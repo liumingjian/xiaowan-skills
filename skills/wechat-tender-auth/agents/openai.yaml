@@ -1,0 +1,7 @@
+interface:
+  display_name: "WeChat Tender Auth"
+  short_description: "微信 MP 授权健康检查与企业微信提醒"
+  default_prompt: "Use $wechat-tender-auth to check WeChat MP auth health and (optionally) notify via WeCom bot webhook."
+
+policy:
+  allow_implicit_invocation: true

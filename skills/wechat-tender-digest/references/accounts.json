@@ -1,0 +1,26 @@
+[
+  {
+    "fakeid": "MzU4NTE1Mjg4MA==",
+    "name": "七小服",
+    "category": "招标信息",
+    "description": "IT基础设施招标中标信息"
+  },
+  {
+    "fakeid": "MzkzNDQxOTU2MQ==",
+    "name": "天下观查",
+    "category": "招标信息",
+    "description": "政企采购招标信息"
+  },
+  {
+    "fakeid": "MzI0NzU2MDgyNA==",
+    "name": "银标Daily",
+    "category": "招标信息",
+    "description": "每日招标中标信息汇总"
+  },
+  {
+    "fakeid": "MzkwMzE4NjU5NA==",
+    "name": "A信创圈俱乐部",
+    "category": "信创招标",
+    "description": "信创产业招标中标信息"
+  }
+]

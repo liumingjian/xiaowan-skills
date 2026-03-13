@@ -1,0 +1,43 @@
+job:
+  name: "daily-bid"
+  description: "七小服招中标日报"
+  window_days: 3
+
+source:
+  accounts:
+    - "七小服"
+  limit_per_account: 10
+
+filters:
+  keywords:
+    - "信创"
+    - "国产化"
+    - "自主可控"
+    - "操作系统"
+    - "数据库"
+    - "中间件"
+    - "云平台"
+    - "服务器"
+    - "存储"
+    - "网络设备"
+    - "软件"
+    - "硬件"
+  categories:
+    - "招标"
+    - "中标"
+  sort_by: "publish_date_desc"
+
+output:
+  root_dir: "wechat-bid-digest"
+  keep_raw: true
+  keep_parsed: true
+  keep_report: true
+  report_filename: "daily-bid-report.html"
+
+email:
+  enabled: false
+  send_on_empty: false
+  layout: "hybrid"
+  subject: "每次招中标信息汇总"
+  to: []
+

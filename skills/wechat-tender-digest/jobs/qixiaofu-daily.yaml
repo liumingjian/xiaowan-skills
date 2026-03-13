@@ -1,0 +1,37 @@
+job:
+  name: "qixiaofu-daily"
+  description: "七小服招中标日报"
+  window_days: 3
+
+source:
+  accounts:
+    - "七小服"
+  limit_per_account: 10
+
+filters:
+  keywords:
+    - "维保"
+    - "硬件"
+    - "服务器"
+    - "软件"
+    - "数据库"
+    - "信创"
+    - "设备"
+  categories:
+    - "招标"
+    - "中标"
+  sort_by: "publish_date_desc"
+
+output:
+  root_dir: "wechat-bid-digest"
+  keep_raw: true
+  keep_parsed: true
+  keep_report: true
+  report_filename: "qixiaofu-bid-report.html"
+
+email:
+  enabled: false
+  send_on_empty: false
+  layout: "table"
+  subject: "每次招中标信息汇总"
+  to: []
