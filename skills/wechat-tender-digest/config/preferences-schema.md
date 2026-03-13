@@ -7,11 +7,9 @@ description: EXTEND.md 偏好字段的完整文档
 
 EXTEND.md 文件使用 Markdown 列表格式存储用户偏好。
 
-## 文件位置（按优先级）
+## 文件位置
 
-1. 项目级：`.wechat-bid-digest/EXTEND.md`（当前工作目录下）
-2. XDG：`$XDG_CONFIG_HOME/wechat-bid-digest/EXTEND.md`
-3. 用户级：`~/.wechat-bid-digest/EXTEND.md`
+唯一配置文件位置：`.wechat-bid-digest/EXTEND.md`（当前工作目录下）
 
 环境变量始终优先于 EXTEND.md 中的值。
 
@@ -46,14 +44,14 @@ EXTEND.md 文件使用 Markdown 列表格式存储用户偏好。
 | `smtp_ssl` | `SMTP_SSL` | 是否使用 SSL（默认 true） | `true` |
 | `smtp_starttls` | `SMTP_STARTTLS` | 是否使用 STARTTLS | `false` |
 | `smtp_use_default_config` | `SMTP_USE_DEFAULT_CONFIG` | 是否尝试读取“默认 SMTP 配置文件”（默认 true） | `false` |
-| `smtp_default_env_path` | `SMTP_DEFAULT_ENV_PATH` | 默认 SMTP 配置文件路径（KEY=VALUE 格式） | `~/.wechat-bid-digest/smtp-default.env` |
+| `smtp_default_env_path` | `SMTP_DEFAULT_ENV_PATH` | 默认 SMTP 配置文件路径（KEY=VALUE 格式） | `.wechat-bid-digest/smtp-default.env` |
 
 ### 默认 SMTP 配置文件（内部场景）
 
 当 `smtp_use_default_config=true` 时，脚本会优先尝试读取默认配置文件（不覆盖已存在的环境变量），用于内部“开箱即用”的发件箱设置。
 
 默认路径：
-`~/.wechat-bid-digest/smtp-default.env`
+`.wechat-bid-digest/smtp-default.env`
 
 示例（请自行替换为你的账号信息，并确保文件权限为 600）：
 

@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from project_paths import get_wecom_state_file
 
 SECONDS_PER_MINUTE = 60
 SECONDS_PER_HOUR = 60 * SECONDS_PER_MINUTE
@@ -15,15 +16,11 @@ SECONDS_PER_HOUR = 60 * SECONDS_PER_MINUTE
 DEFAULT_NOTIFY_COOLDOWN_SECONDS = 6 * SECONDS_PER_HOUR
 DEFAULT_ESCALATE_AFTER_SECONDS = 24 * SECONDS_PER_HOUR
 
-STATE_DIR = Path.home() / ".wechat-bid-digest" / "wecom"
-DEFAULT_STATE_FILE = STATE_DIR / "notify_state.json"
-
-
 @dataclass(frozen=True)
 class WeChatWorkNotifyPolicy:
     cooldown_seconds: int
     escalate_after_seconds: int
-    state_file: Path = DEFAULT_STATE_FILE
+    state_file: Path
 
 
 @dataclass(frozen=True)
@@ -71,7 +68,7 @@ def build_wechat_work_notify_policy(
     return WeChatWorkNotifyPolicy(
         cooldown_seconds=cooldown,
         escalate_after_seconds=escalate_after,
-        state_file=state_file or DEFAULT_STATE_FILE,
+        state_file=state_file or get_wecom_state_file(),
     )
 
 
@@ -207,4 +204,3 @@ def _parse_iso(value: str, *, field: str) -> datetime:
         return datetime.fromisoformat(value)
     except ValueError as error:
         raise ValueError(f"通知状态时间格式错误（{field}）: {value}") from error
-

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import support  # noqa: F401  # adds scripts/ to sys.path
 
@@ -33,7 +35,13 @@ class QrTerminalRenderTests(unittest.TestCase):
         with self.assertRaises(wechat_auth.LoginError):
             wechat_auth._compute_terminal_max_pixels(40)
 
+    def test_display_qr_code_saves_png_before_terminal_render(self) -> None:
+        with patch.object(wechat_auth, "_save_qr_png", return_value=Path("/tmp/qrcode.png")) as save_png:
+            with patch.object(wechat_auth, "_render_qr_to_terminal") as render_terminal:
+                wechat_auth._display_qr_code(b"pngdata")
+        save_png.assert_called_once_with(b"pngdata")
+        render_terminal.assert_called_once_with(b"pngdata")
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())
-

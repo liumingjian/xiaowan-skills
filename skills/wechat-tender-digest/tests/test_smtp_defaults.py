@@ -8,6 +8,7 @@ from pathlib import Path
 
 import support  # noqa: F401  # adds scripts/ to sys.path
 
+from smtp_config_state import inspect_smtp_config
 from smtp_sender import load_smtp_config
 
 
@@ -34,9 +35,11 @@ SMTP_ENV_KEYS = (
 
 
 class SmtpDefaultsTests(unittest.TestCase):
-    def test_load_smtp_config_reads_default_env_file_when_enabled(self) -> None:
+    def test_load_smtp_config_reads_project_default_env_file_when_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            env_path = Path(tmpdir) / "smtp-default.env"
+            project_dir = Path(tmpdir) / ".wechat-bid-digest"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            env_path = project_dir / "smtp-default.env"
             env_path.write_text(
                 "\n".join(
                     [
@@ -57,11 +60,12 @@ class SmtpDefaultsTests(unittest.TestCase):
             )
 
             old = {k: os.environ.get(k) for k in SMTP_ENV_KEYS}
+            original_cwd = Path.cwd()
             try:
                 for k in SMTP_ENV_KEYS:
                     os.environ.pop(k, None)
+                os.chdir(tmpdir)
                 os.environ["SMTP_USE_DEFAULT_CONFIG"] = "true"
-                os.environ["SMTP_DEFAULT_ENV_PATH"] = str(env_path)
                 config = load_smtp_config()
                 self.assertEqual(config.host, "smtp.example.com")
                 self.assertEqual(config.port, 465)
@@ -70,33 +74,81 @@ class SmtpDefaultsTests(unittest.TestCase):
                 self.assertEqual(config.from_addr, "user@example.com")
                 self.assertEqual(config.timeout, 15)
             finally:
+                os.chdir(original_cwd)
                 for k, v in old.items():
                     if v is None:
                         os.environ.pop(k, None)
                     else:
                         os.environ[k] = v
 
-    def test_load_smtp_config_does_not_read_default_env_file_when_disabled(self) -> None:
+    def test_load_smtp_config_does_not_read_project_default_env_file_when_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            env_path = Path(tmpdir) / "smtp-default.env"
+            project_dir = Path(tmpdir) / ".wechat-bid-digest"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            env_path = project_dir / "smtp-default.env"
             env_path.write_text("SMTP_USER=user@example.com\nSMTP_PASS=pass123\n", encoding="utf-8")
 
             old = {k: os.environ.get(k) for k in SMTP_ENV_KEYS}
+            original_cwd = Path.cwd()
             try:
                 for k in SMTP_ENV_KEYS:
                     os.environ.pop(k, None)
+                os.chdir(tmpdir)
                 os.environ["SMTP_USE_DEFAULT_CONFIG"] = "false"
-                os.environ["SMTP_DEFAULT_ENV_PATH"] = str(env_path)
                 with self.assertRaises(ValueError):
                     load_smtp_config()
             finally:
+                os.chdir(original_cwd)
                 for k, v in old.items():
                     if v is None:
                         os.environ.pop(k, None)
                     else:
                         os.environ[k] = v
+
+    def test_inspect_smtp_config_reports_default_env_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / ".wechat-bid-digest"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            (project_dir / "smtp-default.env").write_text(
+                "SMTP_USER=user@example.com\nSMTP_PASS=pass123\nSMTP_FROM=user@example.com\n",
+                encoding="utf-8",
+            )
+            old = {k: os.environ.get(k) for k in SMTP_ENV_KEYS}
+            original_cwd = Path.cwd()
+            try:
+                for k in SMTP_ENV_KEYS:
+                    os.environ.pop(k, None)
+                os.chdir(tmpdir)
+                payload = inspect_smtp_config()
+            finally:
+                os.chdir(original_cwd)
+                for k, v in old.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+        self.assertTrue(payload["ready"])
+        self.assertTrue(payload["default_env_exists"])
+        self.assertEqual(payload["source"]["username"], "default_env")
+        self.assertEqual(payload["source"]["password"], "default_env")
+
+    def test_inspect_smtp_config_reports_missing_fields(self) -> None:
+        old = {k: os.environ.get(k) for k in SMTP_ENV_KEYS}
+        try:
+            for k in SMTP_ENV_KEYS:
+                os.environ.pop(k, None)
+            os.environ["SMTP_USE_DEFAULT_CONFIG"] = "false"
+            payload = inspect_smtp_config()
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.assertFalse(payload["ready"])
+        self.assertEqual(payload["missing_fields"], ["username", "password"])
+        self.assertEqual(payload["source"]["host"], "preset")
 
 
 if __name__ == "__main__":
     unittest.main()
-

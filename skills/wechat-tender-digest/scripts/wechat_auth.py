@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""WeChat MP QR code login and auth token persistence.
-
-Replaces auth-gateway-daemon: handles QR login flow and stores
-cookies/token in ~/.wechat-bid-digest/auth/state.json.
-"""
+"""WeChat MP QR code login and auth token persistence."""
 from __future__ import annotations
 
 import io
@@ -20,9 +16,7 @@ from typing import Any, Optional
 
 import requests
 
-
-AUTH_DIR = Path.home() / ".wechat-bid-digest" / "auth"
-STATE_FILE = AUTH_DIR / "state.json"
+from project_paths import get_auth_qrcode_path, get_auth_state_file
 MP_BASE = "https://mp.weixin.qq.com"
 LOGIN_START = f"{MP_BASE}/cgi-bin/bizlogin?action=startlogin"
 QR_CODE_URL = f"{MP_BASE}/cgi-bin/scanloginqrcode?action=getqrcode"
@@ -68,10 +62,10 @@ class AuthState:
 
 
 class AuthStore:
-    """Read/write auth state to ~/.wechat-bid-digest/auth/state.json."""
+    """Read/write auth state to the current project's .wechat-bid-digest/auth/state.json."""
 
     def __init__(self, path: Optional[Path] = None):
-        self.path = path or STATE_FILE
+        self.path = path or get_auth_state_file()
 
     def load(self) -> AuthState:
         if not self.path.exists():
@@ -160,14 +154,16 @@ def qr_login_flow() -> AuthState:
 
 
 def _display_qr_code(image_data: bytes) -> None:
-    """Display QR code in terminal; persist PNG only if terminal rendering is unavailable."""
+    """Persist QR PNG first, then display it in terminal."""
     if not image_data:
         raise LoginError("二维码数据为空")
+    qr_path = _save_qr_png(image_data)
+    print(f"\n二维码 PNG 已生成: {qr_path}", file=sys.stderr)
+    print("请优先使用该图片扫码；控制台下方同步显示同一二维码。", file=sys.stderr)
     try:
         _render_qr_to_terminal(image_data)
     except LoginError as error:
-        qr_path = _save_qr_png(image_data)
-        print(f"\n无法在控制台渲染二维码（{error}），已保存到: {qr_path}", file=sys.stderr)
+        print(f"\n控制台渲染失败：{error}", file=sys.stderr)
     sys.stderr.flush()
 
 
@@ -216,7 +212,7 @@ def _compute_resize_scale(image_width: int, max_pixels: int) -> int:
 
 
 def _save_qr_png(image_data: bytes) -> Path:
-    qr_path = AUTH_DIR / "qrcode.png"
+    qr_path = get_auth_qrcode_path()
     qr_path.parent.mkdir(parents=True, exist_ok=True)
     qr_path.write_bytes(image_data)
     return qr_path

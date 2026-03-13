@@ -1,11 +1,16 @@
 ---
 name: first-time-setup
-description: 自包含模式的首次设置指南
+description: Project-local setup guide for auth, SMTP, and first run
 ---
 
-# 首次设置指南
+# First-Time Setup
 
-## 前提条件
+## Language Rule
+
+- Agent-facing setup notes may stay in English.
+- All user-facing explanations and confirmations should remain in 中文.
+
+## Prerequisites
 
 - Python 3.9+
 - `requests` 库（`pip install requests`）
@@ -15,23 +20,29 @@ description: 自包含模式的首次设置指南
 pip install requests qrcode Pillow
 ```
 
-## 步骤 1: 扫码登录
+## Step 1: QR Login
 
-运行登录命令，使用微信扫描二维码：
+Run the login command:
 
 ```bash
 python3 "{baseDir}/scripts/run_job.py" --login
 ```
 
-- 默认直接在终端显示二维码
-- 仅在当前环境无法终端渲染时，才会额外保存 `~/.wechat-bid-digest/auth/qrcode.png`
-- 使用微信扫码并确认登录
-- 认证信息保存在 `~/.wechat-bid-digest/auth/state.json`
-- 认证有效期约 4 小时，过期后需重新扫码
+- The script always writes `.wechat-bid-digest/auth/qrcode.png` first.
+- The script then renders the same QR in the terminal.
+- user-facing 提示请用中文告知二维码路径，并提示用户扫码确认。
+- Auth state is saved to `.wechat-bid-digest/auth/state.json`.
+- Auth usually expires in about 4 hours and must be refreshed with another QR login.
 
-## 步骤 2: 配置 SMTP（可选，仅发邮件需要）
+## Step 2: Configure SMTP (Optional, Email Only)
 
-创建 `~/.wechat-bid-digest/EXTEND.md`：
+Preferred project-local options:
+
+1. Use `.wechat-bid-digest/smtp-default.env` for the default sender mailbox.
+2. Or set SMTP fields in `.wechat-bid-digest/EXTEND.md`.
+3. Or use environment variables / `.env`.
+
+Example EXTEND.md:
 
 ```markdown
 # User Preferences
@@ -44,19 +55,20 @@ python3 "{baseDir}/scripts/run_job.py" --login
 - smtp_from: your@163.com
 ```
 
-或者使用环境变量 / `.env` 文件配置。
-
-## 步骤 3: 运行诊断
+## Step 3: Run Diagnostics
 
 ```bash
 python3 "{baseDir}/scripts/run_job.py" --doctor
 ```
 
-检查输出确认：
-- `auth.status` = `valid`（认证有效）
-- `smtp.healthy` = `true`（SMTP 可用，仅当需要发邮件时）
+Check:
+- `auth.ready = true`
+- `smtp.ready = true`
+- `smtp.connection.healthy = true` when email delivery is needed
 
-## 步骤 4: 首次运行
+`--doctor` is the required preflight for email mode.
+
+## Step 4: First Run
 
 ```bash
 # 仅获取和解析（不发邮件）
@@ -66,16 +78,16 @@ python3 "{baseDir}/scripts/run_job.py" --accounts "七小服" --until parse
 python3 "{baseDir}/scripts/run_job.py" --accounts "七小服" --to "user@example.com"
 ```
 
-## 常见问题
+## Troubleshooting
 
-### 二维码无法显示
+### QR code not visible
 安装 `qrcode` 和 `Pillow`：`pip install qrcode Pillow`。
-如果当前环境仍无法终端渲染，脚本会明确提示并保存 `~/.wechat-bid-digest/auth/qrcode.png` 供手动扫码。
+即使终端渲染失败，`.wechat-bid-digest/auth/qrcode.png` 也会保留，可直接扫码。
 
-### 认证频繁过期
+### Auth expires frequently
 WeChat MP 认证有效期较短（约 4 小时）。建议在需要时运行 `--login` 重新扫码。
 
-### SMTP 发送失败
+### SMTP send failure
 1. 确认 SMTP 配置正确（运行 `--doctor` 检查）
 2. 163 邮箱需要开启「授权码」而非使用登录密码
 3. QQ 邮箱需要在设置中开启 SMTP 服务

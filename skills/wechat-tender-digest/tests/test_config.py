@@ -14,6 +14,7 @@ from doctor import build_doctor_payload
 from friendly_setup import create_default_job, default_job_candidates, render_job_yaml, resolve_job_path
 from job_creator import handle_create_job
 from job_config import SourceSection, load_job_config
+from project_paths import get_project_app_dir
 from preferences import _parse_extend_md, load_preferences
 from presets import get_preset, list_presets
 from visible_fields import FIELD_SET_TO_FIELDS
@@ -51,6 +52,20 @@ class ConfigTests(unittest.TestCase):
                 os.environ.pop("SMTP_HOST", None)
             else:
                 os.environ["SMTP_HOST"] = old_env
+
+    def test_preferences_read_project_extend_md_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app_dir = Path(tmpdir) / ".wechat-bid-digest"
+            app_dir.mkdir(parents=True, exist_ok=True)
+            extend_path = app_dir / "EXTEND.md"
+            extend_path.write_text("## SMTP\n- smtp_host: project.example.com\n", encoding="utf-8")
+            original_cwd = Path.cwd()
+            try:
+                os.chdir(tmpdir)
+                prefs = load_preferences()
+            finally:
+                os.chdir(original_cwd)
+        self.assertEqual(prefs.get("smtp_host"), "project.example.com")
 
     def test_presets_available(self) -> None:
         presets = list_presets()
@@ -196,7 +211,7 @@ class ConfigTests(unittest.TestCase):
             visible_fields=(),
         )
         with tempfile.TemporaryDirectory() as tmpdir:
-            project_path, _user_path = default_job_candidates(Path(tmpdir))
+            project_path = default_job_candidates(Path(tmpdir))[0]
             project_path.parent.mkdir(parents=True, exist_ok=True)
             project_path.write_text(yaml_text, encoding="utf-8")
             self.assertEqual(resolve_job_path(None, Path(tmpdir)), project_path)
@@ -276,6 +291,12 @@ email:
         self.assertEqual(payload["event"], "doctor_completed")
         self.assertIsNone(payload["job_path"])
         self.assertIn("auth", payload)
+        self.assertFalse(payload["auth"]["ready"])
+        self.assertTrue(payload["auth"]["qrcode_path"].endswith(".wechat-bid-digest/auth/qrcode.png"))
+        self.assertIn("smtp", payload)
+        self.assertFalse(payload["smtp"]["ready"])
+        self.assertIn("default_env_path", payload["smtp"])
+        self.assertIn("source", payload["smtp"])
 
     def test_create_default_job(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -290,6 +311,7 @@ email:
             config = load_job_config(str(path))
             self.assertEqual(config.source.accounts, ("测试公众号",))
             self.assertEqual(config.email.to, ("test@example.com",))
+            self.assertEqual(path.parent, get_project_app_dir(Path(tmpdir)) / "jobs")
 
     def test_source_section_simplified(self) -> None:
         source = SourceSection(accounts=("七小服",), limit_per_account=10)

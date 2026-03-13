@@ -14,6 +14,7 @@ from init_workspace import init_workspace
 from job_events import emit_error
 from job_creator import handle_create_job
 from job_pipeline import run_job
+from project_paths import get_auth_qrcode_path, get_auth_state_file
 from wechat_auth import AuthStore, LoginError, qr_login_flow
 from wechat_client import WeChatClient, WeChatError
 
@@ -63,7 +64,18 @@ def _handle_login() -> int:
     store = AuthStore()
     state = qr_login_flow()
     store.save(state)
-    print(json.dumps({"type": "status", "event": "login_completed", "expires_at": state.expires_at}, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "type": "status",
+                "event": "login_completed",
+                "expires_at": state.expires_at,
+                "qrcode_path": str(get_auth_qrcode_path()),
+                "auth_state_path": str(get_auth_state_file()),
+            },
+            ensure_ascii=False,
+        )
+    )
     return 0
 
 

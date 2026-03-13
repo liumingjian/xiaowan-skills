@@ -13,7 +13,7 @@ description: Auth token 生命周期、重登录方式、故障排查
 
 ### 状态文件
 
-位置：`~/.wechat-bid-digest/auth/state.json`
+位置：当前项目 `.wechat-bid-digest/auth/state.json`
 
 ```json
 {
@@ -48,7 +48,7 @@ python3 "{baseDir}/scripts/run_job.py" --login
 3. 手机确认登录
 4. `state.json` 自动更新
 
-如果当前环境无法终端渲染二维码，脚本会明确提示并额外保存 `~/.wechat-bid-digest/auth/qrcode.png`。
+如果当前环境无法终端渲染二维码，脚本会明确提示并额外保存 `.wechat-bid-digest/auth/qrcode.png`。
 
 ## 故障排查
 

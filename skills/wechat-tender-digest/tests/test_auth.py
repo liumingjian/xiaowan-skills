@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from auth_manager import AuthManager, AuthManagerError
 from auth_daemon import _build_status_payload
 from auth_manager import AuthCheckResult
 from job_pipeline import ensure_healthy
+from project_paths import get_auth_state_file
 from wechat_auth import AuthState, AuthStore
 from wechat_client import WeChatError
 
@@ -55,6 +57,16 @@ class AuthTests(unittest.TestCase):
             self.assertEqual(loaded.token, "test_token_123")
             self.assertEqual(loaded.cookies, {"key": "value"})
             self.assertTrue(loaded.is_valid())
+
+    def test_auth_store_defaults_to_project_scoped_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_cwd = Path.cwd()
+            try:
+                os.chdir(tmpdir)
+                store = AuthStore()
+            finally:
+                os.chdir(original_cwd)
+        self.assertEqual(store.path.resolve(), get_auth_state_file(Path(tmpdir)).resolve())
 
     def test_auth_state_expired(self) -> None:
         past = datetime.now() - timedelta(hours=1)
@@ -179,26 +191,29 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(_build_status_payload(refreshed, "t")["event"], "auth_refreshed")
         self.assertEqual(_build_status_payload(healthy, "t")["event"], "auth_healthy")
 
-    def test_display_qr_code_prefers_terminal_output(self) -> None:
-        original_auth_dir = wechat_auth.AUTH_DIR
+    def test_display_qr_code_saves_png_and_renders_terminal(self) -> None:
         original_renderer = wechat_auth._render_qr_to_terminal
+        original_save_png = wechat_auth._save_qr_png
         calls = {"rendered": 0}
+        saved = {"count": 0}
 
         try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                wechat_auth.AUTH_DIR = Path(tmpdir)
+            def fake_render(image_data: bytes) -> None:
+                self.assertEqual(image_data, b"fake-png")
+                calls["rendered"] += 1
 
-                def fake_render(image_data: bytes) -> None:
-                    self.assertEqual(image_data, b"fake-png")
-                    calls["rendered"] += 1
+            def record_save_png(_image_data: bytes) -> Path:
+                saved["count"] += 1
+                return Path("/tmp/qrcode.png")
 
-                wechat_auth._render_qr_to_terminal = fake_render
-                wechat_auth._display_qr_code(b"fake-png")
-                self.assertEqual(calls["rendered"], 1)
-                self.assertFalse((Path(tmpdir) / "qrcode.png").exists())
+            wechat_auth._render_qr_to_terminal = fake_render
+            wechat_auth._save_qr_png = record_save_png
+            wechat_auth._display_qr_code(b"fake-png")
+            self.assertEqual(calls["rendered"], 1)
+            self.assertEqual(saved["count"], 1)
         finally:
-            wechat_auth.AUTH_DIR = original_auth_dir
             wechat_auth._render_qr_to_terminal = original_renderer
+            wechat_auth._save_qr_png = original_save_png
 
 
 if __name__ == "__main__":

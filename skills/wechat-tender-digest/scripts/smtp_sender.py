@@ -11,10 +11,9 @@ from email.utils import make_msgid
 from pathlib import Path
 from typing import Optional
 
+from smtp_config_state import inspect_smtp_config, load_dotenv, public_resolved
 
-TRUE_VALUES = {"1", "true", "yes", "on"}
-APP_DIR_NAME = ".wechat-bid-digest"
-DEFAULT_SMTP_ENV_FILENAME = "smtp-default.env"
+
 DEFAULT_SMTP_TIMEOUT_SECONDS = 20
 
 
@@ -54,101 +53,34 @@ def send_html_email(html_body: str, recipients: tuple[str, ...], subject: str, *
 
 
 def test_smtp_connection(env_path: Optional[str] = None) -> dict:
-    """Test SMTP connectivity without sending an email."""
     load_dotenv(env_path)
+    details = inspect_smtp_config()
+    if not details["ready"]:
+        return _build_config_error(details)
+    config = load_smtp_config()
     try:
-        config = load_smtp_config()
-    except ValueError as error:
-        return {"healthy": False, "error": str(error), "stage": "config"}
-    try:
-        context = ssl.create_default_context()
-        if config.use_ssl:
-            with smtplib.SMTP_SSL(config.host, config.port, timeout=config.timeout, context=context) as client:
-                client.login(config.username, config.password)
-        else:
-            with smtplib.SMTP(config.host, config.port, timeout=config.timeout) as client:
-                if config.starttls:
-                    client.starttls(context=context)
-                client.login(config.username, config.password)
-        return {"healthy": True, "host": config.host, "port": config.port, "from_addr": config.from_addr}
+        _login_smtp(config)
+        return _build_connection_result(details, healthy=True, error="")
     except (smtplib.SMTPException, OSError) as error:
-        return {"healthy": False, "error": str(error), "stage": "connection", "host": config.host, "port": config.port}
-
-
-def load_dotenv(env_path: Optional[str]) -> None:
-    if not env_path:
-        return
-    path = Path(env_path)
-    if not path.exists():
-        return
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        if key and key not in os.environ:
-            os.environ[key] = strip_quotes(value.strip())
+        return _build_connection_result(details, healthy=False, error=str(error))
 
 
 def load_smtp_config() -> SmtpConfig:
-    # Load from preferences (EXTEND.md) first, then env vars override
-    from preferences import get_smtp_preferences
-    prefs = get_smtp_preferences()
-
-    use_default_config = parse_bool(
-        os.environ.get("SMTP_USE_DEFAULT_CONFIG") or prefs.get("smtp_use_default_config"),
-        default=True,
-    )
-    default_env_path = (
-        os.environ.get("SMTP_DEFAULT_ENV_PATH")
-        or prefs.get("smtp_default_env_path", "")
-        or str(Path.home() / APP_DIR_NAME / DEFAULT_SMTP_ENV_FILENAME)
-    )
-    if use_default_config:
-        load_dotenv(default_env_path)
-
-    # Preset 163 SMTP config (host/port only, no credentials)
-    PRESET_SMTP = {
-        "host": "smtp.163.com",
-        "port": "465",
-    }
-
-    host = os.environ.get("SMTP_HOST") or prefs.get("smtp_host", "") or PRESET_SMTP["host"]
-    username = os.environ.get("SMTP_USERNAME") or os.environ.get("SMTP_USER") or prefs.get("smtp_username", "")
-    password = os.environ.get("SMTP_PASSWORD") or os.environ.get("SMTP_PASS") or prefs.get("smtp_password", "")
-    from_addr = (os.environ.get("SMTP_FROM") or prefs.get("smtp_from", "")).strip()
-
-    if not username or not password:
-        default_hint = ""
-        env_path = Path(default_env_path).expanduser()
-        if use_default_config and not env_path.exists():
-            default_hint = (
-                "\n\n当前已启用 smtp_use_default_config=true，但未找到默认 SMTP 配置文件:\n"
-                f"  {env_path}\n"
-                "你可以：\n"
-                "  1) 创建该文件（KEY=VALUE 格式，建议 chmod 600）\n"
-                "  2) 或在 EXTEND.md 中设置 smtp_use_default_config: false（推广/公开发布建议关闭）"
-            )
-        raise ValueError(
-            "SMTP 凭据未配置。请通过以下方式之一配置:\n"
-            "  1. 创建 ~/.wechat-bid-digest/EXTEND.md 并填写 smtp_username 和 smtp_password\n"
-            "  2. 设置环境变量: SMTP_USERNAME, SMTP_PASSWORD\n"
-            "运行 --doctor 查看配置状态。"
-            f"{default_hint}"
-        )
-
-    port_str = os.environ.get("SMTP_PORT") or prefs.get("smtp_port", "") or PRESET_SMTP["port"]
-
-    timeout_seconds = _resolve_smtp_timeout_seconds()
+    details = inspect_smtp_config()
+    if not details["ready"]:
+        raise ValueError(str(details["message"]))
+    if details["use_default_config"] and details["default_env_exists"]:
+        load_dotenv(str(details["default_env_path"]))
+    resolved = details["resolved"]
     return SmtpConfig(
-        host=host.strip(),
-        port=int(port_str),
-        use_ssl=parse_bool(os.environ.get("SMTP_SSL") or os.environ.get("SMTP_SECURE") or prefs.get("smtp_ssl"), default=True),
-        starttls=parse_bool(os.environ.get("SMTP_STARTTLS") or os.environ.get("SMTP_REQUIRE_TLS") or prefs.get("smtp_starttls"), default=False),
-        username=username.strip(),
-        password=password.strip(),
-        from_addr=from_addr or username.strip(),
-        timeout=timeout_seconds,
+        host=str(resolved["host"]).strip(),
+        port=int(resolved["port"]),
+        use_ssl=bool(resolved["use_ssl"]),
+        starttls=bool(resolved["starttls"]),
+        username=str(resolved["username"]).strip(),
+        password=str(resolved["password"]).strip(),
+        from_addr=str(resolved["from_addr"]).strip(),
+        timeout=_resolve_smtp_timeout_seconds(),
     )
 
 
@@ -164,50 +96,74 @@ def build_message(html_body: str, recipients: tuple[str, ...], subject: str, *, 
 
 
 def deliver_message(message: EmailMessage, recipients: tuple[str, ...], config: SmtpConfig) -> None:
-    context = ssl.create_default_context()
-    if config.use_ssl:
-        with smtplib.SMTP_SSL(config.host, config.port, timeout=config.timeout, context=context) as client:
-            client.login(config.username, config.password)
-            client.send_message(message, to_addrs=list(recipients))
-        return
-    with smtplib.SMTP(config.host, config.port, timeout=config.timeout) as client:
-        if config.starttls:
-            client.starttls(context=context)
-        client.login(config.username, config.password)
-        client.send_message(message, to_addrs=list(recipients))
+    _login_smtp(config, message=message, recipients=recipients)
 
 
 def write_send_result(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def require_env(name: str) -> str:
-    value = (os.environ.get(name) or "").strip()
-    if not value:
-        raise ValueError(f"{name} is required")
-    return strip_quotes(value)
+def _build_config_error(details: dict) -> dict:
+    return {
+        "healthy": False,
+        "ready": False,
+        "stage": "config",
+        "error": details["message"],
+        "missing_fields": details["missing_fields"],
+        "source": details["source"],
+        "use_default_config": details["use_default_config"],
+        "default_env_path": details["default_env_path"],
+        "default_env_exists": details["default_env_exists"],
+        "resolved": public_resolved(details["resolved"]),
+    }
 
 
-def parse_bool(value: Optional[str], default: bool) -> bool:
-    if value is None or not value.strip():
-        return default
-    return value.strip().lower() in TRUE_VALUES
+def _build_connection_result(details: dict, *, healthy: bool, error: str) -> dict:
+    result = {
+        "healthy": healthy,
+        "ready": True,
+        "host": details["resolved"]["host"],
+        "port": int(details["resolved"]["port"]),
+        "from_addr": details["resolved"]["from_addr"],
+        "source": details["source"],
+        "use_default_config": details["use_default_config"],
+        "default_env_path": details["default_env_path"],
+        "default_env_exists": details["default_env_exists"],
+        "missing_fields": [],
+        "resolved": public_resolved(details["resolved"]),
+    }
+    if not healthy:
+        result["stage"] = "connection"
+        result["error"] = error
+    return result
 
 
-def strip_quotes(value: str) -> str:
-    if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
-        return value[1:-1]
-    return value
+def _login_smtp(
+    config: SmtpConfig, *, message: Optional[EmailMessage] = None, recipients: Optional[tuple[str, ...]] = None
+) -> None:
+    context = ssl.create_default_context()
+    if config.use_ssl:
+        with smtplib.SMTP_SSL(config.host, config.port, timeout=config.timeout, context=context) as client:
+            client.login(config.username, config.password)
+            if message and recipients:
+                client.send_message(message, to_addrs=list(recipients))
+        return
+    with smtplib.SMTP(config.host, config.port, timeout=config.timeout) as client:
+        if config.starttls:
+            client.starttls(context=context)
+        client.login(config.username, config.password)
+        if message and recipients:
+            client.send_message(message, to_addrs=list(recipients))
 
 
 def _resolve_smtp_timeout_seconds() -> int:
-    values = [
+    values = (
         os.environ.get("SMTP_SOCKET_TIMEOUT_MS", ""),
         os.environ.get("SMTP_GREETING_TIMEOUT_MS", ""),
         os.environ.get("SMTP_CONNECTION_TIMEOUT_MS", ""),
         os.environ.get("SMTP_CONNECT_TIMEOUT", ""),
         os.environ.get("SMTP_CONNECTION_TIMEOUT", ""),
-    ]
+    )
     for raw in values:
         if raw and raw.strip():
             return max(1, int(raw.strip()) // 1000)

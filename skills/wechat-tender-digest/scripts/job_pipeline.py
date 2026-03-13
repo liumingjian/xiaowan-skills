@@ -8,11 +8,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from auth_manager import AuthManager
-from bid_parser import build_raw_article, collect_records, extract_text_from_html, records_to_json, safe_filename, save_json
+from bid_parser import collect_records, records_to_json, save_json
 from config_resolver import resolve_config
 from html_report import build_html
-from job_events import attach_fetch_errors, build_stage_payload, finish_with_status, persist_send_result
+from job_fetch import fetch_articles
+from job_events import attach_fetch_errors, build_stage_payload, emit_progress, finish_with_status, persist_send_result
 from output_paths import build_job_date_output_dir
+from smtp_config_state import inspect_smtp_config
 from smtp_sender import SmtpError, send_html_email
 from wechat_auth import AuthStore, qr_login_flow
 from wechat_client import WeChatClient, WeChatError
@@ -41,6 +43,7 @@ def run_job(args: Any) -> int:
 
 def _prepare_context(args: Any) -> Tuple[JobContext, WeChatClient]:
     config = resolve_config(args)
+    ensure_email_preflight(config)
     from_date, to_date = resolve_dates(config, args.from_date, args.to_date)
     output_dir = build_job_date_output_dir(root_dir=config.output.root_dir, job_name=config.job.name, to_date=to_date)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -77,9 +80,11 @@ def _run_stages(ctx: JobContext, client: WeChatClient, *, until: str) -> int:
     if maybe_exit is not None:
         return maybe_exit
 
+    emit_progress("parse_started", stage="parse", job_name=ctx.config.job.name, detail="开始提取招投标记录")
     records = collect_records(
         fetch.raw_articles, ctx.config.filters.keywords, ctx.config.filters.categories, sort_by=ctx.config.filters.sort_by
     )
+    emit_progress("parse_completed", stage="parse", job_name=ctx.config.job.name, current=len(records), total=len(fetch.raw_articles))
     save_parsed_payload(ctx.config, ctx.output_dir, from_date=ctx.from_date, to_date=ctx.to_date, records=records)
     maybe_exit = _finish_if_until(
         ctx, fetch, until=until, stage="parse", event="parse_completed", record_count=len(records), report_path=None
@@ -87,7 +92,9 @@ def _run_stages(ctx: JobContext, client: WeChatClient, *, until: str) -> int:
     if maybe_exit is not None:
         return maybe_exit
 
+    emit_progress("render_started", stage="render", job_name=ctx.config.job.name, current=len(records), detail="开始生成 HTML 报告")
     report_path, html_body = render_report(ctx.config, ctx.output_dir, from_date=ctx.from_date, to_date=ctx.to_date, records=records)
+    emit_progress("render_completed", stage="render", job_name=ctx.config.job.name, current=len(records), detail=str(report_path or "report_disabled"))
     event = "no_matching_records" if not records else "render_completed"
     maybe_exit = _finish_if_until(
         ctx, fetch, until=until, stage="render", event=event, record_count=len(records), report_path=report_path
@@ -161,52 +168,13 @@ def ensure_healthy(health: Dict[str, Any]) -> None:
     raise WeChatError("auth_unknown", f"认证状态未知: {health}")
 
 
-def fetch_articles(
-    client: WeChatClient, config: Any, *, from_date: str, to_date: str, output_dir: Path
-) -> Tuple[List[dict], List[dict]]:
-    accounts = client.resolve_accounts(config.source.accounts)
-    raw_articles: List[dict] = []
-    fetch_errors: List[dict] = []
-    summary_accounts: List[dict] = []
-    for account in accounts:
-        articles = client.list_articles(account, from_date, to_date)[: int(config.source.limit_per_account)]
-        items: List[dict] = []
-        for article in articles:
-            saved_path = ""
-            try:
-                url = str(article.get("url") or article.get("link") or "")
-                html_content = client.download_article_html(url)
-                payload = build_raw_article(
-                    article,
-                    account_name=account.name,
-                    html_content=html_content,
-                    text_content=extract_text_from_html(html_content),
-                )
-                raw_articles.append(payload)
-                if config.output.keep_raw:
-                    raw_path = output_dir / "raw" / safe_filename(account.name) / f"{safe_filename(payload['title'])}.json"
-                    save_json(raw_path, payload)
-                    saved_path = str(raw_path)
-                items.append({"title": payload["title"], "url": payload["url"], "create_time": payload["create_time"], "saved_path": saved_path})
-            except Exception as error:
-                title = str(article.get("title", "unknown"))
-                fetch_errors.append({"title": title, "account": account.name, "error": str(error)})
-        summary_accounts.append({"fakeid": account.fakeid, "name": account.name, "articles": items})
-
-    if config.output.keep_raw:
-        save_json(
-            output_dir / "raw" / "summary.json",
-            {
-                "from_date": from_date,
-                "to_date": to_date,
-                "accounts": summary_accounts,
-                "total_articles": len(raw_articles),
-                "fetch_errors": len(fetch_errors),
-            },
-        )
-    return raw_articles, fetch_errors
-
-
+def ensure_email_preflight(config: Any) -> None:
+    if not config.email.enabled:
+        return
+    smtp_status = inspect_smtp_config()
+    if smtp_status["ready"]:
+        return
+    raise ValueError(f"邮件模式必须先运行 --doctor 并补齐 SMTP 配置。\n{smtp_status['message']}")
 def save_parsed_payload(config: Any, output_dir: Path, *, from_date: str, to_date: str, records: list) -> None:
     if not config.output.keep_parsed:
         return

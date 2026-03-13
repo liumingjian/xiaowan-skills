@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""EXTEND.md preference loading (baoyu-comic pattern).
-
-Three-level lookup: project-level > XDG > ~/.wechat-bid-digest/EXTEND.md
-Environment variables override EXTEND.md values.
-"""
+"""Project-scoped EXTEND.md preference loading."""
 from __future__ import annotations
 
 import os
@@ -11,9 +7,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-
-EXTEND_FILENAME = "EXTEND.md"
-APP_DIR_NAME = ".wechat-bid-digest"
+from project_paths import get_extend_md_path
 
 
 def load_preferences() -> dict[str, str]:
@@ -50,13 +44,9 @@ def load_preferences() -> dict[str, str]:
 
 
 def _load_extend_md() -> dict[str, str]:
-    """Load and merge EXTEND.md in precedence order.
-
-    Precedence (highest wins): project-level > XDG > user-level.
-    This allows keeping secrets in user-level while overriding non-secrets per project.
-    """
+    """Load project-local EXTEND.md."""
     merged: dict[str, str] = {}
-    for path in reversed(_extend_search_paths()):
+    for path in _extend_search_paths():
         if not path.exists():
             continue
         merged.update(_parse_extend_md(path.read_text(encoding="utf-8")))
@@ -64,21 +54,8 @@ def _load_extend_md() -> dict[str, str]:
 
 
 def _extend_search_paths() -> list[Path]:
-    """Return EXTEND.md search paths in priority order."""
-    paths: list[Path] = []
-
-    # 1. Project-level: .wechat-bid-digest/EXTEND.md in cwd
-    paths.append(Path.cwd() / APP_DIR_NAME / EXTEND_FILENAME)
-
-    # 2. XDG config: $XDG_CONFIG_HOME/wechat-bid-digest/EXTEND.md
-    xdg_config = os.environ.get("XDG_CONFIG_HOME", "")
-    if xdg_config:
-        paths.append(Path(xdg_config) / "wechat-bid-digest" / EXTEND_FILENAME)
-
-    # 3. User-level: ~/.wechat-bid-digest/EXTEND.md
-    paths.append(Path.home() / APP_DIR_NAME / EXTEND_FILENAME)
-
-    return paths
+    """Return the single project-scoped EXTEND.md path."""
+    return [get_extend_md_path()]
 
 
 def _parse_extend_md(text: str) -> dict[str, str]:

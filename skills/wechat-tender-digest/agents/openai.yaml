@@ -1,7 +1,7 @@
 interface:
   display_name: "WeChat Tender Digest"
-  short_description: "抓取公众号招中标信息，生成美观 HTML 报告并可邮件发送"
-  default_prompt: "使用 $wechat-tender-digest 抓取公众号招标/中标内容并生成 HTML 报告。无论用户是否提供了需求文本，只要关键偏好（日期范围/过滤条件/字段显示范围/布局等）未明确，都先进入“偏好向导”：给出“快速推荐（推荐）/自定义偏好”编号选项；后续所有有限选项统一使用编号选项方式提问，标注推荐项，并让用户直接回复编号。"
+  short_description: "Fetch tender / award signals from WeChat accounts, generate HTML digests, and optionally send email."
+  default_prompt: "Use $wechat-tender-digest to fetch tender / award content from WeChat official accounts and generate an HTML digest. Keep internal workflow selection and instruction framing in English. Keep all user-facing interaction, numbered options, confirmations, and summaries in 中文. If key preferences are missing, always offer numbered choices with a recommended option before running the pipeline."
 
 policy:
   allow_implicit_invocation: true

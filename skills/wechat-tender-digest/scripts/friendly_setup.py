@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
+from project_paths import get_default_job_path
 
 DEFAULT_KEYWORDS = ("信创", "国产化", "自主可控", "操作系统", "数据库", "中间件", "云平台", "服务器", "存储", "网络设备", "软件", "硬件")
 DEFAULT_SUBJECT = "每次招中标信息汇总"
@@ -11,22 +12,16 @@ DEFAULT_OUTPUT_ROOT = "wechat-bid-digest"
 EMAIL_LAYOUTS = ("table", "hybrid", "card")
 
 
-def default_job_candidates(cwd: Optional[Path] = None) -> Tuple[Path, Path]:
-    root = cwd or Path.cwd()
-    return (
-        root / "wechat-bid-digest" / "jobs" / "default.yaml",
-        Path.home() / ".wechat-bid-digest" / "jobs" / "default.yaml",
-    )
+def default_job_candidates(cwd: Optional[Path] = None) -> tuple[Path]:
+    return (get_default_job_path(cwd),)
 
 
 def resolve_job_path(explicit_job: Optional[str], cwd: Optional[Path] = None) -> Optional[Path]:
     if explicit_job:
         return Path(explicit_job)
-    project_path, user_path = default_job_candidates(cwd)
+    project_path = default_job_candidates(cwd)[0]
     if project_path.exists():
         return project_path
-    if user_path.exists():
-        return user_path
     return None
 
 
@@ -48,8 +43,9 @@ def create_default_job(
     cwd: Optional[Path] = None,
 ) -> Path:
     """Create a job YAML file programmatically (no interactive input)."""
-    project_path, user_path = default_job_candidates(cwd)
-    target_path = project_path if save_location != "user" else user_path
+    if save_location != "project":
+        raise ValueError("仅支持保存到当前项目 .wechat-bid-digest/jobs/")
+    target_path = default_job_candidates(cwd)[0]
     if not description:
         description = f"{accounts[0]}招中标日报" if accounts else "招中标日报"
     if not report_filename:

@@ -14,9 +14,13 @@ def persist_send_result(output_dir: Path, payload: Dict[str, Any]) -> Dict[str, 
     return payload
 
 
+def emit_status(payload: Dict[str, Any]) -> None:
+    print(json.dumps(payload, ensure_ascii=False))
+
+
 def finish_with_status(output_dir: Path, payload: Dict[str, Any]) -> int:
     write_send_result(output_dir / "send-result.json", payload)
-    print(json.dumps(payload, ensure_ascii=False))
+    emit_status(payload)
     return 0
 
 
@@ -47,6 +51,28 @@ def build_stage_payload(
     }
 
 
+def emit_progress(
+    event: str,
+    *,
+    stage: str,
+    job_name: str,
+    account: Optional[str] = None,
+    current: Optional[int] = None,
+    total: Optional[int] = None,
+    detail: str = "",
+) -> None:
+    payload: Dict[str, Any] = {"type": "status", "event": event, "stage": stage, "job_name": job_name}
+    if account:
+        payload["account"] = account
+    if current is not None:
+        payload["current"] = current
+    if total is not None:
+        payload["total"] = total
+    if detail:
+        payload["detail"] = detail
+    emit_status(payload)
+
+
 def attach_fetch_errors(payload: Dict[str, Any], fetch_errors: List[dict]) -> Dict[str, Any]:
     if fetch_errors:
         payload["fetch_errors"] = fetch_errors
@@ -56,4 +82,3 @@ def attach_fetch_errors(payload: Dict[str, Any], fetch_errors: List[dict]) -> Di
 def emit_error(event: str, message: str) -> None:
     print(json.dumps({"type": "error", "event": event, "message": message}, ensure_ascii=False), file=sys.stderr)
     sys.stderr.flush()
-
