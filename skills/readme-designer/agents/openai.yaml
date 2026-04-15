@@ -1,0 +1,7 @@
+interface:
+  display_name: "README Designer"
+  short_description: "重写或审阅仓库 README，强调中文导航、真实命令和首次上手路径。"
+  default_prompt: "Use $readme-designer to review or rewrite a repository README in Chinese. Read the real repo facts first, infer the repo type and maturity, provide an outline before rewriting an existing README, and keep claims strictly grounded in the repository."
+
+policy:
+  allow_implicit_invocation: true

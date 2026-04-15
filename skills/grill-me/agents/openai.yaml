@@ -1,0 +1,7 @@
+interface:
+  display_name: "Grill Me"
+  short_description: "围绕方案或设计逐层追问，直到关键分支和依赖都被澄清。"
+  default_prompt: "Use $grill-me to stress-test a plan or design. Ask one question at a time, provide a recommended answer with each question, and explore the codebase instead when a question can be answered from repository facts."
+
+policy:
+  allow_implicit_invocation: true
