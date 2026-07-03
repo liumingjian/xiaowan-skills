@@ -1,7 +1,0 @@
-interface:
-  display_name: "WeChat Tender Digest"
-  short_description: "Fetch tender / award signals from WeChat accounts, generate HTML digests, and optionally send email."
-  default_prompt: "Use $wechat-tender-digest to fetch tender / award content from WeChat official accounts and generate an HTML digest. Keep internal workflow selection and instruction framing in English. Keep all user-facing interaction, numbered options, confirmations, and summaries in 中文. If key preferences are missing, always offer numbered choices with a recommended option before running the pipeline."
-
-policy:
-  allow_implicit_invocation: true
