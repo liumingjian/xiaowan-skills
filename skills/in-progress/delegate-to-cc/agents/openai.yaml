@@ -1,0 +1,7 @@
+interface:
+  display_name: "Delegate to CC"
+  short_description: "将疑难编程与品味判断委托给 vps-2g 上的 Claude Code"
+  default_prompt: "Use $delegate-to-cc to send this repository problem to Claude Code on vps-2g, then review and integrate its response safely."
+
+policy:
+  allow_implicit_invocation: false
