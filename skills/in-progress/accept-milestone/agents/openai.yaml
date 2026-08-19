@@ -1,0 +1,4 @@
+interface:
+  display_name: "Accept a Milestone"
+  short_description: "Run a clean-room end-to-end acceptance pass"
+  default_prompt: "Use $accept-milestone to run a clean-room acceptance pass for this milestone and produce a plain-language verdict grounded in observed evidence."
