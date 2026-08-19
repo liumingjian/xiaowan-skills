@@ -11,7 +11,7 @@ Options:
   --host SSH_ALIAS           SSH host alias (default: vps-2g)
   --model MODEL              Claude model alias or full model ID
   --timeout-seconds N        Stop Claude after N seconds (default: 900)
-  --include-untracked        Include Git untracked, non-ignored files
+  --include-untracked        Include Git untracked, non-ignored files (no effect in filesystem mode)
   --output-dir DIR           Store returned artifacts in DIR
   -h, --help                 Show this help
 EOF
@@ -90,7 +90,7 @@ esac
 [[ -n "$prompt_file" ]] || die "--prompt-file is required"
 [[ -f "$prompt_file" && -s "$prompt_file" ]] || die "prompt file must exist and be non-empty: $prompt_file"
 
-for command_name in git ssh scp tar; do
+for command_name in ssh scp tar find; do
   command -v "$command_name" >/dev/null 2>&1 || die "required command not found: $command_name"
 done
 tar_metadata_options=()
@@ -100,7 +100,17 @@ for tar_option in --no-xattrs --no-mac-metadata; do
   fi
 done
 
-repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || die "run from inside a Git repository"
+repo_root=""
+snapshot_mode="filesystem"
+if command -v git >/dev/null 2>&1; then
+  if repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    snapshot_mode="git"
+  fi
+fi
+if [[ -z "$repo_root" ]]; then
+  repo_root="$PWD"
+fi
+repo_root="$(cd "$repo_root" && pwd -P)"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 remote_runner="$script_dir/remote-run.sh"
 [[ -f "$remote_runner" ]] || die "remote runner not found: $remote_runner"
@@ -136,26 +146,54 @@ trap cleanup EXIT
 
 manifest="$local_tmp/manifest"
 archive="$local_tmp/repo.tar.gz"
-snapshot_args=(--cached)
-if [[ $include_untracked -eq 1 ]]; then
-  snapshot_args+=(--others --exclude-standard)
-fi
-
-while IFS= read -r -d '' path; do
-  if [[ -e "$repo_root/$path" || -L "$repo_root/$path" ]]; then
-    printf './%s\0' "$path"
+if [[ "$snapshot_mode" == "git" ]]; then
+  snapshot_args=(--cached)
+  if [[ $include_untracked -eq 1 ]]; then
+    snapshot_args+=(--others --exclude-standard)
   fi
-done < <(git -C "$repo_root" ls-files -z "${snapshot_args[@]}") >"$manifest"
+
+  while IFS= read -r -d '' path; do
+    if [[ -e "$repo_root/$path" || -L "$repo_root/$path" ]]; then
+      printf './%s\0' "$path"
+    fi
+  done < <(git -C "$repo_root" ls-files -z "${snapshot_args[@]}") >"$manifest"
+
+  if [[ $include_untracked -eq 0 ]]; then
+    untracked_count="$(git -C "$repo_root" ls-files -z --others --exclude-standard | tr -cd '\0' | wc -c | tr -d ' ')"
+    if [[ "$untracked_count" -gt 0 ]]; then
+      printf 'Note: omitted %s untracked file(s); inspect them before using --include-untracked.\n' "$untracked_count" >&2
+    fi
+  fi
+else
+  # A non-Git project needs an explicit, conservative filesystem boundary.
+  while IFS= read -r -d '' path; do
+    file_name="${path##*/}"
+    case "$path" in
+      ./.git) continue ;;
+    esac
+    case "$file_name" in
+      .env|.env.*|*.pem|*.key|*.p12|*.pfx|*credentials*|secrets.*|secret.*|.npmrc|.pypirc|.netrc|.dockerconfigjson|id_rsa*|id_ed25519*)
+        case "$file_name" in
+          .env.example|.env.*.example|.env.sample|.env.*.sample) ;;
+          *) continue ;;
+        esac
+        ;;
+    esac
+    printf '%s\0' "$path"
+  done < <(
+    cd "$repo_root"
+    find . \
+      \( -type d \( -name .git -o -name node_modules -o -name dist -o -name build -o -name coverage -o -name .next -o -name .nuxt -o -name .cache -o -name .turbo -o -name target -o -name __pycache__ -o -name .venv -o -name venv -o -name .tox \) -prune \) \
+      -o \( -type f -o -type l \) -print0
+  ) >"$manifest"
+
+  if [[ $include_untracked -eq 1 ]]; then
+    printf 'Note: --include-untracked has no effect in filesystem mode; all eligible files are included.\n' >&2
+  fi
+fi
 
 file_count="$(tr -cd '\0' <"$manifest" | wc -c | tr -d ' ')"
 [[ "$file_count" -gt 0 ]] || die "snapshot contains no files"
-
-if [[ $include_untracked -eq 0 ]]; then
-  untracked_count="$(git -C "$repo_root" ls-files -z --others --exclude-standard | tr -cd '\0' | wc -c | tr -d ' ')"
-  if [[ "$untracked_count" -gt 0 ]]; then
-    printf 'Note: omitted %s untracked file(s); inspect them before using --include-untracked.\n' "$untracked_count" >&2
-  fi
-fi
 
 COPYFILE_DISABLE=1 tar "${tar_metadata_options[@]}" --null -czf "$archive" -C "$repo_root" -T "$manifest"
 cp "$prompt_file" "$local_tmp/prompt.md"
@@ -182,6 +220,7 @@ claude_status="$(tr -d '[:space:]' <"$output_dir/status")"
 [[ "$claude_status" =~ ^[0-9]+$ ]] || die "invalid Claude exit status: $claude_status"
 
 printf 'OUTPUT_DIR=%s\n' "$output_dir"
+printf 'SNAPSHOT_MODE=%s\n' "$snapshot_mode"
 printf 'RESPONSE=%s/response.md\n' "$output_dir"
 printf 'PATCH=%s/changes.patch\n' "$output_dir"
 printf 'STDERR=%s/claude.stderr\n' "$output_dir"
