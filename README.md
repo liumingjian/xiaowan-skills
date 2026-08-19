@@ -27,4 +27,4 @@ cp -R xiaowan-skills/skills/in-progress/accept-milestone ~/.codex/skills/
 
 - **[accept-milestone](./skills/in-progress/accept-milestone/SKILL.md)** — 对 milestone 版本做端到端验收：洁净室生命周期 teardown → precheck → init → step test → destroy，输出白话验收结论。
 - **[readme-designer](./skills/in-progress/readme-designer/SKILL.md)** — 面向首次读者重写 / 审阅仓库 README，附反营销的自检 quality-bar。
-- **[delegate-to-cc](./skills/in-progress/delegate-to-cc/SKILL.md)** — 通过 SSH 别名 `vps-2g` 将 tracked 仓库快照交给远端 Claude Code 做二审，返回答复与补丁；依赖本地 `git` / `ssh` / `scp` / `tar`，以及服务器上的 Bash / Git / tar / GNU `timeout` / Claude Code。
+- **[delegate-to-cc](./skills/in-progress/delegate-to-cc/SKILL.md)** — 通过 SSH 别名 `vps-2g` 将 Git 或非 Git 项目快照交给远端 Claude Code 做二审，返回建议或补丁；依赖本地 `ssh` / `scp` / `tar` / `find`（Git 项目还需本地 `git`），以及服务器上的 Bash / Git / tar / GNU `timeout` / Claude Code。

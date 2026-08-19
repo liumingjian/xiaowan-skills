@@ -21,6 +21,7 @@ mkdir -p "$workspace"
 tar -xzf "$remote_root/repo.tar.gz" -C "$workspace"
 
 cd "$workspace"
+# This Git metadata is disposable and exists only to produce a portable patch.
 git init -q
 git config user.name "Claude Code Delegate"
 git config user.email "claude-delegate@localhost"
@@ -50,7 +51,7 @@ full_prompt="$remote_root/full-prompt.md"
 case "$mode" in
   consult)
     cat >"$full_prompt" <<'EOF'
-You are the second-opinion engineer. Work only from this disposable repository snapshot and the handoff below.
+You are the second-opinion engineer. Work only from this disposable project snapshot and the handoff below.
 
 Inspect every relevant file before deciding. Do not modify files. Give a clear recommendation grounded in repository evidence, identify the strongest alternative, and state any uncertainty or missing evidence. Match the depth to the decision.
 
@@ -61,7 +62,7 @@ EOF
     ;;
   implement)
     cat >"$full_prompt" <<'EOF'
-You are the implementation engineer in a disposable repository snapshot. Work only inside this snapshot and follow the handoff below.
+You are the implementation engineer in a disposable project snapshot. Work only inside this snapshot and follow the handoff below.
 
 Inspect every relevant file, then implement the smallest complete solution by editing files. Preserve unrelated behavior and existing user work. Shell access is intentionally unavailable, so do not claim tests ran; end with the exact local checks Codex should run, plus remaining risks.
 
