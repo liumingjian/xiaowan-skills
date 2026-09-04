@@ -48,8 +48,10 @@ MACID=$(resolve_mac "$WANT_MAC") || exit 3
 NOW=$(date +%s)
 if [ "$MACID" = "__none__" ]; then
   ORIGIN=$(origin_ip)
-  echo "rexec: no agent is running on the mac this session came from (${ORIGIN:-no ssh source ip})." >&2
-  echo "Run this in a terminal on that mac:" >&2
+  echo "rexec: no mac has announced from this session's source IP (${ORIGIN:-none - not an ssh session})." >&2
+  echo "Either the agent has never run on that mac, or it is running and something else changed the route." >&2
+  echo "If a mac below is online and is the one you are sitting at, name it:  rexec --mac <name> '<command>'" >&2
+  echo "Otherwise run this in a terminal on that mac:" >&2
   echo "  bash ~/rexec-agent.sh" >&2
   echo "If it is not installed yet:" >&2
   echo "  ssh vps-2g 'cat /var/lib/rexec/agent.sh' > ~/rexec-agent.sh && bash ~/rexec-agent.sh" >&2

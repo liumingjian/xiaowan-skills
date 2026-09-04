@@ -19,9 +19,9 @@ mac_dirs "$MACID"
 
 # Temp files carry the PID so concurrent calls never mv away each other's intermediates.
 printf '%s' "$NOW" > "$M/.alive.$$" && mv "$M/.alive.$$" "$M/agent.alive"
-# Source IP refreshes every poll so routing keeps up after a network or Wi-Fi change.
-IP="${SSH_CLIENT%% *}"
-[ -n "$IP" ] && { printf '%s' "$IP" > "$M/.orig.$$" && mv "$M/.orig.$$" "$M/origin"; }
+# Source IP refreshes every poll so routing keeps up after a network or Wi-Fi change, and every distinct
+# one is kept in the trail so a caller whose own IP has since rotated can still be matched to this mac.
+note_origin "$MACID" "${SSH_CLIENT%% *}"
 printf 'TS=%s\nGATE=%s\nCPU=%s\nMEM=%s\nRUNNING=%s\n' \
   "$NOW" "$GATE" "$CPU" "$MEM" "$NRUN" > "$M/.gate.$$" \
   && mv "$M/.gate.$$" "$M/gate.status"

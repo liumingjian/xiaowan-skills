@@ -32,15 +32,29 @@ read_environ() {
     | tr '\0' '\n' 2>/dev/null
 }
 
+# ::ffff:1.2.3.4 and 1.2.3.4 are the same host reached over a dual stack; store and compare one form.
+norm_ip() { printf '%s' "${1#::ffff:}"; }
+
+# Record where a mac is calling from. `origin` is the current IP; `origins` is the trail of the last 20,
+# which is what lets a long-lived caller still be matched after the home IP rotates under it.
+note_origin() { # MACID IP
+  _m="$MACS/$1"; _ip=$(norm_ip "$2"); _now=$(date +%s)
+  [ -n "$_ip" ] || return 0
+  printf '%s' "$_ip" > "$_m/.orig.$$" && mv "$_m/.orig.$$" "$_m/origin"
+  [ "$(tail -n 1 "$_m/origins" 2>/dev/null | cut -d' ' -f1)" = "$_ip" ] && return 0
+  { grep -v "^$_ip " "$_m/origins" 2>/dev/null; printf '%s %s\n' "$_ip" "$_now"; } \
+    | tail -n 20 > "$_m/.origins.$$" && mv "$_m/.origins.$$" "$_m/origins"
+}
+
 # Which IP this invocation came into the VPS from.
 # Claude Code and interactive shells are both descendants of sshd, so they carry SSH_CONNECTION;
 # but rexec may be called from a deeper child, so walk up the parent chain to find it.
 origin_ip() {
-  if [ -n "${SSH_CONNECTION:-}" ]; then printf '%s' "${SSH_CONNECTION%% *}"; return 0; fi
+  if [ -n "${SSH_CONNECTION:-}" ]; then norm_ip "${SSH_CONNECTION%% *}"; return 0; fi
   p=$$; i=0
   while [ "$p" -gt 1 ] && [ "$i" -lt 40 ]; do
     v=$(read_environ "$p" | sed -n 's/^SSH_CONNECTION=//p' | head -1)
-    [ -n "$v" ] && { printf '%s' "${v%% *}"; return 0; }
+    [ -n "$v" ] && { norm_ip "${v%% *}"; return 0; }
     p=$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null); case "$p" in ''|*[!0-9]*) p=1;; esac
     i=$((i+1))
   done
@@ -63,6 +77,18 @@ mac_list_hint() {
 macs_at_ip() {
   for m in $(all_macs); do
     [ "$(cat "$MACS/$m/origin" 2>/dev/null)" = "$1" ] && echo "$m"
+  done
+}
+
+# Every mac that has announced from this IP within ORIGIN_MEMORY seconds, current or not.
+# A caller's SSH_CONNECTION is frozen at login while the mac re-announces every poll, so a home IP that
+# rotates mid-session leaves the two disagreeing about an IP that was correct for both an hour ago.
+ORIGIN_MEMORY=${REXEC_ORIGIN_MEMORY:-1209600}
+macs_seen_at_ip() {
+  _cut=$(( $(date +%s) - ORIGIN_MEMORY ))
+  for m in $(all_macs); do
+    awk -v ip="$1" -v cut="$_cut" '$1==ip && $2+0>=cut {found=1} END{exit !found}' \
+      "$MACS/$m/origins" 2>/dev/null && echo "$m"
   done
 }
 
@@ -92,8 +118,21 @@ resolve_mac() {
     for m in $(macs_at_ip "$IP"); do hit="$m"; n=$((n+1)); done
     [ "$n" = 1 ] && { printf '%s' "$hit"; return 0; }
     if [ "$n" = 0 ]; then
-      # No agent has ever announced from this IP. Another mac may well be online, but it is not the
-      # machine this session is sitting on, so the job must not go there.
+      # The IP matches no mac's *current* origin. Before giving up, check where each mac has recently
+      # been: a rotated home IP is the common cause, and the trail still identifies the machine.
+      hit=""; n=0
+      for m in $(macs_seen_at_ip "$IP"); do hit="$m"; n=$((n+1)); done
+      if [ "$n" = 1 ]; then
+        echo "rexec: this session's source IP ($IP) has rotated; routing to '$hit', which announced from it recently." >&2
+        printf '%s' "$hit"; return 0
+      fi
+      [ "$n" -gt 1 ] && {
+        echo "rexec: $n macs have recently announced from this session's source IP ($IP)." >&2
+        echo "  Be explicit:  rexec --mac <name> '<command>'" >&2
+        mac_list_hint; return 3
+      }
+      # Genuinely unknown: another mac may be online, but it is not the machine this session is
+      # sitting on, so the job must not go there.
       echo "__none__"; return 0
     fi
     echo "rexec: $n macs share this session's source IP ($IP), so it does not identify which to use." >&2

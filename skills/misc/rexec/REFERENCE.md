@@ -15,13 +15,20 @@ departs from that when you say so explicitly. Resolution order:
    **whether or not its agent is currently up**. If it is down, that is exit **69** and a prompt to start the
    agent *on that mac*: a different mac being online does not make it the target, and silently borrowing it
    runs the job on a machine that has neither the user's attention nor the files they expect.
-3. Source IP **unknown** (not an ssh session at all — cron, tty1) and exactly one mac online — use it.
-4. Otherwise exit **3** and list the candidates: several macs share one source IP (two machines behind one
-   home NAT), or there is no source IP and several macs are online. Re-run with `--mac`; do not guess.
+3. **Origin trail** — the mac that announced from this IP at some point in the last two weeks
+   (`REXEC_ORIGIN_MEMORY`, seconds). This covers the **rotating home IP**: a caller's `SSH_CONNECTION` is
+   frozen at login while the agent re-announces every couple of seconds, so a session that outlives one IP
+   rotation holds an address the mac no longer reports, and step 2 alone would call an obviously-online
+   agent unreachable. Routing this way prints a line saying so.
+4. Source IP **unknown** (not an ssh session at all — cron, tty1) and exactly one mac online — use it.
+5. Otherwise exit **3** and list the candidates: several macs share one source IP or one trail (two machines
+   behind one home NAT), or there is no source IP and several macs are online. Re-run with `--mac`; do not guess.
 
 `origin` is rewritten on every agent poll, so a mac that changes network or Wi-Fi re-routes itself within
-one poll. A mac the user has never started the agent on has no `origin` at all, which lands on the exit-69
-branch: start the agent there once and it registers.
+one poll, and each distinct address is appended to `origins` (the last 20 are kept). A mac the user has
+never started the agent on has neither, which lands on the exit-69 branch: start the agent there once and it
+registers. The trail only knows addresses seen since the agent last ran, so a session older than the mac's
+current trail still needs `--mac`.
 
 The agent derives its own identity name: `<first 12 chars of ComputerName>-<hardware UUID hash4>`, e.g.
 `macbook-pro-3f9a`. The hash suffix keeps two identically named machines from colliding. To rename, use

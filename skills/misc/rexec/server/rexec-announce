@@ -10,5 +10,5 @@ case "$MACID" in *[!A-Za-z0-9_.-]*) echo "invalid MACID" >&2; exit 2;; esac
 mac_dirs "$MACID"
 [ -n "$LABEL_B64" ] && printf '%s' "$LABEL_B64" | openssl base64 -d -A > "$MACS/$MACID/name" 2>/dev/null
 printf '%s' "$CAPS" > "$MACS/$MACID/caps"
-IP="${SSH_CLIENT%% *}"; [ -n "$IP" ] && printf '%s' "$IP" > "$MACS/$MACID/origin"
+note_origin "$MACID" "${SSH_CLIENT%% *}"
 echo "OK $MACID"
