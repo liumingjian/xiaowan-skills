@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Show queue and gate state. Lists every known mac by default and marks this session's default target.
+# Usage: rexec-queue [MACID]
+set -u
+. /var/lib/rexec/bin/rexec-lib.sh
+NOW=$(date +%s)
+fmt_dur() {
+  s=${1:-0}; case "$s" in ''|*[!0-9]*) s=0;; esac
+  if [ "$s" -lt 60 ]; then printf '%ds' "$s"; else printf '%dm%02ds' $((s/60)) $((s%60)); fi
+}
+b64d() { openssl base64 -d -A 2>/dev/null; }
+cmd_of() { sed -n 's/^CMD=//p' "$1" | b64d | tr '\n' ' ' | cut -c1-46; }
+
+show_mac() {
+  MACID="$1"; M="$MACS/$MACID"; MARK="${2:-}"
+
+  HB=$(mac_hb "$MACID")
+  if mac_online "$MACID"; then ST="online"; else
+    if [ "$HB" = 0 ]; then ST="offline (never reported)"; else ST="offline (heartbeat stopped $(fmt_dur $(( NOW - HB ))) ago)"; fi
+  fi
+  echo "════ $MACID  [$ST]  $(mac_label "$MACID")$MARK"
+
+  # --- gate ---
+  G=open
+  if [ -f "$M/gate.status" ]; then
+    G=$(sed -n 's/^GATE=//p' "$M/gate.status")
+    C=$(sed -n 's/^CPU=//p'  "$M/gate.status")
+    MF=$(sed -n 's/^MEM=//p' "$M/gate.status")
+    T=$(sed -n 's/^TS=//p'   "$M/gate.status"); case "$T" in ''|*[!0-9]*) T=0;; esac
+    [ "$G" = open ] && VERDICT="-> accepting new jobs" || VERDICT="-> gate closed, heavy jobs wait (light jobs still run)"
+    printf '  gate: cpu %s  mem free %s  %s   (%s ago)\n' \
+      "${C:--}" "${MF:--}" "$VERDICT" "$(fmt_dur $(( NOW - T )))"
+  else
+    echo "  gate: unknown (the agent has not reported yet)"
+  fi
+
+  # --- running ---
+  NR=0; for r in "$M"/running/*.job; do [ -e "$r" ] && NR=$((NR+1)); done
+  echo "  running ($NR)"
+  [ "$NR" = 0 ] && echo "    (none)"
+  for r in "$M"/running/*.job; do
+    [ -e "$r" ] || break
+    id=$(sed -n 's/^ID=//p' "$r"); st=0
+    [ -f "$M/running/$id.started" ] && st=$(cat "$M/running/$id.started")
+    case "$st" in ''|*[!0-9]*) st=$NOW;; esac
+    mark=""; [ -e "$M/cancel/$id" ] && mark="  <- cancelling"
+    printf '    %-15s %-46s ran %s%s\n' "$id" "$(cmd_of "$r")" "$(fmt_dur $(( NOW - st )))" "$mark"
+  done
+
+  # --- queued (strict FIFO; show what each is blocked by) ---
+  QLIST=$(for f in "$M"/queue/*.job; do
+            [ -e "$f" ] || continue
+            printf '%s %s %s\n' "$(sed -n 's/^SUBMIT=//p' "$f")" \
+                                 "$(sed -n 's/^SEQ=//p' "$f")" "$f"
+          done | sort -n -k1,1 -k2,2 | cut -d' ' -f3-)
+  NQ=$(printf '%s' "$QLIST" | grep -c . || true)
+  echo "  queued ($NQ)"
+  [ "$NQ" = 0 ] && { echo "    (none)"; echo; return 0; }
+  first=1
+  printf '%s\n' "$QLIST" | while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    id=$(sed -n 's/^ID=//p' "$f")
+    sub=$(sed -n 's/^SUBMIT=//p' "$f"); case "$sub" in ''|*[!0-9]*) sub=$NOW;; esac
+    why=""
+    if [ "$first" = 1 ]; then
+      proj=$(sed -n 's/^PROJECT=//p' "$f"); w=$(sed -n 's/^WEIGHT=//p' "$f")
+      for r in "$M"/running/*.job; do
+        [ -e "$r" ] || break
+        if [ "$(sed -n 's/^PROJECT=//p' "$r")" = "$proj" ]; then
+          why="  <- waiting on $(sed -n 's/^ID=//p' "$r") (same project runs serially)"; break
+        fi
+      done
+      if [ -z "$why" ] && [ "$G" != open ] && [ "$w" != light ] && [ "$NR" -gt 0 ]; then
+        why="  <- waiting for mac load to drop"
+      fi
+      [ -z "$why" ] && why="  <- about to be claimed"
+      first=0
+    else
+      why="  <- strict FIFO, blocked by the head of the queue"
+    fi
+    printf '    %-15s %-46s waited %s%s\n' "$id" "$(cmd_of "$f")" "$(fmt_dur $(( NOW - sub )))" "$why"
+  done
+  echo
+}
+
+if [ $# -ge 1 ] && [ -n "$1" ]; then
+  TARGET=$(resolve_mac "$1") || exit 3
+  show_mac "$TARGET"
+  exit 0
+fi
+
+DEFAULT=$(resolve_mac 2>/dev/null || true)
+FOUND=0
+for m in $(all_macs); do
+  FOUND=1
+  if [ "$m" = "$DEFAULT" ]; then show_mac "$m" "   <- default target for this session"; else show_mac "$m"; fi
+done
+[ "$FOUND" = 0 ] && echo "No mac has registered yet (they appear once an agent starts on the mac)"
+exit 0

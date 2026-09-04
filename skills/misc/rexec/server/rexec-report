@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Called by the agent: rexec-report <MACID> <ID> <EXIT> <RAN seconds>; stdin is the output, base64.
+set -u
+. /var/lib/rexec/bin/rexec-lib.sh
+MACID="${1:?}"; ID="${2:?}"; EX="${3:-1}"; RAN="${4:-0}"
+case "$MACID" in *[!A-Za-z0-9_.-]*) echo "invalid MACID" >&2; exit 2;; esac
+M="$MACS/$MACID"
+JOB="$M/running/$ID.job"
+
+SUBMIT=0; STARTED=0; CMD=""; PROJECT=""
+[ -f "$JOB" ] && { SUBMIT=$(sed -n 's/^SUBMIT=//p' "$JOB"); CMD=$(sed -n 's/^CMD=//p' "$JOB"); PROJECT=$(sed -n 's/^PROJECT=//p' "$JOB"); }
+[ -f "$M/running/$ID.started" ] && STARTED=$(cat "$M/running/$ID.started")
+case "$SUBMIT"  in ''|*[!0-9]*) SUBMIT=0;;  esac
+case "$STARTED" in ''|*[!0-9]*) STARTED=0;; esac
+QUEUED=0
+[ "$SUBMIT" -gt 0 ] && [ "$STARTED" -ge "$SUBMIT" ] && QUEUED=$(( STARTED - SUBMIT ))
+
+openssl base64 -d -A > "$M/results/.$ID.out.tmp"
+mv "$M/results/.$ID.out.tmp" "$M/results/$ID.out"
+printf 'EXIT=%s\nRAN=%s\nQUEUED=%s\n' "$EX" "$RAN" "$QUEUED" > "$M/results/.$ID.done.tmp"
+mv "$M/results/.$ID.done.tmp" "$M/results/$ID.done"
+
+printf '{"id":"%s","mac":"%s","project":"%s","exit":%s,"queued":%s,"ran":%s,"end":%s,"cmd_b64":"%s"}\n' \
+  "$ID" "$MACID" "$PROJECT" "${EX:-1}" "$QUEUED" "$RAN" "$(date +%s)" "$CMD" >> "$ROOT/history.jsonl"
+
+rm -f "$JOB" "$M/running/$ID.started" "$M/cancel/$ID"

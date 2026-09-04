@@ -1,0 +1,7 @@
+interface:
+  display_name: "rexec"
+  short_description: "Run builds and test suites on a Mac instead of this server"
+  default_prompt: "Use $rexec to run this build or test suite on the mac."
+
+policy:
+  allow_implicit_invocation: true

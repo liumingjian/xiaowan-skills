@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# rexec - dispatch a command to a mac; the server blocks until the result comes back.
+# Usage: rexec [options] '<shell command>'
+#   --sync DIR     server directory to sync to the mac (default: current working directory)
+#   --no-sync      skip the sync and run straight in the mac workspace (a light job, exempt from the gate)
+#   --with-git     include .git in the sync (opt-in; excluded by default)
+#   --light        declare a light job explicitly, exempt from the load gate
+#   --timeout N    run timeout in seconds (default 900; queue time excluded)
+#   --cwd DIR      subdirectory under the workspace on the mac
+#   --mac NAME     target mac (prefix ok; defaults to the mac this session ssh'd in from)
+#   --macs         list known macs and exit
+#   --queue [MAC]  show the queue and exit
+#   --cancel [ID]  cancel a job and exit
+set -u
+. /var/lib/rexec/bin/rexec-lib.sh
+b64() { openssl base64 -A; }
+fmt_dur() {
+  s=${1:-0}; case "$s" in ''|*[!0-9]*) s=0;; esac
+  if [ "$s" -lt 60 ]; then printf '%ds' "$s"
+  else printf '%dm%02ds' $((s/60)) $((s%60)); fi
+}
+
+SYNC_DIR="$PWD"; TIMEOUT=900; SUBCWD=""; WEIGHT=normal; WANT_MAC="${REXEC_MAC:-}"; WITHGIT=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --sync)    SYNC_DIR="$2"; shift 2;;
+    --no-sync) SYNC_DIR="-"; WEIGHT=light; shift;;
+    --light)   WEIGHT=light; shift;;
+    --with-git) WITHGIT=1; shift;;
+    --timeout) TIMEOUT="$2"; shift 2;;
+    --cwd)     SUBCWD="$2"; shift 2;;
+    --mac)     WANT_MAC="$2"; shift 2;;
+    --macs)    exec "$ROOT/bin/rexec-macs";;
+    --queue)   shift; exec "$ROOT/bin/rexec-queue" "$@";;
+    --cancel)  shift; exec "$ROOT/bin/rexec-cancel" "$@";;
+    --)        shift; break;;
+    -*)        echo "rexec: unknown option $1" >&2; exit 2;;
+    *)         break;;
+  esac
+done
+[ $# -ge 1 ] || { echo "Usage: rexec [--mac NAME] [--sync DIR|--no-sync] [--with-git] [--light] [--timeout N] [--cwd SUB] '<command>'" >&2; exit 2; }
+CMD="$*"
+
+# --- pick the target mac ---
+# Several macs can attach to this VPS. The default target is the mac this session ssh'd in from, matched on
+# source IP; when its agent is down we say so rather than falling back to some other mac that happens to be up.
+MACID=$(resolve_mac "$WANT_MAC") || exit 3
+NOW=$(date +%s)
+if [ "$MACID" = "__none__" ]; then
+  ORIGIN=$(origin_ip)
+  echo "rexec: no agent is running on the mac this session came from (${ORIGIN:-no ssh source ip})." >&2
+  echo "Run this in a terminal on that mac:" >&2
+  echo "  bash ~/rexec-agent.sh" >&2
+  echo "If it is not installed yet:" >&2
+  echo "  ssh vps-2g 'cat /var/lib/rexec/agent.sh' > ~/rexec-agent.sh && bash ~/rexec-agent.sh" >&2
+  # Another mac may be online; it is a different machine, so say so instead of quietly using it.
+  mac_list_hint
+  exit 69
+fi
+M="$MACS/$MACID"
+if ! mac_online "$MACID"; then
+  HB=$(mac_hb "$MACID")
+  if [ "$HB" = 0 ]; then WHEN="never sent a heartbeat"; else WHEN="heartbeat stopped $(( NOW - HB ))s ago"; fi
+  echo "rexec: the agent on target mac '$MACID' is not online ($WHEN)." >&2
+  echo "Run this on that mac:  bash ~/rexec-agent.sh" >&2
+  mac_list_hint
+  exit 69
+fi
+
+# --- --with-git needs an agent that knows the flag ---
+# An older agent parses the job with sed and simply ignores WITHGIT, which would sync without .git while the
+# caller believes it arrived. Refuse instead: a silently missing .git is the bug this flag exists to prevent.
+if [ "$WITHGIT" = 1 ] && ! grep -qw git "$M/caps" 2>/dev/null; then
+  echo "rexec: the agent on '$MACID' predates --with-git." >&2
+  echo "Restart it on that mac (Ctrl-C the agent terminal first):" >&2
+  echo "  ssh vps-2g 'cat /var/lib/rexec/agent.sh' > ~/rexec-agent.sh && bash ~/rexec-agent.sh" >&2
+  exit 2
+fi
+
+# --- project key: basename truncated to 10 + hash6 of the full path ---
+# One project always reuses one workspace (dependencies install once); same-named different projects stay apart.
+if [ "$SYNC_DIR" = "-" ]; then
+  PROJECT="__nosync__"; PROJ_SHORT="nosync"
+else
+  SYNC_DIR=$(cd "$SYNC_DIR" 2>/dev/null && pwd) \
+    || { echo "rexec: sync directory does not exist: $SYNC_DIR" >&2; exit 2; }
+  # Syncing the whole root is never intended: gigabytes of system files pushed to the mac, and basename "/" is "/",
+  # which historically rsynced the entire VPS root into the workspace root on the mac. Refuse outright.
+  [ "$SYNC_DIR" = / ] && {
+    echo "rexec: refusing to sync the root directory /. Use --sync <a project directory>, or --no-sync to probe only." >&2
+    exit 2
+  }
+  PROJ_SHORT=$(printf "%s" "$(basename "$SYNC_DIR")" | tr -c "A-Za-z0-9_.-" "_" | cut -c1-10)
+  [ -n "$PROJ_SHORT" ] || PROJ_SHORT=proj
+  PROJECT="$PROJ_SHORT-$(printf '%s' "$SYNC_DIR" | md5sum | cut -c1-6)"
+fi
+
+# --- short ID: <project10>-<4-digit seq>, at most 15 chars, exactly the log ID column width ---
+# The sequence is global: IDs are unique across macs, so cancelling never needs to know which mac runs it.
+SEQ=$(flock "$ROOT/seq.lock" -c '
+  n=$(cat /var/lib/rexec/seq 2>/dev/null || echo 0)
+  case "$n" in ""|*[!0-9]*) n=0;; esac
+  n=$((n+1)); [ "$n" -gt 9999 ] && n=1
+  printf "%s" "$n" > /var/lib/rexec/seq
+  printf "%04d" "$n"')
+ID="$PROJ_SHORT-$SEQ"
+
+# --- submit ---
+JOB="$M/queue/.$ID.tmp"
+{
+  echo "ID=$ID"
+  echo "CMD=$(printf '%s' "$CMD"      | b64)"
+  echo "SYNC=$(printf '%s' "$SYNC_DIR" | b64)"
+  echo "SUBCWD=$(printf '%s' "$SUBCWD" | b64)"
+  echo "TIMEOUT=$TIMEOUT"
+  echo "WEIGHT=$WEIGHT"
+  echo "WITHGIT=$WITHGIT"
+  echo "PROJECT=$PROJECT"
+  echo "SUBMIT=$NOW"
+  echo "SEQ=$SEQ"
+} > "$JOB"
+mv "$JOB" "$M/queue/$ID.job"
+
+# --- ESC / Ctrl-C: killing only ourselves would leave the job running on the mac, still holding gate budget ---
+on_interrupt() {
+  trap '' INT TERM
+  echo "" >&2
+  echo "rexec: cancelling $ID ..." >&2
+  "$ROOT/bin/rexec-cancel" "$ID" >/dev/null 2>&1
+  exit 130
+}
+trap on_interrupt INT TERM
+
+# --- wait for the result ---
+# --timeout measures run time only: the clock starts when the job is claimed, so queueing never times out.
+DONE="$M/results/$ID.done"
+OUT="$M/results/$ID.out"
+STARTED="$M/running/$ID.started"
+while [ ! -f "$DONE" ]; do
+  sleep 1
+  now=$(date +%s)
+
+  if [ -f "$STARTED" ]; then
+    st=$(cat "$STARTED" 2>/dev/null || echo "$now")
+    case "$st" in ''|*[!0-9]*) st=$now;; esac
+    if [ $(( now - st )) -gt $(( TIMEOUT + 60 )) ]; then
+      echo "rexec: run timed out (>${TIMEOUT}s), termination requested" >&2
+      trap '' INT TERM
+      "$ROOT/bin/rexec-cancel" "$ID" >/dev/null 2>&1
+      exit 124
+    fi
+  fi
+
+  # Fallback for a dead agent. On a clean exit the agent reports every running job, so this never fires.
+  hb=$(mac_hb "$MACID")
+  if [ $(( now - hb )) -gt 180 ]; then
+    echo "rexec: the agent on mac '$MACID' has been unreachable for over 180s, giving up" >&2
+    rm -f "$M/queue/$ID.job"
+    exit 69
+  fi
+done
+
+EXITCODE=$(sed -n 's/^EXIT=//p'   "$DONE")
+RAN=$(sed -n 's/^RAN=//p'         "$DONE")
+QUEUED=$(sed -n 's/^QUEUED=//p'   "$DONE")
+[ -f "$OUT" ] && cat "$OUT"
+printf -- '--- [%s] exit=%s | queued %s | ran %s | total %s ---\n' \
+  "$MACID" "${EXITCODE:-1}" "$(fmt_dur "${QUEUED:-0}")" "$(fmt_dur "${RAN:-0}")" \
+  "$(fmt_dur $(( ${QUEUED:-0} + ${RAN:-0} )))" >&2
+[ "${EXITCODE:-1}" = 125 ] && echo "rexec: this job was cancelled" >&2
+rm -f "$DONE" "$OUT"
+exit "${EXITCODE:-1}"

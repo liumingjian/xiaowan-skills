@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Called once when the agent starts: register this mac's identity and human-readable label.
+# Usage: rexec-announce <MACID> <LABEL_BASE64> [CAPS]
+# CAPS is a comma-separated capability list from the agent; an older agent sends none, which is how the
+# server tells "this agent cannot do it" from "this agent can".
+set -u
+. /var/lib/rexec/bin/rexec-lib.sh
+MACID="${1:?}"; LABEL_B64="${2:-}"; CAPS="${3:-}"
+case "$MACID" in *[!A-Za-z0-9_.-]*) echo "invalid MACID" >&2; exit 2;; esac
+mac_dirs "$MACID"
+[ -n "$LABEL_B64" ] && printf '%s' "$LABEL_B64" | openssl base64 -d -A > "$MACS/$MACID/name" 2>/dev/null
+printf '%s' "$CAPS" > "$MACS/$MACID/caps"
+IP="${SSH_CLIENT%% *}"; [ -n "$IP" ] && printf '%s' "$IP" > "$MACS/$MACID/origin"
+echo "OK $MACID"
