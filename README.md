@@ -24,9 +24,12 @@ These skills are public beta releases. They stay in `skills/in-progress/` until 
 
 - **[accept-milestone](./skills/in-progress/accept-milestone/SKILL.md)** - Run a clean-room, end-to-end acceptance pass and produce a plain-language verdict.
 - **[delegate-to-cc](./skills/in-progress/delegate-to-cc/SKILL.md)** - Send a Git or non-Git project snapshot to Claude Code on `vps-2g` for a second opinion or patch.
+- **[delegate-to-codex](./skills/in-progress/delegate-to-codex/SKILL.md)** - Send the current project to the Codex CLI on the user's Mac for a second opinion or patch.
 - **[readme-designer](./skills/in-progress/readme-designer/SKILL.md)** - Review or rewrite a repository README around real facts, navigation, and a verifiable first run.
 
 `delegate-to-cc` requires the local `ssh`, `scp`, `tar`, and `find` commands plus the `vps-2g` SSH alias. The remote host provides Claude Code and its own disposable Git metadata for patch generation.
+
+`delegate-to-codex` runs the mirror trip and requires the `rexec` skill, which is the only channel from the server to the Mac and also selects the target Mac. The Mac provides the Codex CLI; disposable Git metadata for patch generation is created in the synced workspace.
 
 ## Repository layout
 
