@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# List every registered mac with its online state, source IP, and this session's default target.
+# Column headers stay ASCII: double-width characters would skew the column alignment.
+set -u
+. /var/lib/rexec/bin/rexec-lib.sh
+DEFAULT=$(resolve_mac 2>/dev/null || true)
+IP=$(origin_ip)
+printf 'session origin: %s\n\n' "${IP:-unknown}"
+printf '%-3s %-18s %-8s %-16s %s\n' '' MAC STATE ORIGIN NAME
+FOUND=0
+for m in $(all_macs); do
+  FOUND=1
+  hb=$(mac_hb "$m")
+  if mac_online "$m"; then st=ONLINE
+  elif [ "$hb" = 0 ]; then st=NEVER
+  else st=OFFLINE; fi
+  d=''; [ "$m" = "$DEFAULT" ] && d='->'
+  printf '%-3s %-18s %-8s %-16s %s\n' \
+    "$d" "$m" "$st" "$(cat "$MACS/$m/origin" 2>/dev/null || echo -)" "$(mac_label "$m")"
+done
+[ "$FOUND" = 0 ] && echo '(no mac has registered yet)'
+echo
+if [ -z "$DEFAULT" ] || [ "$DEFAULT" = "__none__" ]; then
+  echo 'no mac matches this session origin: start the agent on the mac you ssh'"'"'d in from,'
+  echo 'or name one explicitly with rexec --mac <name|prefix>'
+else
+  echo '->  the mac this session ssh'"'"'d in from; use rexec --mac <name|prefix> to override'
+fi
+exit 0

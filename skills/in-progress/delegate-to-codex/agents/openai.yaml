@@ -1,0 +1,7 @@
+interface:
+  display_name: "Delegate to Codex"
+  short_description: "Get a review or a patch from Codex on your Mac"
+  default_prompt: "Use $delegate-to-codex to send this to Codex on my Mac, then review the result with me."
+
+policy:
+  allow_implicit_invocation: false

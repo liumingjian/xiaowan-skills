@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Cancel one job. With no ID, list every mac's queue so the user can pick.
+# IDs are globally unique and searched across all macs, so which mac runs it does not matter.
+# Blast radius: that job's process group only - never other parallel jobs, never the agent itself.
+set -u
+. /var/lib/rexec/bin/rexec-lib.sh
+ID="${1:-}"
+
+if [ -z "$ID" ]; then
+  "$ROOT/bin/rexec-queue"
+  echo "To cancel, give an ID:  rexec --cancel <ID>"
+  exit 0
+fi
+
+for MACID in $(all_macs); do
+  M="$MACS/$MACID"
+
+  # 1) still queued - just remove it from the queue, without touching the mac at all
+  Q="$M/queue/$ID.job"
+  if [ -f "$Q" ]; then
+    SUBMIT=$(sed -n 's/^SUBMIT=//p' "$Q"); CMD=$(sed -n 's/^CMD=//p' "$Q")
+    PROJECT=$(sed -n 's/^PROJECT=//p' "$Q")
+    case "$SUBMIT" in ''|*[!0-9]*) SUBMIT=$(date +%s);; esac
+    rm -f "$Q"
+    NOW=$(date +%s); QD=$(( NOW - SUBMIT ))
+    printf '[rexec] cancelled while queued; never ran on the mac\n' > "$M/results/.$ID.out.tmp"
+    mv "$M/results/.$ID.out.tmp" "$M/results/$ID.out"
+    printf 'EXIT=125\nRAN=0\nQUEUED=%s\n' "$QD" > "$M/results/.$ID.done.tmp"
+    mv "$M/results/.$ID.done.tmp" "$M/results/$ID.done"
+    printf '{"id":"%s","mac":"%s","project":"%s","exit":125,"queued":%s,"ran":0,"end":%s,"cmd_b64":"%s"}\n' \
+      "$ID" "$MACID" "$PROJECT" "$QD" "$NOW" "$CMD" >> "$ROOT/history.jsonl"
+    echo "Cancelled $ID (still queued on $MACID, never started)"
+    exit 0
+  fi
+
+  # 2) running - write a marker; the agent picks it up within seconds and kills only that job's process group
+  if [ -f "$M/running/$ID.job" ]; then
+    : > "$M/cancel/$ID"
+    echo "Cancel requested for $ID; the agent on $MACID will terminate it within seconds (that job only)"
+    exit 0
+  fi
+done
+
+echo "No job $ID found. Current queues:" >&2
+"$ROOT/bin/rexec-queue" >&2
+exit 1

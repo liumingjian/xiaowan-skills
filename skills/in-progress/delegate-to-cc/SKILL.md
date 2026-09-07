@@ -16,18 +16,7 @@ Use Claude Code as a **second opinion**, never as the authority. Codex owns the 
 
    The mode is settled when the requested deliverable is either advice or a patch.
 
-2. Write a temporary Markdown handoff with these headings:
-
-   ```markdown
-   # Objective
-   # Why delegated
-   # Evidence
-   # Relevant paths
-   # Constraints
-   # Deliverable
-   ```
-
-   Make the objective checkable. Record what Codex tried and where its confidence ends, state observed errors verbatim, name project-relative paths, and mark unknowns as unknown. Reference project files instead of pasting them; the script sends a snapshot. The handoff is complete when a fresh agent can reconstruct the problem without this conversation.
+2. Write the handoff as Markdown, following `references/handoff.md` beside this file. Save it to a temporary path outside the project. The script reads the file and sends its contents as the prompt, so the handoff itself does not have to be inside the snapshot.
 
 3. Close the transmission boundary. Run from the target project root. The script chooses a snapshot mode automatically:
 
@@ -40,7 +29,7 @@ Use Claude Code as a **second opinion**, never as the authority. Codex owns the 
      Add `--include-untracked` only after every entry is relevant and safe to send.
    - In a non-Git project, it sends eligible files below the current directory, excluding `.git`, common dependency/build/cache directories, and obvious credential files. `--include-untracked` has no effect in this mode.
 
-   Redact credentials and private data from the handoff. The boundary is closed when all required context is included and no secret crosses it.
+   The boundary is closed when all required context is included and no secret crosses it.
 
 4. Keep the working directory at the target project root. Resolve `SKILL_DIR` to the directory containing this file, then run:
 

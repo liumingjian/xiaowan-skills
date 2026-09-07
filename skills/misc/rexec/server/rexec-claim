@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Called once per agent poll; one ssh round trip does three things: refresh the heartbeat, fetch the
+# cancel list, and optionally claim one job.
+# Usage: rexec-claim <MACID> <claim:0|1> <gate:open|closed> <running_count> <cpu%> <memfree%> <heavy_ok:0|1>
+# Queues are namespaced by MACID: a mac only sees, and only claims, jobs addressed to it.
+# heavy_ok=1 means the agent's gate is open and the claim cooldown has elapsed, so another heavy job is fine.
+# Light jobs (--no-sync / --light) ignore that flag, so they are still claimable with the gate closed.
+# Output:
+#   CANCEL=<space-separated ID list>
+#   then the job body, or NONE
+set -u
+. /var/lib/rexec/bin/rexec-lib.sh
+MACID="${1:?}"; WANT="${2:-0}"; GATE="${3:-open}"; NRUN="${4:-0}"
+CPU="${5:--}"; MEM="${6:--}"; HEAVY_OK="${7:-1}"
+case "$MACID" in *[!A-Za-z0-9_.-]*) echo "invalid MACID" >&2; exit 2;; esac
+NOW=$(date +%s)
+M="$MACS/$MACID"
+mac_dirs "$MACID"
+
+# Temp files carry the PID so concurrent calls never mv away each other's intermediates.
+printf '%s' "$NOW" > "$M/.alive.$$" && mv "$M/.alive.$$" "$M/agent.alive"
+# Source IP refreshes every poll so routing keeps up after a network or Wi-Fi change, and every distinct
+# one is kept in the trail so a caller whose own IP has since rotated can still be matched to this mac.
+note_origin "$MACID" "${SSH_CLIENT%% *}"
+printf 'TS=%s\nGATE=%s\nCPU=%s\nMEM=%s\nRUNNING=%s\n' \
+  "$NOW" "$GATE" "$CPU" "$MEM" "$NRUN" > "$M/.gate.$$" \
+  && mv "$M/.gate.$$" "$M/gate.status"
+
+# Orphan result cleanup: when the caller exits via ESC or timeout nobody collects .done/.out and they pile up.
+# Sweep every 10 minutes and drop anything over an hour old (on the normal path results are collected within a second).
+SWEEP="$ROOT/.sweep"
+if [ ! -f "$SWEEP" ] || [ -n "$(find "$SWEEP" -mmin +10 2>/dev/null)" ]; then
+  : > "$SWEEP"
+  find "$MACS"/*/results -type f -mmin +60 -delete 2>/dev/null || true
+fi
+
+# Cancel list: the agent kills the matching process groups, and report clears the markers afterwards.
+CANCELS=""
+for c in "$M"/cancel/*; do
+  [ -e "$c" ] || break
+  CANCELS="$CANCELS $(basename "$c")"
+done
+echo "CANCEL=${CANCELS# }"
+
+[ "$WANT" = 1 ] || { echo NONE; exit 0; }
+
+# Strict FIFO: only the head is considered; if the head cannot run, everything waits.
+# Jobs submitted in the same second collide, so the submit sequence breaks the tie; otherwise this degrades to filename order.
+HEAD=$(for f in "$M"/queue/*.job; do
+         [ -e "$f" ] || continue
+         printf '%s %s %s\n' "$(sed -n 's/^SUBMIT=//p' "$f")" \
+                              "$(sed -n 's/^SEQ=//p' "$f")" "$f"
+       done | sort -n -k1,1 -k2,2 | head -1 | cut -d' ' -f3-)
+[ -n "$HEAD" ] || { echo NONE; exit 0; }
+
+HPROJ=$(sed -n 's/^PROJECT=//p' "$HEAD")
+HWEIGHT=$(sed -n 's/^WEIGHT=//p' "$HEAD")
+
+# Same project runs serially: one workspace directory cannot have two jobs rsyncing and running at once.
+if [ "$HPROJ" != "__nosync__" ]; then
+  for r in "$M"/running/*.job; do
+    [ -e "$r" ] || break
+    [ "$(sed -n 's/^PROJECT=//p' "$r")" = "$HPROJ" ] && { echo NONE; exit 0; }
+  done
+fi
+
+# Load gate plus claim cooldown: light jobs are entirely exempt;
+# and when nothing is running (NRUN=0) we let one through regardless, or a persistently busy mac stalls the queue forever.
+if [ "$HWEIGHT" != light ] && [ "$NRUN" -gt 0 ] && [ "$HEAVY_OK" != 1 ]; then
+  echo NONE; exit 0
+fi
+
+ID=$(sed -n 's/^ID=//p' "$HEAD")
+if mv "$HEAD" "$M/running/$ID.job" 2>/dev/null; then
+  printf '%s' "$NOW" > "$M/running/$ID.started"
+  cat "$M/running/$ID.job"
+else
+  echo NONE
+fi
