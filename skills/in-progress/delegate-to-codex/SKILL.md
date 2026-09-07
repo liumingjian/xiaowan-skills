@@ -29,21 +29,9 @@ agent pulls the job. `rexec` also decides **which** Mac — the one this session
 
    The mode is settled when the requested deliverable is either advice or a patch.
 
-3. **Write the handoff** as Markdown under the project root, with these headings:
-
-   ```markdown
-   # Objective
-   # Why delegated
-   # Evidence
-   # Relevant paths
-   # Constraints
-   # Deliverable
-   ```
-
-   Make the objective checkable. Record what you already tried and where your confidence ends, quote errors
-   verbatim, name project-relative paths, and mark unknowns as unknown. Reference files instead of pasting
-   them; `rexec` syncs the whole directory. Redact credentials. The handoff is complete when a fresh agent
-   could reconstruct the problem without this conversation.
+3. **Write the handoff** as Markdown, following `references/handoff.md` beside this file. Save it under
+   the project root and check that `.gitignore` does not match it: `rexec` syncs the directory, and a
+   handoff it would never carry is refused rather than sent as a dangling path.
 
 4. **Install dependencies first, if the task needs them.** The Codex sandbox has **no network**, so a build
    or test run inside it fails on a missing dependency. Split the work the way the two channels split:
@@ -79,5 +67,3 @@ agent pulls the job. `rexec` also decides **which** Mac — the one this session
   `codex exec review --base <branch>` possible in the handoff.
 - `--with-git` needs a Mac agent new enough to know the flag. If `rexec` refuses, ask the user to restart the
   agent on that Mac; a second Mac being ready is not a reason to retarget.
-- A handoff that `.gitignore` matches never reaches the Mac; `delegate.sh` refuses rather than sending a
-  dangling path.
