@@ -29,6 +29,18 @@ agent pulls the job. `rexec` also decides **which** Mac — the one this session
 
    The mode is settled when the requested deliverable is either advice or a patch.
 
+   **Settle the model.** The default is `gpt-6-astra` at `xhigh` effort. Unless the user has already named
+   a model or effort in this conversation, ask once before dispatching, showing the default and the
+   override format:
+
+   ```
+   model:<model>
+   effort:<effort>
+   ```
+
+   Either line may be omitted; an omitted line keeps its default, and a reply that accepts the default
+   settles it. Pass the result as `--model` and `--effort`.
+
 3. **Write the handoff** as Markdown, following `references/handoff.md` beside this file. Save it under
    the project root and check that `.gitignore` does not match it: `rexec` syncs the directory, and a
    handoff it would never carry is refused rather than sent as a dangling path.
@@ -41,13 +53,14 @@ agent pulls the job. `rexec` also decides **which** Mac — the one this session
    directory holding this file:
 
    ```bash
-   "$SKILL_DIR/scripts/delegate.sh" --mode consult --prompt-file ./handoff.md
+   "$SKILL_DIR/scripts/delegate.sh" --mode consult --prompt-file ./handoff.md \
+     --model gpt-6-astra --effort xhigh
    ```
 
    Add `--with-git` when the review depends on history — a base-branch or single-commit review, or "what
    changed and why". It syncs the whole repository history, so leave it off otherwise. Add
-   `--resume <THREAD_ID>` to continue an earlier Codex thread. See `--help` for mac, model, timeout, and
-   output options. A successful run prints `STATUS=0` plus paths for `response.md`, `changes.patch`, and
+   `--resume <THREAD_ID>` to continue an earlier Codex thread. See `--help` for mac, timeout, and output
+   options. A successful run prints `STATUS=0` plus paths for `response.md`, `changes.patch`, and
    `codex.jsonl`; the bulk stays on disk under `.codex-out/`, never in context. On any other status, read the
    error line — it names the next action — and report the failed delegation rather than retrying blind.
    On `GITIGNORE_HINT`, add `.codex-out/` to `.gitignore`.
