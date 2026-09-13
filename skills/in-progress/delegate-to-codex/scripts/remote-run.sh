@@ -7,6 +7,7 @@ mode="${1:-}"
 prompt_rel="${2:-}"
 model="${3:-}"
 resume_id="${4:-}"
+effort="${5:-}"
 
 case "$mode" in
   consult|implement) ;;
@@ -84,6 +85,9 @@ codex_args+=(
 )
 if [[ -n "$model" ]]; then
   codex_args+=(-m "$model")
+fi
+if [[ -n "$effort" ]]; then
+  codex_args+=(-c "model_reasoning_effort=$effort")
 fi
 # The session id is positional and must follow the options.
 if [[ -n "$resume_id" ]]; then

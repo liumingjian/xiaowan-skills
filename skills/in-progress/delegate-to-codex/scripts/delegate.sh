@@ -14,7 +14,8 @@ Options:
   --prompt-file PATH         Handoff Markdown, inside the current directory
   --mac NAME_OR_PREFIX       Target a specific Mac (see: rexec --macs)
   --with-git                 Sync real Git history, so Codex can review against a base branch
-  --model MODEL              Codex model
+  --model MODEL              Codex model (default: gpt-6-astra)
+  --effort EFFORT            Codex reasoning effort (default: xhigh)
   --timeout-seconds N        Stop Codex after N seconds of run time (default: 1800)
   --resume THREAD_ID         Continue an earlier Codex thread
   --output-dir DIR           Store returned artifacts in DIR (default: .codex-out/<ts>)
@@ -35,7 +36,8 @@ mode="consult"
 prompt_file=""
 mac=""
 with_git=0
-model=""
+model="gpt-6-astra"
+effort="xhigh"
 resume_id=""
 output_dir=""
 timeout_seconds=1800
@@ -47,6 +49,7 @@ while [[ $# -gt 0 ]]; do
     --mac) require_value "$@"; mac="$2"; shift 2 ;;
     --with-git) with_git=1; shift ;;
     --model) require_value "$@"; model="$2"; shift 2 ;;
+    --effort) require_value "$@"; effort="$2"; shift 2 ;;
     --resume) require_value "$@"; resume_id="$2"; shift 2 ;;
     --timeout-seconds) require_value "$@"; timeout_seconds="$2"; shift 2 ;;
     --output-dir) require_value "$@"; output_dir="$2"; shift 2 ;;
@@ -59,6 +62,9 @@ case "$mode" in
   consult|implement) ;;
   *) die "--mode must be consult or implement" ;;
 esac
+# Both values are spliced into a single-quoted remote command, so keep them to plain identifiers.
+[[ "$model" =~ ^[A-Za-z0-9._:-]+$ ]] || die "--model must be a plain model name: $model"
+[[ "$effort" =~ ^[a-z]+$ ]] || die "--effort must be a plain effort level (e.g. low, medium, high, xhigh): $effort"
 [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ && "$timeout_seconds" -le 86400 ]] || die "--timeout-seconds must be between 1 and 86400"
 [[ -n "$prompt_file" ]] || die "--prompt-file is required"
 [[ -f "$prompt_file" && -s "$prompt_file" ]] || die "handoff must exist and be non-empty: $prompt_file"
@@ -93,7 +99,7 @@ remote_runner="$script_dir/remote-run.sh"
 [[ -f "$remote_runner" ]] || die "remote runner not found: $remote_runner"
 runner_b64="$(base64 -w0 <"$remote_runner")"
 
-remote_script='rs="${TMPDIR:-/tmp}/delegate-to-codex-run.sh"; printf %s '"'$runner_b64'"' | base64 -d > "$rs"; bash "$rs" '"'$mode' '$prompt_rel' '$model' '$resume_id'"
+remote_script='rs="${TMPDIR:-/tmp}/delegate-to-codex-run.sh"; printf %s '"'$runner_b64'"' | base64 -d > "$rs"; bash "$rs" '"'$mode' '$prompt_rel' '$model' '$resume_id' '$effort'"
 
 rexec_args=(--timeout "$timeout_seconds")
 [[ -n "$mac" ]] && rexec_args+=(--mac "$mac")
@@ -131,6 +137,8 @@ target_mac="$(sed -n 's/.*--- \[\([^]]*\)\] exit=.*/\1/p' "$bill" | tail -n 1)"
 printf 'OUTPUT_DIR=%s\n' "$output_dir"
 printf 'MODE=%s\n' "$mode"
 printf 'MAC=%s\n' "${target_mac:-unknown}"
+printf 'MODEL=%s\n' "$model"
+printf 'EFFORT=%s\n' "$effort"
 printf 'RESPONSE=%s/response.md\n' "$output_dir"
 printf 'PATCH=%s/changes.patch\n' "$output_dir"
 printf 'PATCH_BYTES=%s\n' "$(wc -c <"$output_dir/changes.patch" | tr -d ' ')"
