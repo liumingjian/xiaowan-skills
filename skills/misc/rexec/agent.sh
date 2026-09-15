@@ -195,14 +195,15 @@ if ! ssh $SSH_OPTS -o BatchMode=yes "$HOST" true 2>/tmp/rexec-sshtest.$$; then
   cat >&2 <<'MSG'
   Troubleshooting:
     1) verify by hand:  ssh -o BatchMode=yes vps-2g true && echo OK
-    2) key has a passphrase:  ssh-add --apple-use-keychain ~/.ssh/my-vps_ed25519
+    2) key has a passphrase:  ssh-add --apple-use-keychain ~/.ssh/vps-2g-rexec
     3) different alias or key:  REXEC_HOST=your-alias bash ~/rexec-agent.sh
+    4) a new mac needs its own key: see "Adding a mac" in the rexec skill's REFERENCE.md
 MSG
   rm -f /tmp/rexec-sshtest.$$; kill "$SAMPLER_PID" 2>/dev/null; exit 1
 fi
 rm -f /tmp/rexec-sshtest.$$
 
-# Register the identity: the server builds a dedicated queue from it and records this machine's source IP for automatic routing
+# Register the identity: the server builds a dedicated queue from it and checks it against this login's key
 if ! $SSH -n "/var/lib/rexec/bin/rexec-announce $MACID $(printf '%s' "$LABEL" | b64) $CAPS" >/dev/null 2>&1; then
   echo "Registration failed: the server-side rexec may be an old version. Re-run the install on the VPS:" >&2
   echo "  bash /home/agent/.claude/skills/rexec/install.sh" >&2

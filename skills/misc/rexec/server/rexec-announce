@@ -7,6 +7,7 @@ set -u
 . /var/lib/rexec/bin/rexec-lib.sh
 MACID="${1:?}"; LABEL_B64="${2:-}"; CAPS="${3:-}"
 case "$MACID" in *[!A-Za-z0-9_.-]*) echo "invalid MACID" >&2; exit 2;; esac
+login_matches "$MACID" || { echo "this login's key is tagged for another mac, not $MACID" >&2; exit 2; }
 mac_dirs "$MACID"
 [ -n "$LABEL_B64" ] && printf '%s' "$LABEL_B64" | openssl base64 -d -A > "$MACS/$MACID/name" 2>/dev/null
 printf '%s' "$CAPS" > "$MACS/$MACID/caps"

@@ -11,13 +11,15 @@ for it, rsyncs the code over, runs it locally, and ships back the output and exi
 Pull-based rather than reverse SSH because the user's home connection sits behind NAT — the server
 cannot reach the mac.
 
-The environment is fixed: SSH alias `vps-2g` (defined in the mac's `~/.ssh/config`, key
-`~/.ssh/my-vps_ed25519`; override with `REXEC_HOST`); mac workspace
-`~/rexec-workspace/<project>-<pathhash>/`.
+The environment is fixed: SSH alias `vps-2g` (defined in the mac's `~/.ssh/config`, override with
+`REXEC_HOST`); each mac logs in with its own key `~/.ssh/vps-2g-rexec`, tagged `rexec-mac=<MACID>` in the
+server's `authorized_keys`; mac workspace `~/rexec-workspace/<project>-<pathhash>/`.
 
 **Multiple macs are first-class.** Each mac's agent has its own identity and its own queue on the server.
-**A job goes to the mac this session ssh'd in from**, matched on source IP — a different mac having an agent
-up is never a substitute, and rexec asks you to start the agent on the right one instead of quietly using it.
+**A job goes to this session's mac**: the one whose key its live ssh login used. A session with no live
+login (a background job) goes to the only online mac, or, when several are online, to the default set with
+`rexec --use <name>`. A different mac having an agent up is never a substitute for the named one, and rexec
+asks you to start the agent on the right one instead of quietly using it. IP addresses play no part.
 **Jobs from different projects run in parallel; jobs from the same project run serially** (they share one
 workspace), counted per mac.
 The caller blocks until the result arrives, and gets a bill of queue time and run time at the end.
@@ -32,6 +34,7 @@ rexec --queue          # every mac's queue: what's running, what's waiting, what
 rexec --cancel <ID>    # cancel one job (IDs look like myproj-0041; globally unique, found across all macs)
 rexec --cancel         # no ID: list the queue first, let the user pick
 rexec --macs           # which macs are registered, who is online, this session's default target
+rexec --use <name>     # set the default mac for when several are online (persists; --use none clears)
 ```
 
 Cancelling kills only that job's process group; other running jobs and the agent itself are untouched.
@@ -53,10 +56,11 @@ bash /home/agent/.claude/skills/rexec/install.sh
 
 Then handle it as `OFFLINE`.
 
-**`OFFLINE`** — no agent is running on this session's mac. Some *other* mac may well show `ONLINE` in the
-table; it is a different machine, so it is not the target — do not reach for `--mac` to route around this.
-Hand the user this command verbatim, ask them to run it **in a terminal on the mac they are ssh'd in from**,
-then **stop and wait for their reply** before continuing:
+**`OFFLINE`** — either this session's login names a mac whose agent is not running, or no agent is
+online at all. In the first case some *other* mac may well show `ONLINE` in the table; it is a different
+machine, so it is not the target — do not reach for `--mac` to route around this.
+Hand the user this command verbatim, ask them to run it **in a terminal on the mac `status.sh` names**
+(or, when it names none, the mac they are using), then **stop and wait for their reply** before continuing:
 
 ```bash
 ssh vps-2g 'cat /var/lib/rexec/agent.sh' > ~/rexec-agent.sh && bash ~/rexec-agent.sh
@@ -67,9 +71,10 @@ things: the agent occupies a terminal tab for as long as it runs, and it is only
 `polling every 2s, ctrl-c to stop` appears; Ctrl-C stops it. Its first line prints its identity, e.g.
 `rexec-agent  macbook-pro-3f9a  ->  vps-2g  ~/rexec-workspace`.
 
-**`AMBIGUOUS`** — two or more macs announced from this session's source IP (both behind one home NAT), so the
-IP no longer picks one out. Show the user the table, ask which mac this session is on, then pass
-`--mac <name>` on **every** rexec call for the rest of the session — the flag does not persist between calls.
+**`AMBIGUOUS`** — several macs are online, this session has no live login naming one, and no default is
+set. Show the user the table, ask which mac to use, then run `rexec --use <name>`: the default persists on
+the server for every session. For a one-off choice, pass `--mac <name>` on **every** rexec call instead —
+that flag does not persist between calls.
 
 **The agent is single-instance, per mac.** Starting a second one is blocked, and the existing pid is
 printed. This is deliberate: two agents fight over the queue, each claiming half the jobs, which is

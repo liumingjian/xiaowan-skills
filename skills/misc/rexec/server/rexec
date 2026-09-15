@@ -7,7 +7,9 @@
 #   --light        declare a light job explicitly, exempt from the load gate
 #   --timeout N    run timeout in seconds (default 900; queue time excluded)
 #   --cwd DIR      subdirectory under the workspace on the mac
-#   --mac NAME     target mac (prefix ok; defaults to the mac this session ssh'd in from)
+#   --mac NAME     target mac (prefix ok; the default is explained at resolve_mac in rexec-lib.sh)
+#   --use NAME     set the default mac for when several are online and no live login names one;
+#                  --use none clears it
 #   --macs         list known macs and exit
 #   --queue [MAC]  show the queue and exit
 #   --cancel [ID]  cancel a job and exit
@@ -30,6 +32,12 @@ while [ $# -gt 0 ]; do
     --timeout) TIMEOUT="$2"; shift 2;;
     --cwd)     SUBCWD="$2"; shift 2;;
     --mac)     WANT_MAC="$2"; shift 2;;
+    --use)
+      [ -n "${2:-}" ] || { echo "Usage: rexec --use <name|prefix|none>" >&2; exit 2; }
+      if [ "$2" = none ]; then rm -f "$ROOT/default"; echo "rexec: default mac cleared"; exit 0; fi
+      U=$(resolve_mac "$2") || exit 3
+      printf '%s' "$U" > "$ROOT/.default.$$" && mv "$ROOT/.default.$$" "$ROOT/default"
+      echo "rexec: default mac is now $U"; exit 0;;
     --macs)    exec "$ROOT/bin/rexec-macs";;
     --queue)   shift; exec "$ROOT/bin/rexec-queue" "$@";;
     --cancel)  shift; exec "$ROOT/bin/rexec-cancel" "$@";;
@@ -42,20 +50,16 @@ done
 CMD="$*"
 
 # --- pick the target mac ---
-# Several macs can attach to this VPS. The default target is the mac this session ssh'd in from, matched on
-# source IP; when its agent is down we say so rather than falling back to some other mac that happens to be up.
+# Several macs can attach to this VPS. The default target is the mac whose key this session's live ssh
+# login used; when its agent is down we say so rather than falling back to some other mac that happens to be up.
 MACID=$(resolve_mac "$WANT_MAC") || exit 3
 NOW=$(date +%s)
 if [ "$MACID" = "__none__" ]; then
-  ORIGIN=$(origin_ip)
-  echo "rexec: no mac has announced from this session's source IP (${ORIGIN:-none - not an ssh session})." >&2
-  echo "Either the agent has never run on that mac, or it is running and something else changed the route." >&2
-  echo "If a mac below is online and is the one you are sitting at, name it:  rexec --mac <name> '<command>'" >&2
-  echo "Otherwise run this in a terminal on that mac:" >&2
+  echo "rexec: no rexec agent is online, and no live ssh login names a mac." >&2
+  echo "Run this in a terminal on the mac you want to use:" >&2
   echo "  bash ~/rexec-agent.sh" >&2
   echo "If it is not installed yet:" >&2
   echo "  ssh vps-2g 'cat /var/lib/rexec/agent.sh' > ~/rexec-agent.sh && bash ~/rexec-agent.sh" >&2
-  # Another mac may be online; it is a different machine, so say so instead of quietly using it.
   mac_list_hint
   exit 69
 fi
