@@ -6,29 +6,44 @@ variables.
 
 ## Choosing the target mac
 
-One VPS can have several macs attached. **The mac this session ssh'd in from is the target**; `rexec` only
-departs from that when you say so explicitly. Resolution order:
+One VPS can have several macs attached. Machines are told apart by **ssh key, never by IP**: home IPs
+rotate, and a proxy can give one mac several addresses at once. Each mac logs in with its own key
+(`~/.ssh/vps-2g-rexec`), whose line in the server's `~agent/.ssh/authorized_keys` ends with the comment
+`rexec-mac=<MACID>`. sshd runs with `ExposeAuthInfo yes` (`/etc/ssh/sshd_config.d/50-rexec.conf`), so each
+login gets `$SSH_USER_AUTH`, a file naming the key it used, which sshd deletes when the login ends.
+
+Resolution order:
 
 1. `--mac <name or prefix>` (or the `REXEC_MAC` environment variable) — explicit; any unique prefix works,
    e.g. `--mac studio`.
-2. **Source-IP claim** — the mac whose agent announced from the same IP this session ssh'd in from, taken
-   **whether or not its agent is currently up**. If it is down, that is exit **69** and a prompt to start the
-   agent *on that mac*: a different mac being online does not make it the target, and silently borrowing it
-   runs the job on a machine that has neither the user's attention nor the files they expect.
-3. **Origin trail** — the mac that announced from this IP at some point in the last two weeks
-   (`REXEC_ORIGIN_MEMORY`, seconds). This covers the **rotating home IP**: a caller's `SSH_CONNECTION` is
-   frozen at login while the agent re-announces every couple of seconds, so a session that outlives one IP
-   rotation holds an address the mac no longer reports, and step 2 alone would call an obviously-online
-   agent unreachable. Routing this way prints a line saying so.
-4. Source IP **unknown** (not an ssh session at all — cron, tty1) and exactly one mac online — use it.
-5. Otherwise exit **3** and list the candidates: several macs share one source IP or one trail (two machines
-   behind one home NAT), or there is no source IP and several macs are online. Re-run with `--mac`; do not guess.
+2. **Login key** — the mac whose key this session's live ssh login used, taken **whether or not its agent is
+   currently up**. If it is down, that is exit **69** and a prompt to start the agent *on that mac*: a
+   different mac being online does not make it the target, and silently borrowing it runs the job on a
+   machine that has neither the user's attention nor the files they expect.
+3. **Exactly one mac online** — use it. An agent only runs where the user started it.
+4. **Several online** — the default set with `rexec --use <name>` (stored in `/var/lib/rexec/default`), if
+   it is one of them.
+5. Otherwise exit **3** and list the candidates. Set a default or re-run with `--mac`; do not guess.
 
-`origin` is rewritten on every agent poll, so a mac that changes network or Wi-Fi re-routes itself within
-one poll, and each distinct address is appended to `origins` (the last 20 are kept). A mac the user has
-never started the agent on has neither, which lands on the exit-69 branch: start the agent there once and it
-registers. The trail only knows addresses seen since the agent last ran, so a session older than the mac's
-current trail still needs `--mac`.
+Step 2 only trusts a **live** login. A long-lived process such as a Claude daemon keeps the
+`SSH_USER_AUTH` of the login that started it, but sshd deleted that file when the login ended, so its
+background jobs skip step 2 instead of inheriting a stale mac.
+
+The agent's own logins are checked as well: `rexec-announce` and `rexec-claim` refuse a MACID other than the
+one the login key is tagged with. An untagged key (the old shared key) is let through.
+
+**Adding a mac.** On the mac, generate its own key, tagged with the identity the agent prints on its first
+line, and point the `vps-2g` alias at it:
+
+```bash
+ssh-keygen -t ed25519 -N "" -C rexec-mac=<MACID> -f ~/.ssh/vps-2g-rexec
+```
+
+Then append `~/.ssh/vps-2g-rexec.pub` to the server's `~agent/.ssh/authorized_keys`, set
+`IdentityFile ~/.ssh/vps-2g-rexec` under `Host vps-2g` in the mac's `~/.ssh/config`, and restart the agent.
+
+The `origin` file under each mac is only the last IP it called from, shown in `rexec --macs`; routing never
+reads it.
 
 The agent derives its own identity name: `<first 12 chars of ComputerName>-<hardware UUID hash4>`, e.g.
 `macbook-pro-3f9a`. The hash suffix keeps two identically named machines from colliding. To rename, use
@@ -83,11 +98,11 @@ job is on.
 
 ## Exit codes
 
-- `3` — several macs share this session's source IP, or there is no source IP and several are online.
-  Re-run with `--mac`.
-- `69` — the agent on **this session's mac** is offline, or has never been started there. Go back to the
-  `OFFLINE` branch of step 1 in SKILL.md to walk the user through starting it, then re-run the command.
-  Not a cue to retarget another mac with `--mac`.
+- `3` — several macs are online, and neither a live login nor the `rexec --use` default picks one; or a
+  `--mac` name matches no mac or several. Set a default or re-run with `--mac`.
+- `69` — the agent on **this session's mac** is offline or has never been started there, or no agent is
+  online at all. Go back to the `OFFLINE` branch of step 1 in SKILL.md to walk the user through starting
+  it, then re-run the command. Not a cue to retarget another mac with `--mac`.
 - `90` — rsync failed. `91` — target directory does not exist.
 - `124` — run timed out (exceeded `--timeout`; queue time excluded).
 - `125` — job cancelled (`--cancel`, or the caller pressed ESC).

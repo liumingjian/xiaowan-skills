@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# List every registered mac with its online state, source IP, and this session's default target.
+# List every registered mac with its online state, last source IP, and this session's default target.
 # Column headers stay ASCII: double-width characters would skew the column alignment.
 set -u
 . /var/lib/rexec/bin/rexec-lib.sh
 DEFAULT=$(resolve_mac 2>/dev/null || true)
-IP=$(origin_ip)
-printf 'session origin: %s\n\n' "${IP:-unknown}"
-printf '%-3s %-18s %-8s %-16s %s\n' '' MAC STATE ORIGIN NAME
+LOGIN=$(session_mac)
+USE=$(default_mac)
+printf 'session login key: %s\n' "${LOGIN:-none (not a live ssh login, or an untagged key)}"
+printf 'rexec --use default: %s\n\n' "${USE:-none}"
+printf '%-3s %-18s %-8s %-16s %s\n' '' MAC STATE LAST-IP NAME
 FOUND=0
 for m in $(all_macs); do
   FOUND=1
@@ -21,9 +23,9 @@ done
 [ "$FOUND" = 0 ] && echo '(no mac has registered yet)'
 echo
 if [ -z "$DEFAULT" ] || [ "$DEFAULT" = "__none__" ]; then
-  echo 'no mac matches this session origin: start the agent on the mac you ssh'"'"'d in from,'
-  echo 'or name one explicitly with rexec --mac <name|prefix>'
+  echo 'no target: no agent is online, or several are online and neither a live login nor a default picks one.'
+  echo 'start the agent on the mac you want, set one with rexec --use <name>, or pass rexec --mac <name>'
 else
-  echo '->  the mac this session ssh'"'"'d in from; use rexec --mac <name|prefix> to override'
+  echo '->  this session'"'"'s target; override per call with rexec --mac <name|prefix>'
 fi
 exit 0

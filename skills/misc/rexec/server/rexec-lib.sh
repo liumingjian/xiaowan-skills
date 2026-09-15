@@ -5,7 +5,7 @@
 # Directory layout (one independent queue per mac, fully isolated):
 #   /var/lib/rexec/macs/<MACID>/{queue,running,results,cancel}
 #   /var/lib/rexec/macs/<MACID>/{agent.alive,gate.status,origin,name}
-#   /var/lib/rexec/{seq,seq.lock,history.jsonl}          shared globally
+#   /var/lib/rexec/{seq,seq.lock,history.jsonl,default}   shared globally
 #
 # The state lives outside /root because two different unix users touch it: the `agent` user runs the
 # client (rexec), while the mac's agent reaches the server side over ssh as root. The tree is
@@ -25,7 +25,7 @@ online_macs(){ for m in $(all_macs); do mac_online "$m" && echo "$m"; done; }
 mac_label() { n=$(cat "$MACS/$1/name" 2>/dev/null); [ -n "$n" ] && printf '%s' "$n" || printf '%s' "$1"; }
 
 # Read one process's environment. Running as `agent`, the ancestors up the chain are root-owned and
-# /proc/<pid>/environ is unreadable, which used to silently lose the session's source IP; fall back to
+# /proc/<pid>/environ is unreadable, which used to silently lose the session's login; fall back to
 # passwordless sudo when it is available, and stay quiet when it is not.
 read_environ() {
   { cat "/proc/$1/environ" 2>/dev/null || sudo -n cat "/proc/$1/environ" 2>/dev/null; } \
@@ -35,69 +35,84 @@ read_environ() {
 # ::ffff:1.2.3.4 and 1.2.3.4 are the same host reached over a dual stack; store and compare one form.
 norm_ip() { printf '%s' "${1#::ffff:}"; }
 
-# Record where a mac is calling from. `origin` is the current IP; `origins` is the trail of the last 20,
-# which is what lets a long-lived caller still be matched after the home IP rotates under it.
+# Record the IP a mac last called from. Display only: routing never reads it, because home IPs rotate
+# and a proxy can give one mac several at once.
 note_origin() { # MACID IP
-  _m="$MACS/$1"; _ip=$(norm_ip "$2"); _now=$(date +%s)
-  [ -n "$_ip" ] || return 0
-  printf '%s' "$_ip" > "$_m/.orig.$$" && mv "$_m/.orig.$$" "$_m/origin"
-  [ "$(tail -n 1 "$_m/origins" 2>/dev/null | cut -d' ' -f1)" = "$_ip" ] && return 0
-  { grep -v "^$_ip " "$_m/origins" 2>/dev/null; printf '%s %s\n' "$_ip" "$_now"; } \
-    | tail -n 20 > "$_m/.origins.$$" && mv "$_m/.origins.$$" "$_m/origins"
+  _ip=$(norm_ip "$2"); [ -n "$_ip" ] || return 0
+  printf '%s' "$_ip" > "$MACS/$1/.orig.$$" && mv "$MACS/$1/.orig.$$" "$MACS/$1/origin"
 }
 
-# Which IP this invocation came into the VPS from.
-# Claude Code and interactive shells are both descendants of sshd, so they carry SSH_CONNECTION;
-# but rexec may be called from a deeper child, so walk up the parent chain to find it.
-origin_ip() {
-  if [ -n "${SSH_CONNECTION:-}" ]; then norm_ip "${SSH_CONNECTION%% *}"; return 0; fi
+# ---- identity: every mac logs in with its own ssh key ----
+# Each mac's public key sits in authorized_keys with the comment `rexec-mac=<MACID>`. sshd runs with
+# `ExposeAuthInfo yes`, so every login gets $SSH_USER_AUTH: a file naming the key it authenticated
+# with, which sshd deletes when the login ends.
+KEYS=${REXEC_KEYS:-$HOME/.ssh/authorized_keys}
+
+# The MACID tagged on the key recorded in auth-info file $1. Empty when the file is gone (the login
+# ended) or the key carries no tag (a key shared by several macs).
+mac_of_auth() {
+  [ -n "${1:-}" ] && [ -r "$1" ] || return 0
+  _blob=$(awk '$1=="publickey"{print $3; exit}' "$1")
+  [ -n "$_blob" ] || return 0
+  awk -v b="$_blob" '{
+      for (i = 1; i <= NF; i++) if ($i == b) {
+        for (j = i + 1; j <= NF; j++) if ($j ~ /^rexec-mac=/) { sub(/^rexec-mac=/, "", $j); print $j; exit }
+      }
+    }' "$KEYS" 2>/dev/null
+}
+
+# The auth-info file of the ssh login this invocation descends from. rexec may be called from a deep
+# child, so walk up the parent chain and stop at the first process carrying SSH_USER_AUTH. A process
+# that outlived its login (a Claude daemon spawning background jobs) still carries the variable, but
+# sshd has deleted the file, so it resolves to nothing rather than to whichever mac logged in when the
+# daemon started.
+session_auth_file() {
+  if [ -n "${SSH_USER_AUTH:-}" ]; then printf '%s' "$SSH_USER_AUTH"; return 0; fi
   p=$$; i=0
   while [ "$p" -gt 1 ] && [ "$i" -lt 40 ]; do
-    v=$(read_environ "$p" | sed -n 's/^SSH_CONNECTION=//p' | head -1)
-    [ -n "$v" ] && { norm_ip "${v%% *}"; return 0; }
+    v=$(read_environ "$p" | sed -n 's/^SSH_USER_AUTH=//p' | head -1)
+    [ -n "$v" ] && { printf '%s' "$v"; return 0; }
     p=$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null); case "$p" in ''|*[!0-9]*) p=1;; esac
     i=$((i+1))
   done
   return 0
 }
+session_mac() { mac_of_auth "$(session_auth_file)"; }
+
+# The mac set with `rexec --use`, which picks one when several are online and no live login names one.
+default_mac() {
+  _d=$(cat "$ROOT/default" 2>/dev/null)
+  if [ -n "$_d" ] && [ -d "$MACS/$_d" ]; then printf '%s' "$_d"; fi
+}
+
+# Called by the agent's own logins (announce, claim): refuse a MACID other than the one the login key
+# is tagged with. A login without auth info, or with an untagged key, is let through, so a mac still on
+# a shared key keeps working until it gets its own.
+login_matches() { # MACID
+  _k=$(mac_of_auth "${SSH_USER_AUTH:-}")
+  [ -z "$_k" ] || [ "$_k" = "$1" ]
+}
 
 mac_list_hint() {
   echo "  macs currently known:" >&2
-  found=0
+  found=0; _d=$(default_mac)
   for m in $(all_macs); do
     found=1
     if mac_online "$m"; then s=ONLINE; else s=OFFLINE; fi
-    printf '    %-18s %-8s %-16s %s\n' "$m" "$s" \
-      "$(cat "$MACS/$m/origin" 2>/dev/null || echo -)" "$(mac_label "$m")" >&2
+    _u=''; [ "$m" = "$_d" ] && _u=' (rexec --use default)'
+    printf '    %-18s %-8s %s%s\n' "$m" "$s" "$(mac_label "$m")" "$_u" >&2
   done
   [ "$found" = 0 ] && echo "    (none - no agent has been started on any mac yet)" >&2
 }
 
-# Every mac that announced from this IP, online or not.
-macs_at_ip() {
-  for m in $(all_macs); do
-    [ "$(cat "$MACS/$m/origin" 2>/dev/null)" = "$1" ] && echo "$m"
-  done
-}
-
-# Every mac that has announced from this IP within ORIGIN_MEMORY seconds, current or not.
-# A caller's SSH_CONNECTION is frozen at login while the mac re-announces every poll, so a home IP that
-# rotates mid-session leaves the two disagreeing about an IP that was correct for both an hour ago.
-ORIGIN_MEMORY=${REXEC_ORIGIN_MEMORY:-1209600}
-macs_seen_at_ip() {
-  _cut=$(( $(date +%s) - ORIGIN_MEMORY ))
-  for m in $(all_macs); do
-    awk -v ip="$1" -v cut="$_cut" '$1==ip && $2+0>=cut {found=1} END{exit !found}' \
-      "$MACS/$m/origins" 2>/dev/null && echo "$m"
-  done
-}
-
 # resolve_mac [wanted name]
 # 1) explicit --mac / REXEC_MAC (a unique prefix is enough)
-# 2) the mac this session ssh'd in from, matched on source IP - online or not, so an offline one
-#    reports "start the agent" instead of silently handing the job to a different machine
-# 3) source IP unknown (not an ssh session) and exactly one mac online - use it
-# 4) otherwise fail: make the caller be explicit rather than guess a machine
+# 2) the mac whose key this session's live ssh login used - online or not, so an offline one reports
+#    "start the agent" instead of the job silently going to a different machine
+# 3) exactly one mac online - use it: an agent only runs where the user started it
+# 4) several online - the `rexec --use` default, if it is one of them
+# 5) otherwise fail: make the caller be explicit rather than guess a machine
+# Prints __none__ when no mac is online and nothing names one.
 resolve_mac() {
   want="${1:-}"
   if [ -n "$want" ]; then
@@ -112,33 +127,8 @@ resolve_mac() {
     mac_list_hint; return 3
   fi
 
-  IP=$(origin_ip)
-  if [ -n "$IP" ]; then
-    hit=""; n=0
-    for m in $(macs_at_ip "$IP"); do hit="$m"; n=$((n+1)); done
-    [ "$n" = 1 ] && { printf '%s' "$hit"; return 0; }
-    if [ "$n" = 0 ]; then
-      # The IP matches no mac's *current* origin. Before giving up, check where each mac has recently
-      # been: a rotated home IP is the common cause, and the trail still identifies the machine.
-      hit=""; n=0
-      for m in $(macs_seen_at_ip "$IP"); do hit="$m"; n=$((n+1)); done
-      if [ "$n" = 1 ]; then
-        echo "rexec: this session's source IP ($IP) has rotated; routing to '$hit', which announced from it recently." >&2
-        printf '%s' "$hit"; return 0
-      fi
-      [ "$n" -gt 1 ] && {
-        echo "rexec: $n macs have recently announced from this session's source IP ($IP)." >&2
-        echo "  Be explicit:  rexec --mac <name> '<command>'" >&2
-        mac_list_hint; return 3
-      }
-      # Genuinely unknown: another mac may be online, but it is not the machine this session is
-      # sitting on, so the job must not go there.
-      echo "__none__"; return 0
-    fi
-    echo "rexec: $n macs share this session's source IP ($IP), so it does not identify which to use." >&2
-    echo "  Be explicit:  rexec --mac <name> '<command>'" >&2
-    mac_list_hint; return 3
-  fi
+  k=$(session_mac)
+  [ -n "$k" ] && { printf '%s' "$k"; return 0; }
 
   ONLINE=$(online_macs)
   [ -n "$ONLINE" ] || { echo "__none__"; return 0; }
@@ -146,7 +136,10 @@ resolve_mac() {
   for m in $ONLINE; do n=$((n+1)); last="$m"; done
   [ "$n" = 1 ] && { printf '%s' "$last"; return 0; }
 
-  echo "rexec: $n macs online, and this session has no ssh source IP to identify which to use." >&2
-  echo "  Be explicit:  rexec --mac <name> '<command>'" >&2
+  d=$(default_mac)
+  for m in $ONLINE; do [ "$m" = "$d" ] && { printf '%s' "$d"; return 0; }; done
+
+  echo "rexec: $n macs online, and neither a live ssh login nor a default picks one." >&2
+  echo "  Set a default:  rexec --use <name>     or per call:  rexec --mac <name> '<command>'" >&2
   mac_list_hint; return 3
 }

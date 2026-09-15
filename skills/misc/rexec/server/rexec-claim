@@ -13,14 +13,14 @@ set -u
 MACID="${1:?}"; WANT="${2:-0}"; GATE="${3:-open}"; NRUN="${4:-0}"
 CPU="${5:--}"; MEM="${6:--}"; HEAVY_OK="${7:-1}"
 case "$MACID" in *[!A-Za-z0-9_.-]*) echo "invalid MACID" >&2; exit 2;; esac
+login_matches "$MACID" || { echo "this login's key is tagged for another mac, not $MACID" >&2; exit 2; }
 NOW=$(date +%s)
 M="$MACS/$MACID"
 mac_dirs "$MACID"
 
 # Temp files carry the PID so concurrent calls never mv away each other's intermediates.
 printf '%s' "$NOW" > "$M/.alive.$$" && mv "$M/.alive.$$" "$M/agent.alive"
-# Source IP refreshes every poll so routing keeps up after a network or Wi-Fi change, and every distinct
-# one is kept in the trail so a caller whose own IP has since rotated can still be matched to this mac.
+# Last source IP, for display only; routing goes by login key, never by IP.
 note_origin "$MACID" "${SSH_CLIENT%% *}"
 printf 'TS=%s\nGATE=%s\nCPU=%s\nMEM=%s\nRUNNING=%s\n' \
   "$NOW" "$GATE" "$CPU" "$MEM" "$NRUN" > "$M/.gate.$$" \
