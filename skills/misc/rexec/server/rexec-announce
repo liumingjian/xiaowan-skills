@@ -12,4 +12,16 @@ mac_dirs "$MACID"
 [ -n "$LABEL_B64" ] && printf '%s' "$LABEL_B64" | openssl base64 -d -A > "$MACS/$MACID/name" 2>/dev/null
 printf '%s' "$CAPS" > "$MACS/$MACID/caps"
 note_origin "$MACID" "${SSH_CLIENT%% *}"
+
+# An agent that has just started is running nothing, so anything still marked running here belongs to a
+# previous agent that never reported it - killed, crashed, or the mac slept. Finish those jobs now:
+# restarting the agent is exactly what a user does to unstick the queue, and without this it is the one
+# action that cannot work, because the stale entries survive the restart and keep blocking claims.
+for _r in "$MACS/$MACID"/running/*.job; do
+  [ -e "$_r" ] || break
+  _rid=$(basename "$_r" .job)
+  reap_job "$MACID" "$_rid" 129 "the agent on $MACID restarted while this job was running; it did not finish"
+  echo "reaped stale job $_rid (left running by a previous agent)" >&2
+done
+
 echo "OK $MACID"

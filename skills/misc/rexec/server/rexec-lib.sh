@@ -11,7 +11,7 @@
 # client (rexec), while the mac's agent reaches the server side over ssh as root. The tree is
 # group-owned by `agent` and setgid; umask 002 keeps everything root creates group-writable, so the
 # client can still consume and clean up its own results.
-ROOT=/var/lib/rexec
+ROOT=${REXEC_ROOT:-/var/lib/rexec}
 MACS="$ROOT/macs"
 umask 002
 
@@ -40,6 +40,30 @@ norm_ip() { printf '%s' "${1#::ffff:}"; }
 note_origin() { # MACID IP
   _ip=$(norm_ip "$2"); [ -n "$_ip" ] || return 0
   printf '%s' "$_ip" > "$MACS/$1/.orig.$$" && mv "$MACS/$1/.orig.$$" "$MACS/$1/origin"
+}
+
+# Finish a job the mac is not running any more, handing its caller a result instead of leaving a
+# `running/` entry nobody will ever report. Such an entry is indistinguishable from a live job to
+# rexec-claim, and because claiming is strict FIFO one of them stalls the mac's whole queue, not just its
+# own project - so every path that can strand a job (agent restart, agent losing its local job records)
+# ends here rather than dropping the files quietly.
+reap_job() { # MACID ID EXIT REASON
+  _m="$MACS/$1"; _id="$2"; _ex="$3"; _why="$4"
+  _job="$_m/running/$_id.job"
+  _sub=$(sed -n 's/^SUBMIT=//p'  "$_job" 2>/dev/null); case "$_sub" in ''|*[!0-9]*) _sub=0;; esac
+  _cmd=$(sed -n 's/^CMD=//p'     "$_job" 2>/dev/null)
+  _prj=$(sed -n 's/^PROJECT=//p' "$_job" 2>/dev/null)
+  _st=$(cat "$_m/running/$_id.started" 2>/dev/null); case "$_st" in ''|*[!0-9]*) _st=0;; esac
+  _now=$(date +%s)
+  _q=0; [ "$_sub" -gt 0 ] && [ "$_st" -ge "$_sub" ] && _q=$(( _st - _sub ))
+  _ran=0; [ "$_st" -gt 0 ] && _ran=$(( _now - _st ))
+  printf '[rexec] %s\n' "$_why" > "$_m/results/.$_id.out.tmp"
+  mv "$_m/results/.$_id.out.tmp" "$_m/results/$_id.out"
+  printf 'EXIT=%s\nRAN=%s\nQUEUED=%s\n' "$_ex" "$_ran" "$_q" > "$_m/results/.$_id.done.tmp"
+  mv "$_m/results/.$_id.done.tmp" "$_m/results/$_id.done"
+  printf '{"id":"%s","mac":"%s","project":"%s","exit":%s,"queued":%s,"ran":%s,"end":%s,"cmd_b64":"%s"}\n' \
+    "$_id" "$1" "$_prj" "$_ex" "$_q" "$_ran" "$_now" "$_cmd" >> "$ROOT/history.jsonl"
+  rm -f "$_job" "$_m/running/$_id.started" "$_m/cancel/$_id"
 }
 
 # ---- identity: every mac logs in with its own ssh key ----
