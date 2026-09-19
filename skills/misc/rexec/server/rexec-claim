@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Called once per agent poll; one ssh round trip does three things: refresh the heartbeat, fetch the
 # cancel list, and optionally claim one job.
-# Usage: rexec-claim <MACID> <claim:0|1> <gate:open|closed> <running_count> <cpu%> <memfree%> <heavy_ok:0|1>
+# Usage: rexec-claim <MACID> <claim:0|1> <gate:open|closed> <running_count> <cpu%> <memfree%> <heavy_ok:0|1> [running_ids]
+# running_ids is the comma-separated list of jobs the agent is actually running ("-" when none). An agent
+# that predates it sends nothing, which disables the reconciliation below rather than reaping everything.
 # Queues are namespaced by MACID: a mac only sees, and only claims, jobs addressed to it.
 # heavy_ok=1 means the agent's gate is open and the claim cooldown has elapsed, so another heavy job is fine.
 # Light jobs (--no-sync / --light) ignore that flag, so they are still claimable with the gate closed.
@@ -11,7 +13,7 @@
 set -u
 . /var/lib/rexec/bin/rexec-lib.sh
 MACID="${1:?}"; WANT="${2:-0}"; GATE="${3:-open}"; NRUN="${4:-0}"
-CPU="${5:--}"; MEM="${6:--}"; HEAVY_OK="${7:-1}"
+CPU="${5:--}"; MEM="${6:--}"; HEAVY_OK="${7:-1}"; RIDS="${8-}"
 case "$MACID" in *[!A-Za-z0-9_.-]*) echo "invalid MACID" >&2; exit 2;; esac
 login_matches "$MACID" || { echo "this login's key is tagged for another mac, not $MACID" >&2; exit 2; }
 NOW=$(date +%s)
@@ -32,6 +34,22 @@ SWEEP="$ROOT/.sweep"
 if [ ! -f "$SWEEP" ] || [ -n "$(find "$SWEEP" -mmin +10 2>/dev/null)" ]; then
   : > "$SWEEP"
   find "$MACS"/*/results -type f -mmin +60 -delete 2>/dev/null || true
+fi
+
+# Reconcile what we think is running with what the agent says it is running. Anything only we still hold is
+# stranded: the agent lost it (restarted, or its local records were wiped) and will never report it, while
+# strict FIFO stalls the whole queue behind it. The grace period covers the one moment when the difference
+# is legitimate - between claiming a job here and the agent listing it on its next poll.
+STRAND_GRACE=${REXEC_STRAND_GRACE:-120}
+if [ -n "$RIDS" ]; then
+  for r in "$M"/running/*.job; do
+    [ -e "$r" ] || break
+    rid=$(basename "$r" .job)
+    case ",$RIDS," in *",$rid,"*) continue;; esac
+    rst=$(cat "$M/running/$rid.started" 2>/dev/null); case "$rst" in ''|*[!0-9]*) rst=0;; esac
+    [ "$rst" -gt 0 ] && [ $(( NOW - rst )) -le "$STRAND_GRACE" ] && continue
+    reap_job "$MACID" "$rid" 129 "the agent on $MACID is no longer running this job (it restarted, or lost track of the job)"
+  done
 fi
 
 # Cancel list: the agent kills the matching process groups, and report clears the markers afterwards.

@@ -46,8 +46,6 @@ if [ -f "$PIDF" ]; then
 fi
 echo $$ > "$PIDF"
 
-rm -f "$JOBS"/* 2>/dev/null
-
 CP="$RD/cm-%C"
 BASE="-T -o ControlPath=$CP -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
 SSH_OPTS="$BASE -o ControlMaster=no"
@@ -74,7 +72,7 @@ fi
 LABEL="${MACNAME:-$MACID}"
 # What this agent version can do. The server refuses a job whose flag is missing here, rather than
 # running it with the flag silently dropped.
-CAPS="git"
+CAPS="git,reap"
 
 
 # ---------- log format: TIME(8) EVENT(6) ID(15) sigil DETAIL ----------
@@ -104,6 +102,36 @@ fmt_dur() {
   s=${1:-0}; case "$s" in ''|*[!0-9]*) s=0;; esac
   if [ "$s" -lt 60 ]; then printf '%ds' "$s"; else printf '%dm%02ds' $((s/60)) $((s%60)); fi
 }
+
+# ---------- recover from the previous agent's unclean exit ----------
+# Ctrl-C kills every running job and reports it. A kill -9, a closed terminal or a dead ssh session does
+# neither: the job's process group keeps running - a build burning cores for days - and the server still
+# lists the job as running, which stalls its strict-FIFO queue. Starting a fresh agent used to leave both
+# behind, because the first thing it did was delete the records that name them. So kill them first, then
+# clear. The server side of the same mess is cleaned by rexec-announce a few lines below.
+#
+# A process group ID only means anything within one boot, so it is only killed when the boot time recorded
+# alongside it still matches: after a reboot those processes are gone anyway, and the number could by then
+# belong to anything.
+# kern.boottime reads `{ sec = 1758253680, usec = 563520 } Thu Sep 19 ...`; take the first number, or a
+# greedy match lands on usec instead.
+BOOT=$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/^[^0-9]*\([0-9][0-9]*\).*/\1/p')
+[ -n "$BOOT" ] || BOOT=unknown
+PREV_BOOT=$(cat "$RD/boot" 2>/dev/null || echo none)
+SELF_PGID=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
+if [ "$BOOT" != unknown ] && [ "$PREV_BOOT" = "$BOOT" ]; then
+  for pf in "$JOBS"/*.pgid; do
+    [ -e "$pf" ] || break
+    pg=$(cat "$pf" 2>/dev/null); case "$pg" in ''|*[!0-9]*) continue;; esac
+    [ "$pg" -gt 1 ] || continue
+    [ "$pg" = "$SELF_PGID" ] && continue
+    kill -0 -"$pg" 2>/dev/null || continue
+    kill -TERM -"$pg" 2>/dev/null; sleep 1; kill -KILL -"$pg" 2>/dev/null
+    say CANCEL "$(basename "$pf" .pgid)" '|' "leftover process group $pg from a previous agent, killed"
+  done
+fi
+rm -f "$JOBS"/* 2>/dev/null
+printf '%s' "$BOOT" > "$RD/boot.tmp" && mv "$RD/boot.tmp" "$RD/boot"
 
 # ---------- job body (a separate file to avoid nested quoting; exec'd after perl setpgrp) ----------
 cat > "$RD/runner.sh" <<'RUNNER_EOF'
@@ -282,8 +310,11 @@ while true; do
   fi
   WANT=1
 
-  # ---- 3. one ssh round trip: refresh heartbeat + fetch cancel list + optionally claim ----
-  PAYLOAD=$($SSH -n "/var/lib/rexec/bin/rexec-claim $MACID $WANT $GATE $NRUN ${CPU}% ${MEM}% $HEAVY_OK" 2>/dev/null)
+  # ---- 3. one ssh round trip: refresh heartbeat + report what is running + fetch cancel list + optionally claim ----
+  # The ID list is what lets the server spot jobs it thinks are running here but we know nothing about;
+  # "-" says "nothing is running", as distinct from an older agent sending no list at all.
+  RIDS=$(running_ids | tr '\n' ',' | sed 's/,$//'); [ -n "$RIDS" ] || RIDS='-'
+  PAYLOAD=$($SSH -n "/var/lib/rexec/bin/rexec-claim $MACID $WANT $GATE $NRUN ${CPU}% ${MEM}% $HEAVY_OK $RIDS" 2>/dev/null)
   if [ -z "$PAYLOAD" ]; then
     say WARN "-" '|' "connection lost, retrying in 5s"; sleep 5; continue
   fi

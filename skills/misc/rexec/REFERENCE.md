@@ -89,6 +89,35 @@ Two consequences worth knowing:
 - Queue time does **not** count against `--timeout`, which measures run time only, so yielding for a long
   while never causes a false timeout.
 
+## When the agent dies without saying so
+
+Ctrl-C is a clean stop: the agent kills every job it is running and reports each one, so no caller is left
+waiting. `kill -9`, a closed terminal, a lost ssh session or a sleeping mac are not, and they used to leave
+two kinds of wreckage that **restarting the agent did not clear** — which is a trap, because restarting is
+the one thing a user reaches for when the queue stops moving:
+
+- **On the mac**, the job's process group kept running. A build can burn cores for days, and the load gate
+  reads that CPU and refuses to claim anything new.
+- **On the server**, the job stayed listed as running. Claiming is strict FIFO, so one such entry blocks
+  every job behind it, not only its own project, and nothing ever times it out: `--timeout` is enforced by
+  the agent, and that agent is gone.
+
+Three mechanisms now clear it, and none of them needs the user to do anything beyond restarting the agent:
+
+1. **The agent, at startup**, kills the process groups its predecessor left behind, before wiping the job
+   records that name them. Process group IDs mean nothing across a reboot, so they are only killed when the
+   boot time recorded with them still matches — after a reboot the processes are gone anyway.
+2. **`rexec-announce`, at startup**, finishes every job the server still has marked running for that mac. A
+   freshly started agent runs nothing by definition, so all of them are stale.
+3. **`rexec-claim`, on every poll**, compares the running list the agent reports with the server's own. A job
+   only the server still holds is stranded and gets finished, after a grace period (`REXEC_STRAND_GRACE`,
+   default 120s) that covers the gap between claiming a job and the agent's next poll. This catches an agent
+   that is alive but lost track of a job, and needs no restart at all.
+
+Stranded jobs finish with **exit 129** and an explanation in their output, so whoever was blocked on them is
+released instead of waiting forever. An agent older than this reports no running list, which disables
+mechanism 3 for that mac rather than reaping everything it owns; restart it and mechanisms 1 and 2 apply.
+
 ## Blast radius of a cancel
 
 `--cancel` kills **only that job's process group**. Other running jobs and the agent itself are untouched.
@@ -106,7 +135,11 @@ job is on.
 - `90` — rsync failed. `91` — target directory does not exist.
 - `124` — run timed out (exceeded `--timeout`; queue time excluded).
 - `125` — job cancelled (`--cancel`, or the caller pressed ESC).
+- `129` — the job was stranded: the agent that was running it died without reporting (kill -9, closed
+  terminal, mac asleep), so the server finished it on the agent's behalf. Re-run the command.
 - `130` — the agent on the mac was stopped with Ctrl-C, taking the job with it.
+- `70` — the job vanished from the queue without producing a result (someone cleaned the state tree by
+  hand). Re-run the command.
 - anything else — the real exit code of the command itself on the mac.
 
 On failure `rexec` writes the reason and the next step to stderr itself; this table is only a quick lookup.
@@ -124,6 +157,9 @@ On failure `rexec` writes the reason and the next step to stderr itself; this ta
 | `REXEC_MEM_MIN` | free memory floor % | 20 |
 | `REXEC_COOLDOWN` | claim cooldown, seconds | 15 |
 | `REXEC_LOG` | write the agent log to this file | no log file |
+
+Server side: `REXEC_STRAND_GRACE` (default 120s) is how long a job may be missing from the agent's reported
+running list before the server treats it as stranded, and `REXEC_ROOT` relocates the state tree (tests only).
 
 To get the agent log on disk use `REXEC_LOG`, not a shell `>` redirect — bash's block buffering holds log
 lines in the buffer instead of writing them out.

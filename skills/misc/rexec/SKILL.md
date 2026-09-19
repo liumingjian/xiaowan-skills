@@ -138,8 +138,11 @@ Leave the light, static work on the server: reading and writing code, grep, type
 - `--no-sync` and `--light` declare a **light job**, exempt from the mac's load gate — good for zero-cost probing.
 - **Interrupt means cancel.** Pressing ESC on a `rexec` call in the session terminates the job on the mac
   too, so nothing is orphaned.
+- **An agent that dies without a clean Ctrl-C is cleaned up automatically** — leftover processes on the mac
+  and the jobs the server still thinks are running, which would otherwise block the queue for every later
+  job. They end as **exit 129**; just re-run the command. `REFERENCE.md` has the details.
 
 ## Troubleshooting
 
-How the target mac is resolved, load gate not releasing, exit code meanings, agent environment variables —
-read `REFERENCE.md` in this directory.
+How the target mac is resolved, load gate not releasing, a queue that has stopped moving, exit code
+meanings, agent environment variables — read `REFERENCE.md` in this directory.

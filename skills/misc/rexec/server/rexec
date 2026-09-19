@@ -142,9 +142,23 @@ trap on_interrupt INT TERM
 DONE="$M/results/$ID.done"
 OUT="$M/results/$ID.out"
 STARTED="$M/running/$ID.started"
+GONE=0
 while [ ! -f "$DONE" ]; do
   sleep 1
   now=$(date +%s)
+
+  # A job that is neither queued, running, nor finished no longer exists anywhere - waiting for it would
+  # never end. Cancelling a queued job removes the queue file a moment before it writes the result, so the
+  # state has to hold for several consecutive polls before we believe it.
+  if [ ! -f "$M/queue/$ID.job" ] && [ ! -f "$M/running/$ID.job" ]; then
+    GONE=$(( GONE + 1 ))
+    if [ "$GONE" -ge 10 ]; then
+      echo "rexec: job $ID vanished from the queue on '$MACID' without producing a result; giving up" >&2
+      exit 70
+    fi
+  else
+    GONE=0
+  fi
 
   if [ -f "$STARTED" ]; then
     st=$(cat "$STARTED" 2>/dev/null || echo "$now")
