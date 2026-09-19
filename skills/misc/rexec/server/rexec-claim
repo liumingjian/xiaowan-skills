@@ -40,17 +40,29 @@ fi
 # stranded: the agent lost it (restarted, or its local records were wiped) and will never report it, while
 # strict FIFO stalls the whole queue behind it. The grace period covers the one moment when the difference
 # is legitimate - between claiming a job here and the agent listing it on its next poll.
+# The age fallback needs no list at all, which is what reaches a mac still on an older agent: past its own
+# --timeout the agent would have killed and reported it, so an entry that survives timeout plus a wide
+# margin is proof the agent is not there to do either.
 STRAND_GRACE=${REXEC_STRAND_GRACE:-120}
-if [ -n "$RIDS" ]; then
-  for r in "$M"/running/*.job; do
-    [ -e "$r" ] || break
-    rid=$(basename "$r" .job)
-    case ",$RIDS," in *",$rid,"*) continue;; esac
-    rst=$(cat "$M/running/$rid.started" 2>/dev/null); case "$rst" in ''|*[!0-9]*) rst=0;; esac
-    [ "$rst" -gt 0 ] && [ $(( NOW - rst )) -le "$STRAND_GRACE" ] && continue
+STRAND_SLACK=${REXEC_STRAND_SLACK:-300}
+for r in "$M"/running/*.job; do
+  [ -e "$r" ] || break
+  rid=$(basename "$r" .job)
+  # The agent says it is running this one: believe it, whatever its age.
+  case ",$RIDS," in *",$rid,"*) continue;; esac
+  rst=$(cat "$M/running/$rid.started" 2>/dev/null); case "$rst" in ''|*[!0-9]*) rst=0;; esac
+  rage=0; [ "$rst" -gt 0 ] && rage=$(( NOW - rst ))
+  if [ -n "$RIDS" ]; then
+    [ "$rst" -gt 0 ] && [ "$rage" -le "$STRAND_GRACE" ] && continue
     reap_job "$MACID" "$rid" 129 "the agent on $MACID is no longer running this job (it restarted, or lost track of the job)"
-  done
-fi
+  else
+    # No list to go on - this agent predates it. Fall back on age: the agent enforces --timeout, so an entry
+    # that outlives its own timeout by a wide margin proves no agent is there to enforce anything.
+    rtmo=$(sed -n 's/^TIMEOUT=//p' "$r"); case "$rtmo" in ''|*[!0-9]*) rtmo=900;; esac
+    [ "$rage" -gt $(( rtmo + STRAND_SLACK )) ] \
+      && reap_job "$MACID" "$rid" 129 "the agent on $MACID never reported this job, and it is now far past its ${rtmo}s timeout"
+  fi
+done
 
 # Cancel list: the agent kills the matching process groups, and report clears the markers afterwards.
 CANCELS=""

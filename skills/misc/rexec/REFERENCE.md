@@ -113,10 +113,15 @@ Three mechanisms now clear it, and none of them needs the user to do anything be
    only the server still holds is stranded and gets finished, after a grace period (`REXEC_STRAND_GRACE`,
    default 120s) that covers the gap between claiming a job and the agent's next poll. This catches an agent
    that is alive but lost track of a job, and needs no restart at all.
+4. **`rexec-claim`, by age**, is what reaches a mac whose agent predates mechanism 3 and therefore sends no
+   list. With nothing to compare against it goes by age alone: the agent is what enforces `--timeout`, so an
+   entry outliving its own timeout by a wide margin (`REXEC_STRAND_SLACK`, default 300s) proves no agent is
+   there to enforce anything. A job the agent does report as running is never reaped by age, however long it
+   has been going.
 
 Stranded jobs finish with **exit 129** and an explanation in their output, so whoever was blocked on them is
-released instead of waiting forever. An agent older than this reports no running list, which disables
-mechanism 3 for that mac rather than reaping everything it owns; restart it and mechanisms 1 and 2 apply.
+released instead of waiting forever. An agent older than this reports no running list, which limits it to
+mechanism 4 until it restarts.
 
 ## Blast radius of a cancel
 
@@ -159,7 +164,9 @@ On failure `rexec` writes the reason and the next step to stderr itself; this ta
 | `REXEC_LOG` | write the agent log to this file | no log file |
 
 Server side: `REXEC_STRAND_GRACE` (default 120s) is how long a job may be missing from the agent's reported
-running list before the server treats it as stranded, and `REXEC_ROOT` relocates the state tree (tests only).
+running list before the server treats it as stranded, `REXEC_STRAND_SLACK` (default 300s) is how far past its
+own `--timeout` a job may sit in the running list before the same happens, and `REXEC_ROOT` relocates the
+state tree (tests only).
 
 To get the agent log on disk use `REXEC_LOG`, not a shell `>` redirect — bash's block buffering holds log
 lines in the buffer instead of writing them out.
