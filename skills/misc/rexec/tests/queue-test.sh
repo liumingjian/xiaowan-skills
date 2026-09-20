@@ -120,6 +120,14 @@ is "...so its own project keeps waiting"                 ""          "$(ls "$M/r
 
 reset
 detach proj_a-0001 proj_a
+submit proj_a-0002 proj_a
+date +%s > "$M/agent.alive"
+is "the queue names the detached job as the blocker" \
+   "  <- waiting on proj_a-0001 (detached, same project runs serially)" \
+   "$("$SRV/rexec-queue" "$MAC" | sed -n 's/.*\(  <- waiting on .*\)/\1/p')"
+
+reset
+detach proj_a-0001 proj_a
 printf 'EXIT=0\nRAN=5\nEND=%s\n' "$(date +%s)" > "$M/detached/proj_a-0001.done"
 submit proj_a-0002 proj_a
 is "a finished detached job releases the slot" proj_a-0002 "$(picked)"

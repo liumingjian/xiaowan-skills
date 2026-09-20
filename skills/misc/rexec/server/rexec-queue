@@ -87,6 +87,15 @@ show_mac() {
           why="  <- waiting on $(sed -n 's/^ID=//p' "$r") (same project runs serially)"; break
         fi
       done
+      # A detached job holds the workspace exactly as a running one does, and it is the case most worth
+      # naming here: it is off the queue, so without this the job looks blocked by nothing at all.
+      if [ -z "$why" ]; then
+        for d in $(detached_active "$MACID"); do
+          if [ "$(sed -n 's/^PROJECT=//p' "$M/detached/$d.job")" = "$proj" ]; then
+            why="  <- waiting on $d (detached, same project runs serially)"; break
+          fi
+        done
+      fi
     fi
     if [ -z "$why" ] && [ "$G" != open ] && [ "$w" != light ] && [ "$NR" -gt 0 ]; then
       why="  <- waiting for mac load to drop"
