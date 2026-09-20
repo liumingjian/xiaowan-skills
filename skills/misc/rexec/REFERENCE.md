@@ -72,9 +72,11 @@ Two consequences worth knowing:
 
 - **Parallel across projects, serial within a project.** Two commands from one project share a workspace
   directory, and running them together would shred each other's files.
-- **Strict first-come, first-served.** If the head of the queue cannot run (waiting on an earlier job from
-  the same project), everything behind it waits too, even when it could run. Execution order is therefore
-  fully predictable, and `--queue` states what each job is blocked by.
+- **First-come, first-served, but a blocked job is stepped over.** Each poll claims the earliest job that
+  can actually run. Only same-project jobs queue behind each other; work from other projects flows past.
+  Execution order is therefore no longer globally predictable — project B can overtake project A — which is
+  the price of the property that matters more: one long build can no longer stop the whole mac. It used to.
+  `--queue` states what each job is blocked by.
 - **Load gate, three bands.** The agent samples the mac's CPU and memory pressure every few seconds and
   decides whether to accept another **heavy** job:
   - CPU below `REXEC_CPU_RELAX` (default 40%) — take it immediately, no cooldown. This is the normal path
@@ -89,6 +91,28 @@ Two consequences worth knowing:
 - Queue time does **not** count against `--timeout`, which measures run time only, so yielding for a long
   while never causes a false timeout.
 
+## When the caller dies without saying so
+
+The mirror image of the section below, and the other half of a queue that stops moving. Pressing ESC is a
+clean stop: `rexec` traps it and cancels the job properly. A session that is killed outright is not — it is
+compacted away, OOM-killed on a small VPS, or loses its ssh link — and it leaves behind a job that nobody
+will ever collect.
+
+Every `rexec` client therefore writes the current time into `macs/<id>/alive/<ID>`, once before it submits
+and again on every second of its wait loop. `rexec-claim` reads it on each poll:
+
+- a **queued** job whose heartbeat stopped more than `REXEC_CALLER_GRACE` (default 90s) ago is dropped;
+- a **running** one gets a cancel marker, and the agent terminates it like any other cancel.
+
+This closes the gap that made a restart useless. Nothing else expires a *queued* job — `rexec-announce`
+only ever reaped running ones — so an abandoned job kept its place in the queue across every agent restart,
+and while it sat there its project-mates sat behind it. Restarting the agent was the one action that could
+not fix it, which is exactly the action a stuck queue invites.
+
+A job carrying **no** heartbeat file at all is left alone: it came from a client that predates this, and
+grandfathering costs one stale job that finishes by itself, where the opposite default would reap every
+in-flight job the moment the server is upgraded.
+
 ## When the agent dies without saying so
 
 Ctrl-C is a clean stop: the agent kills every job it is running and reports each one, so no caller is left
@@ -98,9 +122,9 @@ the one thing a user reaches for when the queue stops moving:
 
 - **On the mac**, the job's process group kept running. A build can burn cores for days, and the load gate
   reads that CPU and refuses to claim anything new.
-- **On the server**, the job stayed listed as running. Claiming is strict FIFO, so one such entry blocks
-  every job behind it, not only its own project, and nothing ever times it out: `--timeout` is enforced by
-  the agent, and that agent is gone.
+- **On the server**, the job stayed listed as running, so every later job from the same project queued
+  behind a job that had already died, and nothing ever timed it out: `--timeout` is enforced by the agent,
+  and that agent is gone.
 
 Three mechanisms now clear it, and none of them needs the user to do anything beyond restarting the agent:
 
@@ -163,7 +187,8 @@ On failure `rexec` writes the reason and the next step to stderr itself; this ta
 | `REXEC_COOLDOWN` | claim cooldown, seconds | 15 |
 | `REXEC_LOG` | write the agent log to this file | no log file |
 
-Server side: `REXEC_STRAND_GRACE` (default 120s) is how long a job may be missing from the agent's reported
+Server side: `REXEC_CALLER_GRACE` (default 90s) is how long a job may go without a caller heartbeat before
+the server treats it as abandoned, `REXEC_STRAND_GRACE` (default 120s) is how long a job may be missing from the agent's reported
 running list before the server treats it as stranded, `REXEC_STRAND_SLACK` (default 300s) is how far past its
 own `--timeout` a job may sit in the running list before the same happens, and `REXEC_ROOT` relocates the
 state tree (tests only).

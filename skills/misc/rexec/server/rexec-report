@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Called by the agent: rexec-report <MACID> <ID> <EXIT> <RAN seconds>; stdin is the output, base64.
 set -u
-. /var/lib/rexec/bin/rexec-lib.sh
+# Resolve siblings from this script's own directory, so the tree works both from /var/lib/rexec/bin
+# (where /usr/local/bin/rexec is a symlink into it) and straight out of a checkout, which is what
+# lets tests/queue-test.sh drive the real scripts against a REXEC_ROOT sandbox.
+BIN=$(cd "$(dirname "$(readlink -f "$0")")" && pwd -P)
+. "$BIN/rexec-lib.sh"
 MACID="${1:?}"; ID="${2:?}"; EX="${3:-1}"; RAN="${4:-0}"
 case "$MACID" in *[!A-Za-z0-9_.-]*) echo "invalid MACID" >&2; exit 2;; esac
 M="$MACS/$MACID"

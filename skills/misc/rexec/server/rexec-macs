@@ -2,7 +2,11 @@
 # List every registered mac with its online state, last source IP, and this session's default target.
 # Column headers stay ASCII: double-width characters would skew the column alignment.
 set -u
-. /var/lib/rexec/bin/rexec-lib.sh
+# Resolve siblings from this script's own directory, so the tree works both from /var/lib/rexec/bin
+# (where /usr/local/bin/rexec is a symlink into it) and straight out of a checkout, which is what
+# lets tests/queue-test.sh drive the real scripts against a REXEC_ROOT sandbox.
+BIN=$(cd "$(dirname "$(readlink -f "$0")")" && pwd -P)
+. "$BIN/rexec-lib.sh"
 DEFAULT=$(resolve_mac 2>/dev/null || true)
 LOGIN=$(session_mac)
 USE=$(default_mac)

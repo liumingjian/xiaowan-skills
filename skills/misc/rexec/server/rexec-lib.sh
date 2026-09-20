@@ -3,7 +3,7 @@
 # Shared by rexec / queue / cancel / claim / report.
 #
 # Directory layout (one independent queue per mac, fully isolated):
-#   /var/lib/rexec/macs/<MACID>/{queue,running,results,cancel}
+#   /var/lib/rexec/macs/<MACID>/{queue,running,results,cancel,alive}
 #   /var/lib/rexec/macs/<MACID>/{agent.alive,gate.status,origin,name}
 #   /var/lib/rexec/{seq,seq.lock,history.jsonl,default}   shared globally
 #
@@ -16,7 +16,7 @@ MACS="$ROOT/macs"
 umask 002
 
 mac_dirs() { # create the full directory set for one mac
-  mkdir -p "$MACS/$1/queue" "$MACS/$1/running" "$MACS/$1/results" "$MACS/$1/cancel"
+  mkdir -p "$MACS/$1/queue" "$MACS/$1/running" "$MACS/$1/results" "$MACS/$1/cancel" "$MACS/$1/alive"
 }
 all_macs()  { for d in "$MACS"/*; do [ -d "$d" ] && basename "$d"; done; }
 mac_hb()    { l=$(cat "$MACS/$1/agent.alive" 2>/dev/null); case "$l" in ''|*[!0-9]*) l=0;; esac; printf '%s' "$l"; }
@@ -42,11 +42,29 @@ note_origin() { # MACID IP
   printf '%s' "$_ip" > "$MACS/$1/.orig.$$" && mv "$MACS/$1/.orig.$$" "$MACS/$1/origin"
 }
 
+# ---- caller heartbeat ----
+# `rexec` writes the current time into alive/<ID> before it submits, and again on every poll of its wait
+# loop. A caller that is killed outright - ESC is trapped, but a compacted session, an OOM kill or a
+# dropped ssh link is not - stops touching it, and that silence is the only reliable way to tell "nobody
+# is waiting for this any more" from "this is simply taking a while". Without it an abandoned job keeps
+# its place in the queue forever, survives every agent restart, and blocks its project-mates behind it.
+#
+# A job with no heartbeat file at all was submitted by a client that predates this, so it is left alone:
+# grandfathering costs one stale job that finishes on its own, while the opposite default would reap
+# every in-flight job the moment the server is upgraded.
+CALLER_GRACE=${REXEC_CALLER_GRACE:-90}
+
+caller_gone() { # MACID ID -> true when the caller has stopped heartbeating
+  _a="$MACS/$1/alive/$2"
+  [ -f "$_a" ] || return 1
+  _t=$(cat "$_a" 2>/dev/null); case "$_t" in ''|*[!0-9]*) return 1;; esac
+  [ $(( $(date +%s) - _t )) -gt "$CALLER_GRACE" ]
+}
+
 # Finish a job the mac is not running any more, handing its caller a result instead of leaving a
 # `running/` entry nobody will ever report. Such an entry is indistinguishable from a live job to
-# rexec-claim, and because claiming is strict FIFO one of them stalls the mac's whole queue, not just its
-# own project - so every path that can strand a job (agent restart, agent losing its local job records)
-# ends here rather than dropping the files quietly.
+# rexec-claim, so it holds its project's slot forever - and every path that can strand a job (agent
+# restart, agent losing its local job records) ends here rather than dropping the files quietly.
 reap_job() { # MACID ID EXIT REASON
   _m="$MACS/$1"; _id="$2"; _ex="$3"; _why="$4"
   _job="$_m/running/$_id.job"
@@ -63,7 +81,7 @@ reap_job() { # MACID ID EXIT REASON
   mv "$_m/results/.$_id.done.tmp" "$_m/results/$_id.done"
   printf '{"id":"%s","mac":"%s","project":"%s","exit":%s,"queued":%s,"ran":%s,"end":%s,"cmd_b64":"%s"}\n' \
     "$_id" "$1" "$_prj" "$_ex" "$_q" "$_ran" "$_now" "$_cmd" >> "$ROOT/history.jsonl"
-  rm -f "$_job" "$_m/running/$_id.started" "$_m/cancel/$_id"
+  rm -f "$_job" "$_m/running/$_id.started" "$_m/cancel/$_id" "$_m/alive/$_id"
 }
 
 # ---- identity: every mac logs in with its own ssh key ----

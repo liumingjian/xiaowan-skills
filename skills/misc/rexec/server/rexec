@@ -14,7 +14,11 @@
 #   --queue [MAC]  show the queue and exit
 #   --cancel [ID]  cancel a job and exit
 set -u
-. /var/lib/rexec/bin/rexec-lib.sh
+# Resolve siblings from this script's own directory, so the tree works both from /var/lib/rexec/bin
+# (where /usr/local/bin/rexec is a symlink into it) and straight out of a checkout, which is what
+# lets tests/queue-test.sh drive the real scripts against a REXEC_ROOT sandbox.
+BIN=$(cd "$(dirname "$(readlink -f "$0")")" && pwd -P)
+. "$BIN/rexec-lib.sh"
 b64() { openssl base64 -A; }
 fmt_dur() {
   s=${1:-0}; case "$s" in ''|*[!0-9]*) s=0;; esac
@@ -38,9 +42,9 @@ while [ $# -gt 0 ]; do
       U=$(resolve_mac "$2") || exit 3
       printf '%s' "$U" > "$ROOT/.default.$$" && mv "$ROOT/.default.$$" "$ROOT/default"
       echo "rexec: default mac is now $U"; exit 0;;
-    --macs)    exec "$ROOT/bin/rexec-macs";;
-    --queue)   shift; exec "$ROOT/bin/rexec-queue" "$@";;
-    --cancel)  shift; exec "$ROOT/bin/rexec-cancel" "$@";;
+    --macs)    exec "$BIN/rexec-macs";;
+    --queue)   shift; exec "$BIN/rexec-queue" "$@";;
+    --cancel)  shift; exec "$BIN/rexec-cancel" "$@";;
     --)        shift; break;;
     -*)        echo "rexec: unknown option $1" >&2; exit 2;;
     *)         break;;
@@ -111,6 +115,17 @@ SEQ=$(flock "$ROOT/seq.lock" -c '
   printf "%04d" "$n"')
 ID="$PROJ_SHORT-$SEQ"
 
+# --- caller heartbeat ---
+# Written before the job is submitted, so every job this client creates has one from birth, and refreshed
+# on every poll of the wait loop below. The server drops queued jobs, and cancels running ones, once this
+# stops moving: that is how a session killed outright - compacted, OOM-killed, ssh dropped - stops leaving
+# work nobody is waiting for wedged in the queue. `mac_dirs` is not called here because the client may be
+# racing an agent that has not announced yet.
+mkdir -p "$M/alive" 2>/dev/null || true
+ALIVE="$M/alive/$ID"
+printf '%s' "$NOW" > "$ALIVE" 2>/dev/null || true
+trap 'rm -f "$ALIVE" 2>/dev/null || true' EXIT
+
 # --- submit ---
 JOB="$M/queue/.$ID.tmp"
 {
@@ -132,7 +147,7 @@ on_interrupt() {
   trap '' INT TERM
   echo "" >&2
   echo "rexec: cancelling $ID ..." >&2
-  "$ROOT/bin/rexec-cancel" "$ID" >/dev/null 2>&1
+  "$BIN/rexec-cancel" "$ID" >/dev/null 2>&1
   exit 130
 }
 trap on_interrupt INT TERM
@@ -146,6 +161,7 @@ GONE=0
 while [ ! -f "$DONE" ]; do
   sleep 1
   now=$(date +%s)
+  printf '%s' "$now" > "$ALIVE" 2>/dev/null || true
 
   # A job that is neither queued, running, nor finished no longer exists anywhere - waiting for it would
   # never end. Cancelling a queued job removes the queue file a moment before it writes the result, so the
@@ -166,7 +182,7 @@ while [ ! -f "$DONE" ]; do
     if [ $(( now - st )) -gt $(( TIMEOUT + 60 )) ]; then
       echo "rexec: run timed out (>${TIMEOUT}s), termination requested" >&2
       trap '' INT TERM
-      "$ROOT/bin/rexec-cancel" "$ID" >/dev/null 2>&1
+      "$BIN/rexec-cancel" "$ID" >/dev/null 2>&1
       exit 124
     fi
   fi

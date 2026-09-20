@@ -137,7 +137,9 @@ Leave the light, static work on the server: reading and writing code, grep, type
 - Commands must run unattended (`vim` and installers that want keystrokes cannot work).
 - `--no-sync` and `--light` declare a **light job**, exempt from the mac's load gate — good for zero-cost probing.
 - **Interrupt means cancel.** Pressing ESC on a `rexec` call in the session terminates the job on the mac
-  too, so nothing is orphaned.
+  too, so nothing is orphaned. A session that dies without ESC — compacted, OOM-killed, ssh dropped — stops
+  sending the heartbeat that says someone is still waiting, and the server drops the job within 90s rather
+  than leaving it to block the queue.
 - **An agent that dies without a clean Ctrl-C is cleaned up automatically** — leftover processes on the mac
   and the jobs the server still thinks are running, which would otherwise block the queue for every later
   job. They end as **exit 129**; just re-run the command. `REFERENCE.md` has the details.

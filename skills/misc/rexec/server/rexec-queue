@@ -2,7 +2,11 @@
 # Show queue and gate state. Lists every known mac by default and marks this session's default target.
 # Usage: rexec-queue [MACID]
 set -u
-. /var/lib/rexec/bin/rexec-lib.sh
+# Resolve siblings from this script's own directory, so the tree works both from /var/lib/rexec/bin
+# (where /usr/local/bin/rexec is a symlink into it) and straight out of a checkout, which is what
+# lets tests/queue-test.sh drive the real scripts against a REXEC_ROOT sandbox.
+BIN=$(cd "$(dirname "$(readlink -f "$0")")" && pwd -P)
+. "$BIN/rexec-lib.sh"
 NOW=$(date +%s)
 fmt_dur() {
   s=${1:-0}; case "$s" in ''|*[!0-9]*) s=0;; esac
@@ -47,7 +51,7 @@ show_mac() {
     printf '    %-15s %-46s ran %s%s\n' "$id" "$(cmd_of "$r")" "$(fmt_dur $(( NOW - st )))" "$mark"
   done
 
-  # --- queued (strict FIFO; show what each is blocked by) ---
+  # --- queued (submit order; each line says what is actually holding that job) ---
   QLIST=$(for f in "$M"/queue/*.job; do
             [ -e "$f" ] || continue
             printf '%s %s %s\n' "$(sed -n 's/^SUBMIT=//p' "$f")" \
@@ -56,30 +60,34 @@ show_mac() {
   NQ=$(printf '%s' "$QLIST" | grep -c . || true)
   echo "  queued ($NQ)"
   [ "$NQ" = 0 ] && { echo "    (none)"; echo; return 0; }
-  first=1
-  printf '%s\n' "$QLIST" | while IFS= read -r f; do
+  # A heredoc rather than a pipe, so PICKED survives the loop: it marks the one job the next poll claims.
+  PICKED=0
+  while IFS= read -r f; do
     [ -n "$f" ] || continue
     id=$(sed -n 's/^ID=//p' "$f")
     sub=$(sed -n 's/^SUBMIT=//p' "$f"); case "$sub" in ''|*[!0-9]*) sub=$NOW;; esac
+    proj=$(sed -n 's/^PROJECT=//p' "$f"); w=$(sed -n 's/^WEIGHT=//p' "$f")
     why=""
-    if [ "$first" = 1 ]; then
-      proj=$(sed -n 's/^PROJECT=//p' "$f"); w=$(sed -n 's/^WEIGHT=//p' "$f")
+    if [ "$proj" != "__nosync__" ]; then
       for r in "$M"/running/*.job; do
         [ -e "$r" ] || break
         if [ "$(sed -n 's/^PROJECT=//p' "$r")" = "$proj" ]; then
           why="  <- waiting on $(sed -n 's/^ID=//p' "$r") (same project runs serially)"; break
         fi
       done
-      if [ -z "$why" ] && [ "$G" != open ] && [ "$w" != light ] && [ "$NR" -gt 0 ]; then
-        why="  <- waiting for mac load to drop"
-      fi
-      [ -z "$why" ] && why="  <- about to be claimed"
-      first=0
-    else
-      why="  <- strict FIFO, blocked by the head of the queue"
     fi
+    if [ -z "$why" ] && [ "$G" != open ] && [ "$w" != light ] && [ "$NR" -gt 0 ]; then
+      why="  <- waiting for mac load to drop"
+    fi
+    if [ -z "$why" ]; then
+      if [ "$PICKED" = 0 ]; then why="  <- about to be claimed"; PICKED=1
+      else                       why="  <- ready; one job is claimed per poll"; fi
+    fi
+    caller_gone "$MACID" "$id" && why="  <- caller is gone, will be dropped"
     printf '    %-15s %-46s waited %s%s\n' "$id" "$(cmd_of "$f")" "$(fmt_dur $(( NOW - sub )))" "$why"
-  done
+  done <<QUEUE_EOF
+$QLIST
+QUEUE_EOF
   echo
 }
 
