@@ -11,7 +11,11 @@
 #   CANCEL=<space-separated ID list>
 #   then the job body, or NONE
 set -u
-. /var/lib/rexec/bin/rexec-lib.sh
+# Resolve siblings from this script's own directory, so the tree works both from /var/lib/rexec/bin
+# (where /usr/local/bin/rexec is a symlink into it) and straight out of a checkout, which is what
+# lets tests/queue-test.sh drive the real scripts against a REXEC_ROOT sandbox.
+BIN=$(cd "$(dirname "$(readlink -f "$0")")" && pwd -P)
+. "$BIN/rexec-lib.sh"
 MACID="${1:?}"; WANT="${2:-0}"; GATE="${3:-open}"; NRUN="${4:-0}"
 CPU="${5:--}"; MEM="${6:--}"; HEAVY_OK="${7:-1}"; RIDS="${8-}"
 case "$MACID" in *[!A-Za-z0-9_.-]*) echo "invalid MACID" >&2; exit 2;; esac
@@ -23,7 +27,9 @@ mac_dirs "$MACID"
 # Temp files carry the PID so concurrent calls never mv away each other's intermediates.
 printf '%s' "$NOW" > "$M/.alive.$$" && mv "$M/.alive.$$" "$M/agent.alive"
 # Last source IP, for display only; routing goes by login key, never by IP.
-note_origin "$MACID" "${SSH_CLIENT%% *}"
+# SSH_CLIENT is unset when this runs outside an ssh login (the test harness); keep set -u happy.
+_CLI="${SSH_CLIENT-}"
+note_origin "$MACID" "${_CLI%% *}"
 printf 'TS=%s\nGATE=%s\nCPU=%s\nMEM=%s\nRUNNING=%s\n' \
   "$NOW" "$GATE" "$CPU" "$MEM" "$NRUN" > "$M/.gate.$$" \
   && mv "$M/.gate.$$" "$M/gate.status"
@@ -38,7 +44,7 @@ fi
 
 # Reconcile what we think is running with what the agent says it is running. Anything only we still hold is
 # stranded: the agent lost it (restarted, or its local records were wiped) and will never report it, while
-# strict FIFO stalls the whole queue behind it. The grace period covers the one moment when the difference
+# every later job from its project queues behind a job that no longer exists. The grace period covers the one moment when the difference
 # is legitimate - between claiming a job here and the agent listing it on its next poll.
 # The age fallback needs no list at all, which is what reaches a mac still on an older agent: past its own
 # --timeout the agent would have killed and reported it, so an entry that survives timeout plus a wide
@@ -64,6 +70,27 @@ for r in "$M"/running/*.job; do
   fi
 done
 
+# Reconcile against the callers. A `rexec` client heartbeats from submit until it collects its result, so
+# a heartbeat that has stopped means nobody is waiting for that job any more - the session was compacted,
+# OOM-killed, or its ssh link dropped (ESC is trapped and cancels properly, so it never lands here).
+#   queued  -> drop it. Nothing has run yet, there is no result to deliver, and left alone it would sit in
+#              the queue forever: nothing else expires a queued job, and an agent restart only ever
+#              cleared running ones, which is why restarting the agent could not unstick this.
+#   running -> ask the agent to cancel it. A build whose output nobody will ever read is pure waste, and
+#              it holds its project's slot for as long as it runs.
+for q in "$M"/queue/*.job; do
+  [ -e "$q" ] || break
+  qid=$(basename "$q" .job)
+  caller_gone "$MACID" "$qid" || continue
+  rm -f "$q" "$M/alive/$qid"
+done
+for r in "$M"/running/*.job; do
+  [ -e "$r" ] || break
+  rid=$(basename "$r" .job)
+  caller_gone "$MACID" "$rid" || continue
+  [ -e "$M/cancel/$rid" ] || : > "$M/cancel/$rid"
+done
+
 # Cancel list: the agent kills the matching process groups, and report clears the markers afterwards.
 CANCELS=""
 for c in "$M"/cancel/*; do
@@ -74,34 +101,51 @@ echo "CANCEL=${CANCELS# }"
 
 [ "$WANT" = 1 ] || { echo NONE; exit 0; }
 
-# Strict FIFO: only the head is considered; if the head cannot run, everything waits.
+# Claim the first job in the queue that can actually run, walking the queue in submit order rather than
+# looking only at its head. Considering only the head made execution order globally predictable, at the
+# price of one project being able to stop the whole mac: a long job from project X, plus one more X job
+# waiting, and every other project's work sat behind them for as long as the build took. Order within a
+# project is still strictly FIFO - that is the constraint with real meaning behind it, since those jobs
+# share one workspace directory - but projects no longer queue behind each other.
 # Jobs submitted in the same second collide, so the submit sequence breaks the tie; otherwise this degrades to filename order.
-HEAD=$(for f in "$M"/queue/*.job; do
-         [ -e "$f" ] || continue
-         printf '%s %s %s\n' "$(sed -n 's/^SUBMIT=//p' "$f")" \
-                              "$(sed -n 's/^SEQ=//p' "$f")" "$f"
-       done | sort -n -k1,1 -k2,2 | head -1 | cut -d' ' -f3-)
-[ -n "$HEAD" ] || { echo NONE; exit 0; }
+QUEUED=$(for f in "$M"/queue/*.job; do
+           [ -e "$f" ] || continue
+           printf '%s %s %s\n' "$(sed -n 's/^SUBMIT=//p' "$f")" \
+                                "$(sed -n 's/^SEQ=//p' "$f")" "$f"
+         done | sort -n -k1,1 -k2,2 | cut -d' ' -f3-)
 
-HPROJ=$(sed -n 's/^PROJECT=//p' "$HEAD")
-HWEIGHT=$(sed -n 's/^WEIGHT=//p' "$HEAD")
+# A heredoc, not a pipe: the loop has to run in this shell or the job it picks is lost with the subshell.
+PICK=""
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  HPROJ=$(sed -n 's/^PROJECT=//p' "$f")
+  HWEIGHT=$(sed -n 's/^WEIGHT=//p' "$f")
 
-# Same project runs serially: one workspace directory cannot have two jobs rsyncing and running at once.
-if [ "$HPROJ" != "__nosync__" ]; then
-  for r in "$M"/running/*.job; do
-    [ -e "$r" ] || break
-    [ "$(sed -n 's/^PROJECT=//p' "$r")" = "$HPROJ" ] && { echo NONE; exit 0; }
-  done
-fi
+  # Same project runs serially: one workspace directory cannot have two jobs rsyncing and running at once.
+  # Skipping such a job never breaks FIFO within its project, because every later job of that project is
+  # held by the very same running job.
+  if [ "$HPROJ" != "__nosync__" ]; then
+    BUSY=0
+    for r in "$M"/running/*.job; do
+      [ -e "$r" ] || break
+      [ "$(sed -n 's/^PROJECT=//p' "$r")" = "$HPROJ" ] && { BUSY=1; break; }
+    done
+    [ "$BUSY" = 1 ] && continue
+  fi
 
-# Load gate plus claim cooldown: light jobs are entirely exempt;
-# and when nothing is running (NRUN=0) we let one through regardless, or a persistently busy mac stalls the queue forever.
-if [ "$HWEIGHT" != light ] && [ "$NRUN" -gt 0 ] && [ "$HEAVY_OK" != 1 ]; then
-  echo NONE; exit 0
-fi
+  # Load gate plus claim cooldown: light jobs are entirely exempt, so keep scanning past a heavy job the
+  # gate is holding - a zero-cost probe behind it should not wait for the machine to cool down.
+  # When nothing is running (NRUN=0) one job goes through regardless, or a persistently busy mac stalls the queue forever.
+  if [ "$HWEIGHT" != light ] && [ "$NRUN" -gt 0 ] && [ "$HEAVY_OK" != 1 ]; then continue; fi
 
-ID=$(sed -n 's/^ID=//p' "$HEAD")
-if mv "$HEAD" "$M/running/$ID.job" 2>/dev/null; then
+  PICK="$f"; break
+done <<QUEUE_EOF
+$QUEUED
+QUEUE_EOF
+[ -n "$PICK" ] || { echo NONE; exit 0; }
+
+ID=$(sed -n 's/^ID=//p' "$PICK")
+if mv "$PICK" "$M/running/$ID.job" 2>/dev/null; then
   printf '%s' "$NOW" > "$M/running/$ID.started"
   cat "$M/running/$ID.job"
 else
