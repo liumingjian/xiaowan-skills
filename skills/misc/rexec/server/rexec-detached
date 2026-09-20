@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Server side of a detached job: work that outlives both its caller and the mac's agent.
+#
+# A normal job lives in queue/ then running/, and its result is delivered to a caller that is still
+# blocked on it. A detached job has no such caller: `rexec --detach` gets a receipt for the *launch* and
+# goes away, so the job needs a record of its own that nothing else expires.
+#
+#   detached/<ID>.job    the job, plus PGID / BOOT / STARTED / LOG - created before the process is spawned
+#   detached/<ID>.tail   the last lines of its log, pushed by the agent every few seconds
+#   detached/<ID>.done   EXIT / RAN, written once - its presence is what "finished" means
+#   detached/<ID>.out    the log tail as of completion
+#
+# Usage (everything but `list` is called from the mac):
+#   rexec-detached start <MACID> <ID> <PGID> <BOOT> <LOG_B64>
+#   rexec-detached tail  <MACID> <ID>              stdin: log tail, base64
+#   rexec-detached done  <MACID> <ID> <EXIT> <RAN> stdin: log tail, base64
+#   rexec-detached list  <MACID>                   ids that have not finished
+set -u
+BIN=$(cd "$(dirname "$(readlink -f "$0")")" && pwd -P)
+. "$BIN/rexec-lib.sh"
+ACT="${1:?}"; MACID="${2:?}"
+case "$MACID" in *[!A-Za-z0-9_.-]*) echo "invalid MACID" >&2; exit 2;; esac
+M="$MACS/$MACID"
+mac_dirs "$MACID"
+
+case "$ACT" in
+  start)
+    login_matches "$MACID" || { echo "this login's key is tagged for another mac" >&2; exit 2; }
+    ID="${3:?}"; PGID="${4:?}"; BOOT="${5:?}"; LOG=$(printf '%s' "${6:-}" | openssl base64 -d -A)
+    JOB="$M/running/$ID.job"
+    [ -f "$JOB" ] || { echo "no running job $ID on $MACID" >&2; exit 1; }
+    # Written before the launch is reported, so the project's slot never gaps: from the scheduler's point
+    # of view the job moves straight from running/ to detached/ and keeps holding its workspace.
+    { cat "$JOB"; printf 'PGID=%s\nBOOT=%s\nSTARTED=%s\nLOG=%s\n' "$PGID" "$BOOT" "$(date +%s)" "$LOG"; } \
+      > "$M/detached/.$ID.tmp" && mv "$M/detached/.$ID.tmp" "$M/detached/$ID.job"
+    echo "OK $ID";;
+
+  tail)
+    login_matches "$MACID" || exit 2
+    ID="${3:?}"
+    [ -f "$M/detached/$ID.job" ] || exit 0
+    openssl base64 -d -A > "$M/detached/.$ID.tail.tmp" 2>/dev/null \
+      && mv "$M/detached/.$ID.tail.tmp" "$M/detached/$ID.tail";;
+
+  done)
+    login_matches "$MACID" || exit 2
+    ID="${3:?}"; EX="${4:-1}"; RAN="${5:-0}"
+    [ -f "$M/detached/$ID.job" ] || { echo "no detached job $ID on $MACID" >&2; exit 1; }
+    # Report once. The process reports itself on the way out, and the agent reports it if that never
+    # arrives, so both paths land here and the first one wins.
+    [ -f "$M/detached/$ID.done" ] && exit 0
+    openssl base64 -d -A > "$M/detached/.$ID.out.tmp" 2>/dev/null
+    mv "$M/detached/.$ID.out.tmp" "$M/detached/$ID.out" 2>/dev/null
+    PRJ=$(sed -n 's/^PROJECT=//p' "$M/detached/$ID.job")
+    CMD=$(sed -n 's/^CMD=//p'     "$M/detached/$ID.job")
+    printf 'EXIT=%s\nRAN=%s\nEND=%s\n' "$EX" "$RAN" "$(date +%s)" > "$M/detached/.$ID.done.tmp" \
+      && mv "$M/detached/.$ID.done.tmp" "$M/detached/$ID.done"
+    rm -f "$M/cancel/$ID"
+    printf '{"id":"%s","mac":"%s","project":"%s","exit":%s,"queued":0,"ran":%s,"end":%s,"detached":true,"cmd_b64":"%s"}\n' \
+      "$ID" "$MACID" "$PRJ" "$EX" "$RAN" "$(date +%s)" "$CMD" >> "$ROOT/history.jsonl"
+    echo "OK $ID";;
+
+  list)
+    for j in "$M"/detached/*.job; do
+      [ -e "$j" ] || break
+      _id=$(basename "$j" .job)
+      [ -f "$M/detached/$_id.done" ] || echo "$_id"
+    done;;
+
+  *) echo "usage: rexec-detached start|tail|done|list <MACID> ..." >&2; exit 2;;
+esac

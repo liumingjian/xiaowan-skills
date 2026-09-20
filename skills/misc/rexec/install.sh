@@ -7,9 +7,10 @@ set -eu
 S="$(cd "$(dirname "$0")" && pwd -P)"   # deploy from wherever this checkout lives
 R=/var/lib/rexec
 mkdir -p "$R/macs" "$R/bin" "$R/logs"
-install -m 775 "$S/server/rexec"        "$S/server/rexec-claim"  "$S/server/rexec-report" \
-               "$S/server/rexec-queue"  "$S/server/rexec-cancel" "$S/server/rexec-macs"   \
-               "$S/server/rexec-announce" "$R/bin/"
+install -m 775 "$S/server/rexec"        "$S/server/rexec-claim"  "$S/server/rexec-report"   \
+               "$S/server/rexec-queue"  "$S/server/rexec-cancel" "$S/server/rexec-macs"     \
+               "$S/server/rexec-announce" "$S/server/rexec-detached" "$S/server/rexec-wait" \
+               "$S/server/rexec-tail" "$R/bin/"
 install -m 664 "$S/server/rexec-lib.sh" "$R/bin/"
 install -m 775 "$S/agent.sh" "$R/agent.sh"
 # Shared between root and agent: group-owned by agent, setgid so new files inherit the group.

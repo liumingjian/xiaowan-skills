@@ -6,6 +6,9 @@
 #   --with-git     include .git in the sync (opt-in; excluded by default)
 #   --light        declare a light job explicitly, exempt from the load gate
 #   --timeout N    run timeout in seconds (default 900; queue time excluded)
+#   --detach       launch on the mac and return at once; the job outlives this caller and the agent
+#   --wait ID      block until a detached job finishes, then print its receipt
+#   --tail ID      show the latest progress of a detached job and return
 #   --cwd DIR      subdirectory under the workspace on the mac
 #   --mac NAME     target mac (prefix ok; the default is explained at resolve_mac in rexec-lib.sh)
 #   --use NAME     set the default mac for when several are online and no live login names one;
@@ -27,13 +30,17 @@ fmt_dur() {
 }
 
 SYNC_DIR="$PWD"; TIMEOUT=900; SUBCWD=""; WEIGHT=normal; WANT_MAC="${REXEC_MAC:-}"; WITHGIT=0
+DETACH=0; SAW_TIMEOUT=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --sync)    SYNC_DIR="$2"; shift 2;;
     --no-sync) SYNC_DIR="-"; WEIGHT=light; shift;;
     --light)   WEIGHT=light; shift;;
     --with-git) WITHGIT=1; shift;;
-    --timeout) TIMEOUT="$2"; shift 2;;
+    --timeout) TIMEOUT="$2"; SAW_TIMEOUT=1; shift 2;;
+    --detach)  DETACH=1; shift;;
+    --wait)    shift; exec "$BIN/rexec-wait" "$@";;
+    --tail)    shift; exec "$BIN/rexec-tail" "$@";;
     --cwd)     SUBCWD="$2"; shift 2;;
     --mac)     WANT_MAC="$2"; shift 2;;
     --use)
@@ -50,8 +57,17 @@ while [ $# -gt 0 ]; do
     *)         break;;
   esac
 done
-[ $# -ge 1 ] || { echo "Usage: rexec [--mac NAME] [--sync DIR|--no-sync] [--with-git] [--light] [--timeout N] [--cwd SUB] '<command>'" >&2; exit 2; }
+[ $# -ge 1 ] || { echo "Usage: rexec [--mac NAME] [--sync DIR|--no-sync] [--with-git] [--light] [--timeout N|--detach] [--cwd SUB] '<command>'" >&2; exit 2; }
 CMD="$*"
+
+# --timeout is enforced by the agent, with a kill aimed at the job's process group; a detached job is in a
+# process group of its own precisely so that nothing can reach it that way. Rather than accept a flag that
+# would silently do nothing, say it: wanting a bigger timeout is the signal that the job should be detached.
+if [ "$DETACH" = 1 ] && [ "$SAW_TIMEOUT" = 1 ]; then
+  echo "rexec: --detach and --timeout are mutually exclusive - a detached job has no run timeout." >&2
+  echo "  Drop --timeout: --detach is what you reach for when a job is too long to sit and wait for." >&2
+  exit 2
+fi
 
 # --- pick the target mac ---
 # Several macs can attach to this VPS. The default target is the mac whose key this session's live ssh
@@ -82,6 +98,16 @@ fi
 # caller believes it arrived. Refuse instead: a silently missing .git is the bug this flag exists to prevent.
 if [ "$WITHGIT" = 1 ] && ! grep -qw git "$M/caps" 2>/dev/null; then
   echo "rexec: the agent on '$MACID' predates --with-git." >&2
+  echo "Restart it on that mac (Ctrl-C the agent terminal first):" >&2
+  echo "  ssh vps-2g 'cat /var/lib/rexec/agent.sh' > ~/rexec-agent.sh && bash ~/rexec-agent.sh" >&2
+  exit 2
+fi
+
+# --- --detach needs an agent that knows the flag ---
+# An older agent would run it like any other job: the caller would get a receipt for something it believes
+# is detached, while it actually blocks and dies at the 900s timeout. Refuse up front instead.
+if [ "$DETACH" = 1 ] && ! grep -qw detach "$M/caps" 2>/dev/null; then
+  echo "rexec: the agent on '$MACID' predates --detach." >&2
   echo "Restart it on that mac (Ctrl-C the agent terminal first):" >&2
   echo "  ssh vps-2g 'cat /var/lib/rexec/agent.sh' > ~/rexec-agent.sh && bash ~/rexec-agent.sh" >&2
   exit 2
@@ -136,6 +162,7 @@ JOB="$M/queue/.$ID.tmp"
   echo "TIMEOUT=$TIMEOUT"
   echo "WEIGHT=$WEIGHT"
   echo "WITHGIT=$WITHGIT"
+  echo "DETACH=$DETACH"
   echo "PROJECT=$PROJECT"
   echo "SUBMIT=$NOW"
   echo "SEQ=$SEQ"
@@ -200,6 +227,14 @@ EXITCODE=$(sed -n 's/^EXIT=//p'   "$DONE")
 RAN=$(sed -n 's/^RAN=//p'         "$DONE")
 QUEUED=$(sed -n 's/^QUEUED=//p'   "$DONE")
 [ -f "$OUT" ] && cat "$OUT"
+# For a detached job this receipt covers the launch only - sync plus spawn - and the job itself is still
+# going. Say where it went, so the next step is not a guess.
+if [ "$DETACH" = 1 ] && [ "${EXITCODE:-1}" = 0 ]; then
+  printf 'rexec: %s is now running detached on %s; it outlives this session and the agent.\n' "$ID" "$MACID"
+  printf '  progress:  rexec --tail %s\n' "$ID"
+  printf '  result:    rexec --wait %s\n' "$ID"
+  printf '  cancel:    rexec --cancel %s\n' "$ID"
+fi
 printf -- '--- [%s] exit=%s | queued %s | ran %s | total %s ---\n' \
   "$MACID" "${EXITCODE:-1}" "$(fmt_dur "${QUEUED:-0}")" "$(fmt_dur "${RAN:-0}")" \
   "$(fmt_dur $(( ${QUEUED:-0} + ${RAN:-0} )))" >&2

@@ -1,6 +1,6 @@
 ---
 name: rexec
-description: Dispatch work that has to actually run — and that eats memory or time — to the user's mac, bypassing this memory-starved server. Covers compiling and building, installing dependencies, creating virtualenvs, running test suites, starting services for end-to-end checks, and docker containers or image builds. Also takes `/rexec queue` to see the queue, `/rexec cancel <ID>` to cancel a job, and `/rexec macs` to see which macs are online.
+description: Dispatch work that has to actually run — and that eats memory or time — to the user's mac, bypassing this memory-starved server. Covers compiling and building, installing dependencies, creating virtualenvs, running test suites, starting services for end-to-end checks, and docker containers or image builds. Dispatches long builds to the mac's background with `--detach` and collects them later, so a job too long to wait for is not a job you have to babysit. Also takes `/rexec queue` to see the queue, `/rexec cancel <ID>` to cancel a job, and `/rexec macs` to see which macs are online.
 ---
 
 # rexec
@@ -22,7 +22,8 @@ login (a background job) goes to the only online mac, or, when several are onlin
 asks you to start the agent on the right one instead of quietly using it. IP addresses play no part.
 **Jobs from different projects run in parallel; jobs from the same project run serially** (they share one
 workspace), counted per mac.
-The caller blocks until the result arrives, and gets a bill of queue time and run time at the end.
+The caller blocks until the result arrives, and gets a bill of queue time and run time at the end — unless
+the job is dispatched with `--detach`, which returns as soon as it is launched.
 
 ## Sub-commands
 
@@ -96,11 +97,26 @@ rexec 'set -o pipefail; pytest -q 2>&1 | tail -30'
 rexec 'set -o pipefail; npm ci --silent && npm test 2>&1 | tail -40'
 rexec 'set -o pipefail; cargo test --release 2>&1 | tail -40'
 rexec --no-sync 'node -v; python3 -V; docker ps'        # already short, leave it alone
-rexec --timeout 1800 'set -o pipefail; cargo build --release 2>&1 | tail -20'
 # to do more work after the pipe, save the exit code explicitly with ec=$?
 rexec --sync /home/agent/repo/myproj --cwd frontend \
       'npm run build > /tmp/b.log 2>&1; ec=$?; tail -40 /tmp/b.log; exit $ec'
 ```
+
+### Long jobs go to the background
+
+**A job you would give more than the default timeout is a job for `--detach`.** Raising `--timeout` is the
+wrong lever: it holds the caller hostage to a build it cannot outlive, and a session that dies mid-wait
+takes the job with it. Dispatch it detached, get an ID back in seconds, and collect the same receipt later.
+
+```bash
+rexec --detach 'set -o pipefail; cargo build --release 2>&1 | tail -20'   # -> proj-0042
+rexec --tail proj-0042              # progress, any time, costs nothing
+rexec --wait proj-0042              # blocks; prints the usual receipt and exit code
+```
+
+A detached job outlives this session **and** the agent on the mac: closing the agent's terminal, or losing
+the session, does not touch it. Only `rexec --cancel <ID>` stops it. `--detach` and `--timeout` are
+mutually exclusive, because a detached job has no run timeout — that is the point of it.
 
 **`set -o pipefail` is mandatory.** `| tail` replaces the exit code with `tail`'s, which is always 0, and
 exit-code passthrough is what this whole thing rests on — without it, narrowing the output silently
@@ -140,6 +156,10 @@ Leave the light, static work on the server: reading and writing code, grep, type
   too, so nothing is orphaned. A session that dies without ESC — compacted, OOM-killed, ssh dropped — stops
   sending the heartbeat that says someone is still waiting, and the server drops the job within 90s rather
   than leaving it to block the queue.
+- **A detached job keeps its project's workspace** for as long as it runs, so a later `rexec` on the same
+  project waits for it rather than `rsync --delete`-ing the files out from under it. Other projects are
+  unaffected. Its full log stays on the mac for a week; `--tail` reads a snapshot the agent pushes every
+  15s, so it costs nothing and is at most that stale.
 - **An agent that dies without a clean Ctrl-C is cleaned up automatically** — leftover processes on the mac
   and the jobs the server still thinks are running, which would otherwise block the queue for every later
   job. They end as **exit 129**; just re-run the command. `REFERENCE.md` has the details.

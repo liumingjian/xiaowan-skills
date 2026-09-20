@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Show where a detached job has got to, and return. Free: the agent pushes a snapshot of the log every few
+# seconds, so this only reads the server's own copy and never touches the mac.
+# Usage: rexec-tail <ID> [-n LINES]
+set -u
+BIN=$(cd "$(dirname "$(readlink -f "$0")")" && pwd -P)
+. "$BIN/rexec-lib.sh"
+ID="${1:-}"; N=20
+[ -n "$ID" ] || { echo "Usage: rexec --tail <ID> [-n LINES]" >&2; exit 2; }
+[ "${2:-}" = "-n" ] && { N="${3:-20}"; case "$N" in ''|*[!0-9]*) N=20;; esac; }
+fmt_dur() {
+  s=${1:-0}; case "$s" in ''|*[!0-9]*) s=0;; esac
+  if [ "$s" -lt 60 ]; then printf '%ds' "$s"; else printf '%dm%02ds' $((s/60)) $((s%60)); fi
+}
+
+MACID=$(mac_of_job "$ID") || {
+  echo "rexec: no job $ID on any mac. Detached jobs are kept for a week after they finish." >&2
+  exit 70
+}
+D="$MACS/$MACID/detached"
+[ -f "$D/$ID.job" ] || { echo "rexec: $ID is not a detached job; use  rexec --queue  to see it." >&2; exit 70; }
+NOW=$(date +%s)
+LOG=$(sed -n 's/^LOG=//p' "$D/$ID.job")
+ST=$(sed -n 's/^STARTED=//p' "$D/$ID.job"); case "$ST" in ''|*[!0-9]*) ST=$NOW;; esac
+
+if [ -f "$D/$ID.done" ]; then
+  EX=$(sed -n 's/^EXIT=//p' "$D/$ID.done"); RAN=$(sed -n 's/^RAN=//p' "$D/$ID.done")
+  printf '%s on %s: finished, exit %s after %s\n' "$ID" "$MACID" "${EX:-?}" "$(fmt_dur "${RAN:-0}")"
+  SRC="$D/$ID.out"
+else
+  printf '%s on %s: running for %s\n' "$ID" "$MACID" "$(fmt_dur $(( NOW - ST )))"
+  SRC="$D/$ID.tail"
+  if [ -f "$SRC" ]; then
+    AGE=$(( NOW - $(date +%s -r "$SRC") ))
+    printf '  snapshot taken %s ago; the full log is %s on the mac\n' "$(fmt_dur "$AGE")" "$LOG"
+  fi
+fi
+if [ -s "$SRC" ]; then tail -n "$N" "$SRC"
+else echo "  (no output yet)"; fi

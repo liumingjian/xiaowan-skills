@@ -68,6 +68,49 @@ Two consequences worth knowing:
   believes otherwise, so `rexec` refuses the job up front with **exit 2** and asks for an agent restart on
   that mac. Restarting the agent re-announces and clears it.
 
+## Detached jobs
+
+`--detach` runs a job on the mac and returns as soon as it is launched. It exists because the alternative
+for a long build — a bigger `--timeout` — makes the job's survival depend on the caller's, and a session
+that is compacted or killed takes a two-hour build with it.
+
+What it escapes, and how:
+
+- **`perl setpgrp` puts it in a process group of its own.** Every implicit kill in rexec is aimed at a
+  process group: cancel, timeout, and the sweep a new agent does over its predecessor's leftovers. None of
+  them can name this one. `nohup` on top of that makes closing the agent's terminal harmless.
+- **It reports its own result.** When the command exits, the detached process ssh's back to the server
+  itself, over its own connection rather than the agent's multiplexed one, and records the exit code and
+  log tail under `macs/<id>/detached/<ID>`. A detached job therefore finishes correctly on a mac whose
+  agent stopped hours ago. The agent is only the backstop, for a process killed before it could report.
+- **`--cancel` still reaches it**, because the agent records its process group id. Surviving every
+  *implicit* death is the goal; being unkillable is not.
+
+What it does not escape:
+
+- **The project's workspace slot.** A detached job left `running/` the moment it was launched, but it is
+  still building in that directory, so the scheduler keeps it counted: a later job from the same project
+  waits, exactly as it would for a foreground one. Other projects are unaffected. It also counts toward
+  the "nothing is running, let one job through regardless" escape hatch in the load gate, so three
+  detached builds cannot make the mac look idle.
+- **A mac reboot.** Process group ids mean nothing across a boot, so the record carries the boot time too.
+
+Collecting it:
+
+- `rexec --wait <ID>` blocks until it finishes, then prints the same receipt a foreground job would have:
+  log tail, bill line, exit code. Waiting twice is fine, and a job that finished before anyone waited is
+  collected just the same — its record is kept for a week.
+- `rexec --tail <ID> [-n N]` reads a snapshot of the log that the agent pushes to the server every
+  `REXEC_TAIL` seconds (default 15). It never touches the mac, so it is free, and at most that stale. The
+  full log lives on the mac at `~/.rexec/detached/<ID>.log` for a week.
+- **When the agent is offline, nothing judges a detached job.** The process reports itself; the agent is
+  what notices when it never got the chance. With the agent down, `--wait` says so on stderr and keeps
+  waiting rather than declaring a job dead because the user closed a terminal. Once the agent is back, a
+  process group that is gone is reported as **exit 129** on its first poll.
+- Like `--with-git`, an agent that predates `--detach` makes `rexec` refuse the job with **exit 2** and ask
+  for a restart on that mac. Running it as a normal job instead would give the caller a receipt for
+  something it believes is detached, which would then die at the 900s timeout.
+
 ## Parallelism and queueing
 
 - **Parallel across projects, serial within a project.** Two commands from one project share a workspace
@@ -87,7 +130,7 @@ Two consequences worth knowing:
     whatever the user is doing; it reopens on its own once things settle.
   - Two exemptions: **light jobs** (`--no-sync` / `--light`) ignore the gate entirely, and when nothing at
     all is running one job is claimed regardless of the gate (otherwise a persistently busy mac would stall
-    the queue forever).
+    the queue forever). Detached jobs count as running for that second exemption.
 - Queue time does **not** count against `--timeout`, which measures run time only, so yielding for a long
   while never causes a false timeout.
 
@@ -163,12 +206,15 @@ job is on.
   it, then re-run the command. Not a cue to retarget another mac with `--mac`.
 - `90` — rsync failed. `91` — target directory does not exist.
 - `124` — run timed out (exceeded `--timeout`; queue time excluded).
-- `125` — job cancelled (`--cancel`, or the caller pressed ESC).
+- `125` — job cancelled (`--cancel`, or the caller pressed ESC). For a detached job `--cancel` is the only
+  thing that produces it.
 - `129` — the job was stranded: the agent that was running it died without reporting (kill -9, closed
-  terminal, mac asleep), so the server finished it on the agent's behalf. Re-run the command.
+  terminal, mac asleep), so the server finished it on the agent's behalf. For a detached job it means the
+  process group is gone without a result — killed from outside, or the mac rebooted. Re-run the command.
 - `130` — the agent on the mac was stopped with Ctrl-C, taking the job with it.
-- `70` — the job vanished from the queue without producing a result (someone cleaned the state tree by
-  hand). Re-run the command.
+- `70` — no such job on any mac: it vanished from the queue without producing a result (someone cleaned
+  the state tree by hand), or a `--wait` / `--tail` names an ID that never existed or has aged out of the
+  week-long detached history. Re-run the command.
 - anything else — the real exit code of the command itself on the mac.
 
 On failure `rexec` writes the reason and the next step to stderr itself; this table is only a quick lookup.
@@ -185,6 +231,7 @@ On failure `rexec` writes the reason and the next step to stderr itself; this ta
 | `REXEC_CPU_RELAX` | CPU floor % below which cooldown is ignored | 40 |
 | `REXEC_MEM_MIN` | free memory floor % | 20 |
 | `REXEC_COOLDOWN` | claim cooldown, seconds | 15 |
+| `REXEC_TAIL` | how often a detached job's log tail is pushed to the server, seconds | 15 |
 | `REXEC_LOG` | write the agent log to this file | no log file |
 
 Server side: `REXEC_CALLER_GRACE` (default 90s) is how long a job may go without a caller heartbeat before

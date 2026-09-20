@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Block until a detached job finishes, then hand back the same receipt a foreground job would have given:
+# its log tail, the bill line, and its exit code. Waiting twice is fine - the record is kept for a week.
+# Usage: rexec-wait <ID>
+set -u
+BIN=$(cd "$(dirname "$(readlink -f "$0")")" && pwd -P)
+. "$BIN/rexec-lib.sh"
+ID="${1:-}"
+[ -n "$ID" ] || { echo "Usage: rexec --wait <ID>" >&2; exit 2; }
+fmt_dur() {
+  s=${1:-0}; case "$s" in ''|*[!0-9]*) s=0;; esac
+  if [ "$s" -lt 60 ]; then printf '%ds' "$s"; else printf '%dm%02ds' $((s/60)) $((s%60)); fi
+}
+
+MACID=$(mac_of_job "$ID") || {
+  echo "rexec: no job $ID on any mac. Detached jobs are kept for a week after they finish." >&2
+  exit 70
+}
+D="$MACS/$MACID/detached"
+[ -f "$D/$ID.job" ] || {
+  echo "rexec: $ID is not a detached job - it is still queued or running, so the call that submitted it is" >&2
+  echo "  the one that gets its result. Use  rexec --queue  to see it." >&2
+  exit 70
+}
+
+# An offline agent is the one case where nothing can tell a live job from a dead one: the process reports
+# itself when it exits, and the agent is what notices when it never gets the chance. Say so rather than
+# waiting silently, but keep waiting - the user closing a terminal is not evidence the build stopped.
+WARNED=0
+while [ ! -f "$D/$ID.done" ]; do
+  if [ "$WARNED" = 0 ] && ! mac_online "$MACID"; then
+    echo "rexec: the agent on '$MACID' is offline, so the state of $ID cannot be confirmed while you wait." >&2
+    echo "  A detached job keeps running without the agent and still reports on its own when it finishes." >&2
+    WARNED=1
+  fi
+  sleep 2
+done
+
+EXITCODE=$(sed -n 's/^EXIT=//p' "$D/$ID.done")
+RAN=$(sed -n 's/^RAN=//p'       "$D/$ID.done")
+[ -f "$D/$ID.out" ] && cat "$D/$ID.out"
+printf -- '--- [%s] exit=%s | detached | ran %s ---\n' "$MACID" "${EXITCODE:-1}" "$(fmt_dur "${RAN:-0}")" >&2
+[ "${EXITCODE:-1}" = 125 ] && echo "rexec: this job was cancelled" >&2
+exit "${EXITCODE:-1}"
