@@ -3,7 +3,7 @@
 # Shared by rexec / queue / cancel / claim / report.
 #
 # Directory layout (one independent queue per mac, fully isolated):
-#   /var/lib/rexec/macs/<MACID>/{queue,running,results,cancel,alive}
+#   /var/lib/rexec/macs/<MACID>/{queue,running,results,cancel,alive,detached}
 #   /var/lib/rexec/macs/<MACID>/{agent.alive,gate.status,origin,name}
 #   /var/lib/rexec/{seq,seq.lock,history.jsonl,default}   shared globally
 #
@@ -16,7 +16,8 @@ MACS="$ROOT/macs"
 umask 002
 
 mac_dirs() { # create the full directory set for one mac
-  mkdir -p "$MACS/$1/queue" "$MACS/$1/running" "$MACS/$1/results" "$MACS/$1/cancel" "$MACS/$1/alive"
+  mkdir -p "$MACS/$1/queue" "$MACS/$1/running" "$MACS/$1/results" "$MACS/$1/cancel" \
+           "$MACS/$1/alive" "$MACS/$1/detached"
 }
 all_macs()  { for d in "$MACS"/*; do [ -d "$d" ] && basename "$d"; done; }
 mac_hb()    { l=$(cat "$MACS/$1/agent.alive" 2>/dev/null); case "$l" in ''|*[!0-9]*) l=0;; esac; printf '%s' "$l"; }
@@ -40,6 +41,36 @@ norm_ip() { printf '%s' "${1#::ffff:}"; }
 note_origin() { # MACID IP
   _ip=$(norm_ip "$2"); [ -n "$_ip" ] || return 0
   printf '%s' "$_ip" > "$MACS/$1/.orig.$$" && mv "$MACS/$1/.orig.$$" "$MACS/$1/origin"
+}
+
+# ---- detached jobs ----
+# A detached job has left running/ but is still on the mac, so it keeps holding its project's workspace.
+# Its record stays after it finishes - that is what `rexec --wait` reads - so "still occupied" means a
+# record without a .done beside it.
+detached_active() { # MACID -> ids still running
+  for _j in "$MACS/$1"/detached/*.job; do
+    [ -e "$_j" ] || break
+    _i=$(basename "$_j" .job)
+    [ -f "$MACS/$1/detached/$_i.done" ] || echo "$_i"
+  done
+}
+
+detached_holds() { # MACID PROJECT -> true when a detached job of that project is still running
+  for _i in $(detached_active "$1"); do
+    [ "$(sed -n 's/^PROJECT=//p' "$MACS/$1/detached/$_i.job" 2>/dev/null)" = "$2" ] && return 0
+  done
+  return 1
+}
+
+# The mac holding job $1, whether it is queued, running or detached. IDs are globally unique, so a caller
+# never has to know which mac its job went to.
+mac_of_job() {
+  for _m in $(all_macs); do
+    for _p in "detached/$1.job" "running/$1.job" "queue/$1.job"; do
+      [ -f "$MACS/$_m/$_p" ] && { printf '%s' "$_m"; return 0; }
+    done
+  done
+  return 1
 }
 
 # ---- caller heartbeat ----

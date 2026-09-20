@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Called once per agent poll; one ssh round trip does three things: refresh the heartbeat, fetch the
 # cancel list, and optionally claim one job.
-# Usage: rexec-claim <MACID> <claim:0|1> <gate:open|closed> <running_count> <cpu%> <memfree%> <heavy_ok:0|1> [running_ids]
+# Usage: rexec-claim <MACID> <claim:0|1> <gate:open|closed> <running_count> <cpu%> <memfree%> <heavy_ok:0|1> [running_ids] [detached_ids]
 # running_ids is the comma-separated list of jobs the agent is actually running ("-" when none). An agent
 # that predates it sends nothing, which disables the reconciliation below rather than reaping everything.
 # Queues are namespaced by MACID: a mac only sees, and only claims, jobs addressed to it.
@@ -17,7 +17,7 @@ set -u
 BIN=$(cd "$(dirname "$(readlink -f "$0")")" && pwd -P)
 . "$BIN/rexec-lib.sh"
 MACID="${1:?}"; WANT="${2:-0}"; GATE="${3:-open}"; NRUN="${4:-0}"
-CPU="${5:--}"; MEM="${6:--}"; HEAVY_OK="${7:-1}"; RIDS="${8-}"
+CPU="${5:--}"; MEM="${6:--}"; HEAVY_OK="${7:-1}"; RIDS="${8-}"; DIDS="${9-}"
 case "$MACID" in *[!A-Za-z0-9_.-]*) echo "invalid MACID" >&2; exit 2;; esac
 login_matches "$MACID" || { echo "this login's key is tagged for another mac, not $MACID" >&2; exit 2; }
 NOW=$(date +%s)
@@ -40,6 +40,13 @@ SWEEP="$ROOT/.sweep"
 if [ ! -f "$SWEEP" ] || [ -n "$(find "$SWEEP" -mmin +10 2>/dev/null)" ]; then
   : > "$SWEEP"
   find "$MACS"/*/results -type f -mmin +60 -delete 2>/dev/null || true
+  # Finished detached jobs are kept far longer: their whole point is that nobody was waiting, so the
+  # result has to survive until someone comes back for it. A week matches the log retention on the mac.
+  for _d in "$MACS"/*/detached/*.done; do
+    [ -e "$_d" ] || break
+    [ -n "$(find "$_d" -mtime +7 2>/dev/null)" ] || continue
+    rm -f "${_d%.done}".*
+  done
 fi
 
 # Reconcile what we think is running with what the agent says it is running. Anything only we still hold is
@@ -91,6 +98,21 @@ for r in "$M"/running/*.job; do
   [ -e "$M/cancel/$rid" ] || : > "$M/cancel/$rid"
 done
 
+# Detached jobs: the agent reports which ones it can still see a live process group for. Anything else has
+# died without reporting - the mac rebooted, or someone killed the process from outside. Only an agent that
+# knows about detached jobs sends this list at all; without it we make no judgement, because the alternative
+# is declaring jobs dead every time the user simply closes the agent's terminal.
+if [ -n "$DIDS" ]; then
+  for d in $(detached_active "$MACID"); do
+    case ",$DIDS," in *",$d,"*) continue;; esac
+    RAN=0
+    DST=$(sed -n 's/^STARTED=//p' "$M/detached/$d.job"); case "$DST" in ''|*[!0-9]*) DST=0;; esac
+    [ "$DST" -gt 0 ] && RAN=$(( NOW - DST ))
+    printf '[rexec] the detached process for %s is gone from %s without reporting (the mac rebooted, or it was killed from outside)\n' \
+      "$d" "$MACID" | openssl base64 -A | "$BIN/rexec-detached" done "$MACID" "$d" 129 "$RAN" >/dev/null 2>&1
+  done
+fi
+
 # Cancel list: the agent kills the matching process groups, and report clears the markers afterwards.
 CANCELS=""
 for c in "$M"/cancel/*; do
@@ -130,6 +152,9 @@ while IFS= read -r f; do
       [ -e "$r" ] || break
       [ "$(sed -n 's/^PROJECT=//p' "$r")" = "$HPROJ" ] && { BUSY=1; break; }
     done
+    # A detached job left running/ the moment it was launched, but it is still building in that same
+    # workspace directory, and a job claimed now would rsync --delete the files out from under it.
+    [ "$BUSY" = 0 ] && detached_holds "$MACID" "$HPROJ" && BUSY=1
     [ "$BUSY" = 1 ] && continue
   fi
 

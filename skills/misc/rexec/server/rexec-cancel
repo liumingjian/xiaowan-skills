@@ -37,7 +37,21 @@ for MACID in $(all_macs); do
     exit 0
   fi
 
-  # 2) running - write a marker; the agent picks it up within seconds and kills only that job's process group
+  # 2) detached - same marker, but the agent has to be up to act on it: a detached job is in a process
+  # group of its own so that nothing implicit can reach it, which leaves an explicit cancel as the only
+  # way in, and the agent as the only thing holding the knife.
+  if [ -f "$M/detached/$ID.job" ] && [ ! -f "$M/detached/$ID.done" ]; then
+    : > "$M/cancel/$ID"
+    if mac_online "$MACID"; then
+      echo "Cancel requested for detached job $ID; the agent on $MACID will terminate it within seconds"
+    else
+      echo "Cancel queued for detached job $ID, but the agent on $MACID is offline."
+      echo "It keeps running until the agent is started there again, and is killed on its first poll."
+    fi
+    exit 0
+  fi
+
+  # 3) running - write a marker; the agent picks it up within seconds and kills only that job's process group
   if [ -f "$M/running/$ID.job" ]; then
     : > "$M/cancel/$ID"
     echo "Cancel requested for $ID; the agent on $MACID will terminate it within seconds (that job only)"

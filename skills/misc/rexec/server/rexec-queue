@@ -51,6 +51,18 @@ show_mac() {
     printf '    %-15s %-46s ran %s%s\n' "$id" "$(cmd_of "$r")" "$(fmt_dur $(( NOW - st )))" "$mark"
   done
 
+  # --- detached: off the queue, still on the mac, still holding its project's workspace ---
+  ND=0; for d in $(detached_active "$MACID"); do ND=$((ND+1)); done
+  if [ "$ND" -gt 0 ]; then
+    echo "  detached ($ND)"
+    for id in $(detached_active "$MACID"); do
+      st=$(sed -n 's/^STARTED=//p' "$M/detached/$id.job"); case "$st" in ''|*[!0-9]*) st=$NOW;; esac
+      mark=""; [ -e "$M/cancel/$id" ] && mark="  <- cancelling"
+      printf '    %-15s %-46s ran %s%s\n' "$id" "$(cmd_of "$M/detached/$id.job")" \
+        "$(fmt_dur $(( NOW - st )))" "$mark"
+    done
+  fi
+
   # --- queued (submit order; each line says what is actually holding that job) ---
   QLIST=$(for f in "$M"/queue/*.job; do
             [ -e "$f" ] || continue

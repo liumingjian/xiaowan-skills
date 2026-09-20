@@ -38,12 +38,10 @@ beat()    { date +%s > "$M/alive/$1"; }                       # a caller that is
 stale()   { printf '%s' $(( $(date +%s) - 600 )) > "$M/alive/$1"; }  # a caller killed 10 minutes ago
 nobeat()  { rm -f "$M/alive/$1"; }                            # a client that predates heartbeats
 
-# claim [WANT] [NRUN] [HEAVY_OK] [RIDS] -> the ID it picked, or NONE
-claim() {
-  "$SRV/rexec-claim" "$MAC" "${1:-1}" open "${2:-0}" 10% 80% "${3:-1}" "${4:--}" 2>/dev/null \
-    | sed -n 's/^ID=//p' | head -1
-}
-claim_raw() { "$SRV/rexec-claim" "$MAC" "${1:-1}" open "${2:-0}" 10% 80% "${3:-1}" "${4:--}" 2>/dev/null; }
+# claim [WANT] [NRUN] [HEAVY_OK] [RIDS] [DIDS] -> the ID it picked, or NONE
+# An omitted DIDS is how an agent that predates --detach calls in: it sends no detached list at all.
+claim_raw() { "$SRV/rexec-claim" "$MAC" "${1:-1}" open "${2:-0}" 10% 80% "${3:-1}" "${4:--}" "${5-}" 2>/dev/null; }
+claim()     { claim_raw "$@" | sed -n 's/^ID=//p' | head -1; }
 picked()  { p=$(claim "$@"); [ -n "$p" ] || p=NONE; printf '%s' "$p"; }
 
 echo "rexec scheduler tests  ($REXEC_ROOT)"
@@ -105,6 +103,57 @@ submit proj_a-0003 proj_a                                         # queued, call
 "$SRV/rexec-announce" "$MAC" "$(printf 'Test Mac' | openssl base64 -A)" git,reap >/dev/null 2>&1
 is "restart reaps the stale running entry" "" "$(ls "$M/running" | grep proj_a-0001 || true)"
 is "the live caller's job then runs"       proj_a-0003 "$(picked)"
+
+echo "- detached jobs"
+detach() { # ID PROJECT [pgid] - submit it, claim it, and hand it off to detached/
+  submit "$1" "$2"; start "$1"
+  "$SRV/rexec-detached" start "$MAC" "$1" "${3:-99999}" boot1 "$(printf '/log' | openssl base64 -A)" >/dev/null
+  rm -f "$M/running/$1.job" "$M/running/$1.started" "$M/alive/$1"   # what reporting the launch does
+}
+
+reset
+detach proj_a-0001 proj_a
+submit proj_a-0002 proj_a
+submit proj_b-0003 proj_b
+is "a detached job still holds its project's workspace" proj_b-0003 "$(picked 1 1 1 - )"
+is "...so its own project keeps waiting"                 ""          "$(ls "$M/running" | grep proj_a-0002 || true)"
+
+reset
+detach proj_a-0001 proj_a
+printf 'EXIT=0\nRAN=5\nEND=%s\n' "$(date +%s)" > "$M/detached/proj_a-0001.done"
+submit proj_a-0002 proj_a
+is "a finished detached job releases the slot" proj_a-0002 "$(picked)"
+
+reset
+detach proj_a-0001 proj_a
+claim_raw 0 1 1 - proj_a-0001 >/dev/null
+is "a detached job the agent still sees is left alone" "" "$(ls "$M/detached" | grep '\.done' || true)"
+
+reset
+detach proj_a-0001 proj_a
+claim_raw 0 0 1 - - >/dev/null
+is "a detached job the agent cannot see any more is reaped" 129 \
+   "$(sed -n 's/^EXIT=//p' "$M/detached/proj_a-0001.done" 2>/dev/null)"
+
+reset
+detach proj_a-0001 proj_a
+claim_raw 0 0 1 - >/dev/null
+is "an agent that predates --detach reaps nothing" "" \
+   "$(sed -n 's/^EXIT=//p' "$M/detached/proj_a-0001.done" 2>/dev/null)"
+
+reset
+detach proj_a-0001 proj_a
+"$SRV/rexec-cancel" proj_a-0001 >/dev/null 2>&1
+is "a detached job can still be cancelled explicitly" proj_a-0001 "$(ls "$M/cancel")"
+
+reset
+detach proj_a-0001 proj_a
+printf 'built ok' | openssl base64 -A | "$SRV/rexec-detached" done "$MAC" proj_a-0001 0 42 >/dev/null
+is "the job reports its own result" 0        "$(sed -n 's/^EXIT=//p' "$M/detached/proj_a-0001.done")"
+is "...with its log"                'built ok' "$(cat "$M/detached/proj_a-0001.out")"
+printf 'later' | openssl base64 -A | "$SRV/rexec-detached" done "$MAC" proj_a-0001 9 99 >/dev/null
+is "...and a second report is ignored" 0     "$(sed -n 's/^EXIT=//p' "$M/detached/proj_a-0001.done")"
+is "a finished job leaves the active list"  "" "$("$SRV/rexec-detached" list "$MAC")"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 rm -rf "$REXEC_ROOT"

@@ -12,6 +12,7 @@
 #   REXEC_CPU_RELAX below this CPU level the claim cooldown is ignored, default CPU_MAX/2 (i.e. 40)
 #   REXEC_COOLDOWN  claim cooldown in seconds (only applies when CPU sits in RELAX..CPU_MAX), default 15
 #   REXEC_LOG       write the terminal log to this file (opened in append mode internally; do not use a shell > redirect)
+#   REXEC_TAIL      how often to push a detached job's log tail to the server, in seconds, default 15
 set -u
 HOST="${REXEC_HOST:-vps-2g}"
 WS="${REXEC_WS:-$HOME/rexec-workspace}"
@@ -19,6 +20,7 @@ POLL="${REXEC_POLL:-2}"
 CPU_MAX="${REXEC_CPU_MAX:-80}"
 MEM_MIN="${REXEC_MEM_MIN:-20}"
 COOLDOWN="${REXEC_COOLDOWN:-15}"
+TAIL_EVERY="${REXEC_TAIL:-15}"
 CPU_RELAX="${REXEC_CPU_RELAX:-$(( ${REXEC_CPU_MAX:-80} / 2 ))}"
 
 # Use REXEC_LOG for a log file rather than a shell `>` redirect:
@@ -30,7 +32,10 @@ if [ -n "${REXEC_LOG:-}" ]; then exec 2>>"$REXEC_LOG"; fi
 
 RD="$HOME/.rexec"
 JOBS="$RD/jobs"
-mkdir -p "$WS" "$RD" "$JOBS"
+# Detached jobs are tracked separately from JOBS on purpose: everything under JOBS is wiped and killed when
+# a new agent starts, and a detached job is defined by surviving exactly that.
+DET="$RD/detached"
+mkdir -p "$WS" "$RD" "$JOBS" "$DET"
 
 # Single instance: two agents fight over the queue, each claiming half the jobs and logging separately, which is brutal to diagnose.
 # The install command is idempotent and users re-run it often, so this has to be blocked here.
@@ -72,7 +77,7 @@ fi
 LABEL="${MACNAME:-$MACID}"
 # What this agent version can do. The server refuses a job whose flag is missing here, rather than
 # running it with the flag silently dropped.
-CAPS="git,reap"
+CAPS="git,reap,detach"
 
 
 # ---------- log format: TIME(8) EVENT(6) ID(15) sigil DETAIL ----------
@@ -131,6 +136,9 @@ if [ "$BOOT" != unknown ] && [ "$PREV_BOOT" = "$BOOT" ]; then
   done
 fi
 rm -f "$JOBS"/* 2>/dev/null
+# Detached records survive the wipe above - that is the point of keeping them elsewhere. Only their logs
+# age out, after a week, which is how long the server keeps the matching result.
+find "$DET" -name '*.log' -mtime +7 -delete 2>/dev/null || true
 printf '%s' "$BOOT" > "$RD/boot.tmp" && mv "$RD/boot.tmp" "$RD/boot"
 
 # ---------- job body (a separate file to avoid nested quoting; exec'd after perl setpgrp) ----------
@@ -163,6 +171,52 @@ fi
 DIR="$J_RUNDIR"
 [ -n "$J_SUB" ] && DIR="$J_RUNDIR/$J_SUB"
 cd "$DIR" 2>/dev/null || { echo "directory does not exist: $DIR"; exit 91; }
+
+# A detached job is launched here and left behind: the sync above was the caller's business, everything
+# below it is not. What the caller gets back is this launch, which takes seconds.
+if [ "${J_DETACH:-0}" = 1 ]; then
+  LOG="$J_DET/$J_ID.log"
+  : > "$LOG"
+  printf '%s' "$J_CMD" > "$J_DET/$J_ID.cmd"
+  # The body is written to a file rather than quoted into a command line: the command can contain anything.
+  cat > "$J_DET/$J_ID.body" <<BODY
+#!/bin/bash
+# setpgrp puts this in a process group of its own, so no kill aimed at the agent or at another job can
+# reach it, and nohup makes closing the agent's terminal harmless. It reports its own result over its own
+# ssh connection - not the agent's multiplexed one, which dies with the agent - which is what lets a
+# detached job finish correctly on a mac whose agent stopped hours ago.
+ID='$J_ID'; DET='$J_DET'; HOST='$J_HOST'; MACID='$J_MACID'; DIR='$DIR'
+START=\$(date +%s)
+cd "\$DIR" || exit 91
+/bin/bash -lc "\$(cat "\$DET/\$ID.cmd")" >> "\$DET/\$ID.log" 2>&1
+EC=\$?
+echo \$EC > "\$DET/\$ID.exit"
+RAN=\$(( \$(date +%s) - START ))
+n=0
+while [ \$n -lt 3 ]; do
+  if tail -c 400000 "\$DET/\$ID.log" | openssl base64 -A \\
+     | ssh -T -o BatchMode=yes -o ConnectTimeout=10 "\$HOST" \\
+           /var/lib/rexec/bin/rexec-detached done "\$MACID" "\$ID" \$EC \$RAN >/dev/null 2>&1; then
+    : > "\$DET/\$ID.reported"; break
+  fi
+  n=\$(( n + 1 )); sleep 10
+done
+BODY
+  nohup perl -e 'setpgrp(0,0); exec @ARGV or die "exec failed: $!"' -- \
+        /bin/bash "$J_DET/$J_ID.body" >> "$LOG" 2>&1 </dev/null &
+  PG=$!
+  printf 'PGID=%s\nBOOT=%s\nSTART=%s\n' "$PG" "$J_BOOT" "$(date +%s)" > "$J_DET/$J_ID.meta"
+  # Registered before this job leaves running/, so the project's workspace is never unclaimed for an instant.
+  if ! $J_RSH "$J_HOST" "/var/lib/rexec/bin/rexec-detached start $J_MACID $J_ID $PG $J_BOOT $(printf '%s' "$LOG" | openssl base64 -A)" >/dev/null 2>&1; then
+    kill -TERM -"$PG" 2>/dev/null
+    rm -f "$J_DET/$J_ID.meta"
+    echo "could not register the detached job on the server; nothing was left running"
+    exit 1
+  fi
+  echo "detached as $J_ID (process group $PG); log: $LOG"
+  exit 0
+fi
+
 exec /bin/bash -lc "$J_CMD"
 RUNNER_EOF
 chmod +x "$RD/runner.sh"
@@ -194,6 +248,24 @@ kill_job() {
   p=$(pgid_of "$1")
   [ -n "$p" ] && { kill -TERM -"$p" 2>/dev/null; sleep 1; kill -KILL -"$p" 2>/dev/null; }
 }
+# ---- detached jobs ----
+# Tracked by process group, and re-adopted as-is when the agent restarts: their records live outside JOBS
+# and are never wiped. Nothing here ever kills one - only an explicit `rexec --cancel` does.
+det_ids()   { for m in "$DET"/*.meta; do [ -e "$m" ] || break; basename "$m" .meta; done; }
+det_pgid()  { sed -n 's/^PGID=//p' "$DET/$1.meta" 2>/dev/null; }
+det_alive() { # a process group id means nothing across a reboot, so the boot time has to match too
+  b=$(sed -n 's/^BOOT=//p' "$DET/$1.meta" 2>/dev/null)
+  [ -n "$b" ] && [ "$b" = "$BOOT" ] || return 1
+  p=$(det_pgid "$1"); case "$p" in ''|*[!0-9]*) return 1;; esac
+  kill -0 -"$p" 2>/dev/null
+}
+det_clear() { rm -f "$DET/$1.meta" "$DET/$1.body" "$DET/$1.cmd" "$DET/$1.exit" "$DET/$1.reported"; }
+det_report() { # ID EXIT - the backstop for a job that could not report itself
+  st=$(sed -n 's/^START=//p' "$DET/$1.meta" 2>/dev/null); case "$st" in ''|*[!0-9]*) st=$(date +%s);; esac
+  tail -c 400000 "$DET/$1.log" 2>/dev/null | b64 \
+    | $SSH /var/lib/rexec/bin/rexec-detached done "$MACID" "$1" "$2" $(( $(date +%s) - st )) >/dev/null 2>&1
+}
+
 stop_agent() {
   if [ "$STOPPING" = 1 ]; then echo; echo "forced exit"; exit 130; fi
   STOPPING=1; echo
@@ -209,6 +281,8 @@ stop_agent() {
   done
   ssh $BASE -O exit "$HOST" >/dev/null 2>&1
   rm -f "$PIDF"
+  nd=0; for d in $(det_ids); do det_alive "$d" && nd=$((nd+1)); done
+  [ "$nd" -gt 0 ] && out "$nd detached job(s) keep running; rexec --tail and rexec --wait still reach them"
   out "rexec-agent stopped"
   exit 130
 }
@@ -242,6 +316,7 @@ out "polling every ${POLL}s, ctrl-c to stop"
 out ""
 
 LAST_CLAIM=0
+LAST_TAIL=0
 GATE_STATE=init
 
 while true; do
@@ -286,7 +361,32 @@ while true; do
     fi
   done
 
+  # ---- 1b. detached jobs: report the ones that are gone, push progress for the ones that are not ----
+  DIDS=""; NDET=0; PUSH=0
+  [ $(( NOW - LAST_TAIL )) -ge "$TAIL_EVERY" ] && PUSH=1
+  for did in $(det_ids); do
+    if det_alive "$did"; then
+      DIDS="$DIDS,$did"; NDET=$((NDET+1))
+      # A snapshot of the log, so `rexec --tail` costs nothing and never has to reach the mac.
+      [ "$PUSH" = 1 ] && tail -n 60 "$DET/$did.log" 2>/dev/null | b64 \
+        | $SSH /var/lib/rexec/bin/rexec-detached tail "$MACID" "$did" >/dev/null 2>&1
+      continue
+    fi
+    # Gone. It reports itself on the way out, so getting here usually means it could not - killed from
+    # outside, or the mac rebooted under it. Its own exit code if it managed to record one, else 129.
+    if [ ! -f "$DET/$did.reported" ]; then
+      ec=$(cat "$DET/$did.exit" 2>/dev/null); case "$ec" in ''|*[!0-9]*) ec=129;; esac
+      det_report "$did" "$ec"
+      say FAIL "$did" '|' "detached job ended without reporting, recorded exit $ec"
+    fi
+    det_clear "$did"
+  done
+  [ "$PUSH" = 1 ] && LAST_TAIL="$NOW"
+
   NRUN=0; for m in "$JOBS"/*.meta; do [ -e "$m" ] && NRUN=$((NRUN+1)); done
+  # Detached jobs are off the queue but very much on the machine. Counting them keeps the "nothing is
+  # running, let one through regardless" escape hatch from firing while three of them burn every core.
+  NRUN=$(( NRUN + NDET ))
 
   # ---- 2. gate: CPU and memory both guard; either one over the limit stops heavy claims ----
   if [ "$CPU" -le "$CPU_MAX" ] && [ "$MEM" -ge "$MEM_MIN" ]; then GATE=open; else GATE=closed; fi
@@ -314,7 +414,8 @@ while true; do
   # The ID list is what lets the server spot jobs it thinks are running here but we know nothing about;
   # "-" says "nothing is running", as distinct from an older agent sending no list at all.
   RIDS=$(running_ids | tr '\n' ',' | sed 's/,$//'); [ -n "$RIDS" ] || RIDS='-'
-  PAYLOAD=$($SSH -n "/var/lib/rexec/bin/rexec-claim $MACID $WANT $GATE $NRUN ${CPU}% ${MEM}% $HEAVY_OK $RIDS" 2>/dev/null)
+  DIDS="${DIDS#,}"; [ -n "$DIDS" ] || DIDS='-'
+  PAYLOAD=$($SSH -n "/var/lib/rexec/bin/rexec-claim $MACID $WANT $GATE $NRUN ${CPU}% ${MEM}% $HEAVY_OK $RIDS $DIDS" 2>/dev/null)
   if [ -z "$PAYLOAD" ]; then
     say WARN "-" '|' "connection lost, retrying in 5s"; sleep 5; continue
   fi
@@ -327,6 +428,15 @@ while true; do
       : > "$JOBS/$cid.cancelled"
       echo "[rexec-agent] cancel requested" >> "$RD/$cid.log"
       kill_job "$cid"
+    elif [ -f "$DET/$cid.meta" ]; then
+      # The only thing that ever kills a detached job. It cannot report its own death here, since the kill
+      # takes the reporting shell with it, so the agent reports for it.
+      p=$(det_pgid "$cid")
+      [ -n "$p" ] && { kill -TERM -"$p" 2>/dev/null; sleep 1; kill -KILL -"$p" 2>/dev/null; }
+      echo "[rexec-agent] cancel requested" >> "$DET/$cid.log"
+      det_report "$cid" 125
+      det_clear "$cid"
+      say CANCEL "$cid" '|' "detached job cancelled"
     fi
   done
 
@@ -341,7 +451,9 @@ while true; do
     SUBMIT=$(printf '%s\n' "$BODY" | sed -n 's/^SUBMIT=//p')
     WEIGHT=$(printf '%s\n' "$BODY" | sed -n 's/^WEIGHT=//p')
     WGIT=$(printf   '%s\n' "$BODY" | sed -n 's/^WITHGIT=//p')
+    DTCH=$(printf   '%s\n' "$BODY" | sed -n 's/^DETACH=//p')
     case "$WGIT" in 1) ;; *) WGIT=0;; esac
+    case "$DTCH" in 1) ;; *) DTCH=0;; esac
     case "$TMO"    in ''|*[!0-9]*) TMO=900;; esac
     case "$SUBMIT" in ''|*[!0-9]*) SUBMIT=$NOW;; esac
 
@@ -364,6 +476,7 @@ while true; do
     (
       J_ID="$ID" J_CMD="$CMD" J_SYNC="$SYNC" J_SUB="$SUB" J_GIT="$WGIT" \
       J_RUNDIR="$RUNDIR" J_HOST="$HOST" J_RSH="$RSH" J_JOBS="$JOBS" \
+      J_DETACH="$DTCH" J_DET="$DET" J_MACID="$MACID" J_BOOT="$BOOT" \
       perl -e 'setpgrp(0,0); exec @ARGV or die "exec failed: $!"' -- \
            /bin/bash "$RD/runner.sh" >> "$RD/$ID.log" 2>&1
       # This wrapper deliberately stays in the agent's process group: kill -PGID cannot reach it, so the exit code survives
