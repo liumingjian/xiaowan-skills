@@ -14,7 +14,12 @@ install -m 664 "$S/server/rexec-lib.sh" "$R/bin/"
 install -m 775 "$S/agent.sh" "$R/agent.sh"
 # Shared between root and agent: group-owned by agent, setgid so new files inherit the group.
 chgrp -R agent "$R" 2>/dev/null || sudo chgrp -R agent "$R"
-chmod -R g+rwX "$R"; find "$R" -type d -exec chmod g+s {} +
+# The mac's agent reaches the server as root, so parts of the state tree are root-owned and these two
+# cannot touch them - they already carry the right bits, having been created under this umask. Without
+# the guard `set -e` aborts the deploy here, before the symlinks below, on every re-install after a mac
+# has ever connected.
+chmod -R g+rwX "$R" 2>/dev/null || true
+find "$R" -type d -exec chmod g+s {} + 2>/dev/null || true
 sudo ln -sfn "$R" /root/.rexec
 sudo ln -sfn "$R/bin/rexec" /usr/local/bin/rexec
 # Clear the flat single-mac-era layout: drop empty dirs and the global heartbeat file so they are not
