@@ -51,11 +51,24 @@ if [ -f "$PIDF" ]; then
 fi
 echo $$ > "$PIDF"
 
-CP="$RD/cm-%C"
+# A literal path rather than %C, so master_up can clear a dead master's socket; hashed per host so a
+# master left over for another REXEC_HOST is never reused.
+CP="$RD/cm-$(printf '%s' "$HOST" | openssl md5 | sed 's/.*[= ]//' | cut -c1-8)"
 BASE="-T -o ControlPath=$CP -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
 SSH_OPTS="$BASE -o ControlMaster=no"
 SSH="ssh $SSH_OPTS $HOST"
 RSH="ssh $SSH_OPTS"
+
+# The master carries every poll, sync and report, and keeps them off fresh logins, which are what a flaky
+# home link drops. sshd times the master out when the link stalls, so it is rebuilt whenever it is gone;
+# made only once at startup, its first timeout left every later call on a fresh login for good.
+master_up() {
+  ssh $BASE -O check "$HOST" >/dev/null 2>&1 && return 0
+  # A dead master leaves its socket behind, and `ssh -M` onto a taken path quietly runs as a plain
+  # connection instead - one more stray per retry.
+  rm -f "$CP"
+  ssh $BASE -M -f -N "$HOST" </dev/null >/dev/null 2>&1
+}
 
 b64()  { openssl base64 -A; }
 b64d() { openssl base64 -d -A; }
@@ -290,7 +303,7 @@ trap stop_agent INT TERM
 
 # ---------- connection ----------
 out "rexec-agent  $MACID  ->  $HOST  $WS"
-ssh $BASE -M -f -N "$HOST" </dev/null >/dev/null 2>&1
+master_up
 if ! ssh $SSH_OPTS -o BatchMode=yes "$HOST" true 2>/tmp/rexec-sshtest.$$; then
   echo "Cannot connect to '$HOST' with key-based auth:" >&2
   sed 's/^/    /' /tmp/rexec-sshtest.$$ >&2
@@ -333,12 +346,25 @@ while true; do
     el=$(( NOW - st ))
 
     if [ -f "$JOBS/$id.exit" ]; then
-      ex=$(cat "$JOBS/$id.exit"); case "$ex" in ''|*[!0-9]*) ex=1;; esac
-      # 143/137 from a kill carry no information; map them to the semantic codes the caller expects
-      [ -f "$JOBS/$id.timedout"  ] && ex=124
-      [ -f "$JOBS/$id.cancelled" ] && ex=125
+      # Settled on first sight and kept, so a report that has to be retried still carries the real run time.
+      if [ ! -f "$JOBS/$id.final" ]; then
+        ex=$(cat "$JOBS/$id.exit"); case "$ex" in ''|*[!0-9]*) ex=1;; esac
+        # 143/137 from a kill carry no information; map them to the semantic codes the caller expects
+        [ -f "$JOBS/$id.timedout"  ] && ex=124
+        [ -f "$JOBS/$id.cancelled" ] && ex=125
+        echo "$ex $el" > "$JOBS/$id.final"
+      fi
+      read -r ex el < "$JOBS/$id.final"
+      # Keep the records until the server has the result. Dropping them takes the job off the running list
+      # sent with every poll, and the server then reaps a job that finished fine as stranded (exit 129).
+      # 255 is ssh's own failure, i.e. the report never arrived; anything else came from the server.
       tail -c 400000 "$RD/$id.log" 2>/dev/null | b64 \
         | $SSH /var/lib/rexec/bin/rexec-report "$MACID" "$id" "$ex" "$el" >/dev/null 2>&1
+      if [ $? = 255 ]; then
+        [ -f "$JOBS/$id.unreported" ] || { : > "$JOBS/$id.unreported"
+          say WARN "$id" '|' "exit $ex, but the report did not reach $HOST; retrying every poll"; }
+        continue
+      fi
       qd=$(sed -n 's/^QUEUED=//p' "$m"); case "$qd" in ''|*[!0-9]*) qd=0;; esac
       det="$(printf '%-8s' "exit $ex") | $(printf '%-13s' "queued $(fmt_dur "$qd")") | ran $(fmt_dur "$el")"
       case "$ex" in
@@ -377,6 +403,12 @@ while true; do
     if [ ! -f "$DET/$did.reported" ]; then
       ec=$(cat "$DET/$did.exit" 2>/dev/null); case "$ec" in ''|*[!0-9]*) ec=129;; esac
       det_report "$did" "$ec"
+      if [ $? = 255 ]; then
+        # Still listed as alive until the report lands: unlisted, the server records it as 129 and the
+        # real exit code that follows is ignored, since the first result wins.
+        DIDS="$DIDS,$did"
+        continue
+      fi
       say FAIL "$did" '|' "detached job ended without reporting, recorded exit $ec"
     fi
     det_clear "$did"
@@ -415,6 +447,7 @@ while true; do
   # "-" says "nothing is running", as distinct from an older agent sending no list at all.
   RIDS=$(running_ids | tr '\n' ',' | sed 's/,$//'); [ -n "$RIDS" ] || RIDS='-'
   DIDS="${DIDS#,}"; [ -n "$DIDS" ] || DIDS='-'
+  master_up
   PAYLOAD=$($SSH -n "/var/lib/rexec/bin/rexec-claim $MACID $WANT $GATE $NRUN ${CPU}% ${MEM}% $HEAVY_OK $RIDS $DIDS" 2>/dev/null)
   if [ -z "$PAYLOAD" ]; then
     say WARN "-" '|' "connection lost, retrying in 5s"; sleep 5; continue

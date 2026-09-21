@@ -110,6 +110,10 @@ detach() { # ID PROJECT [pgid] - submit it, claim it, and hand it off to detache
   "$SRV/rexec-detached" start "$MAC" "$1" "${3:-99999}" boot1 "$(printf '/log' | openssl base64 -A)" >/dev/null
   rm -f "$M/running/$1.job" "$M/running/$1.started" "$M/alive/$1"   # what reporting the launch does
 }
+aged() { # launched 10 minutes ago
+  sed "s/^STARTED=.*/STARTED=$(( $(date +%s) - 600 ))/" "$M/detached/$1.job" > "$M/detached/.aged" \
+    && mv "$M/detached/.aged" "$M/detached/$1.job"
+}
 
 reset
 detach proj_a-0001 proj_a
@@ -138,9 +142,17 @@ claim_raw 0 1 1 - proj_a-0001 >/dev/null
 is "a detached job the agent still sees is left alone" "" "$(ls "$M/detached" | grep '\.done' || true)"
 
 reset
-detach proj_a-0001 proj_a
+detach proj_a-0001 proj_a; aged proj_a-0001
 claim_raw 0 0 1 - - >/dev/null
 is "a detached job the agent cannot see any more is reaped" 129 \
+   "$(sed -n 's/^EXIT=//p' "$M/detached/proj_a-0001.done" 2>/dev/null)"
+
+# The agent builds its detached list before its claim goes out, and the runner registers a launch in
+# between, so the first poll after a launch routinely does not list it yet.
+reset
+detach proj_a-0001 proj_a
+claim_raw 0 0 1 - - >/dev/null
+is "a detached job launched moments ago is not reaped before the agent lists it" "" \
    "$(sed -n 's/^EXIT=//p' "$M/detached/proj_a-0001.done" 2>/dev/null)"
 
 reset

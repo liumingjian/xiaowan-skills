@@ -102,12 +102,15 @@ done
 # died without reporting - the mac rebooted, or someone killed the process from outside. Only an agent that
 # knows about detached jobs sends this list at all; without it we make no judgement, because the alternative
 # is declaring jobs dead every time the user simply closes the agent's terminal.
+# The same grace as running jobs: the agent builds DIDS before this call goes out, and its runner registers
+# a launch in between, so the first poll after a launch routinely omits a job that is alive and well.
 if [ -n "$DIDS" ]; then
   for d in $(detached_active "$MACID"); do
     case ",$DIDS," in *",$d,"*) continue;; esac
     RAN=0
     DST=$(sed -n 's/^STARTED=//p' "$M/detached/$d.job"); case "$DST" in ''|*[!0-9]*) DST=0;; esac
     [ "$DST" -gt 0 ] && RAN=$(( NOW - DST ))
+    [ "$DST" -gt 0 ] && [ "$RAN" -le "$STRAND_GRACE" ] && continue
     printf '[rexec] the detached process for %s is gone from %s without reporting (the mac rebooted, or it was killed from outside)\n' \
       "$d" "$MACID" | openssl base64 -A | "$BIN/rexec-detached" done "$MACID" "$d" 129 "$RAN" >/dev/null 2>&1
   done

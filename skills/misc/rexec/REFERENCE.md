@@ -179,7 +179,11 @@ Three mechanisms now clear it, and none of them needs the user to do anything be
 3. **`rexec-claim`, on every poll**, compares the running list the agent reports with the server's own. A job
    only the server still holds is stranded and gets finished, after a grace period (`REXEC_STRAND_GRACE`,
    default 120s) that covers the gap between claiming a job and the agent's next poll. This catches an agent
-   that is alive but lost track of a job, and needs no restart at all.
+   that is alive but lost track of a job, and needs no restart at all. The agent keeps a finished job on
+   that list until its result has actually reached the server, retrying the report on every poll (the
+   terminal shows `WARN ... retrying every poll`). Otherwise one report lost to a flaky link turned a job
+   that finished fine into a 129. Detached jobs get the same grace, because the first poll after a launch
+   can go out before the launch is registered.
 4. **`rexec-claim`, by age**, is what reaches a mac whose agent predates mechanism 3 and therefore sends no
    list. With nothing to compare against it goes by age alone: the agent is what enforces `--timeout`, so an
    entry outliving its own timeout by a wide margin (`REXEC_STRAND_SLACK`, default 300s) proves no agent is
@@ -239,6 +243,16 @@ the server treats it as abandoned, `REXEC_STRAND_GRACE` (default 120s) is how lo
 running list before the server treats it as stranded, `REXEC_STRAND_SLACK` (default 300s) is how far past its
 own `--timeout` a job may sit in the running list before the same happens, and `REXEC_ROOT` relocates the
 state tree (tests only).
+
+The agent sends everything through one multiplexed ssh connection (ControlMaster) and rebuilds it on
+the next poll whenever it is gone. sshd drops it when the home link stalls (`Timeout, client not
+responding` in the server's auth log). The agent used to build it only once, at startup, so after the
+first stall every poll, sync and report opened a fresh login, and those are the connections a flaky link
+cuts before the handshake (`Connection closed by <vps> port <port>`, `connection lost, retrying in 5s`).
+
+`tests/queue-test.sh` covers the server side and runs anywhere. `tests/agent-test.sh` runs the real agent
+against the real server scripts through a fake `ssh` that can drop reports or kill the master, and needs a
+mac: `rexec 'bash skills/misc/rexec/tests/agent-test.sh'`. Neither touches the live queue or agent.
 
 To get the agent log on disk use `REXEC_LOG`, not a shell `>` redirect — bash's block buffering holds log
 lines in the buffer instead of writing them out.
