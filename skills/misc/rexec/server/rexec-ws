@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Server side of the mac's workspace cleanup (gc.sh in agent.sh). The mac knows its workspaces and when it
+# last used each; only the server knows whether the directory a workspace was synced from still exists, and
+# which jobs are queued for it.
+#
+# Usage (called from the mac):
+#   rexec-ws check <MACID>    stdin: "<name>\t<source path, base64>" per line
+#     out: "BUSY <names>" first - projects with a job queued, running or detached here, which must not be
+#          touched - then "<name>\tpresent|gone" per input line
+#   rexec-ws legacy <MACID>   stdin: one pre-ws_key workspace name per line ("<basename10>-<hash6>")
+#     out: "<name>\t<new name>\t<source path, base64>" when a directory on this server hashes to it,
+#          "<name>\t-" when none does
+set -u
+BIN=$(cd "$(dirname "$(readlink -f "$0")")" && pwd -P)
+. "$BIN/rexec-lib.sh"
+ACT="${1:?}"; MACID="${2:?}"
+case "$MACID" in *[!A-Za-z0-9_.-]*) echo "invalid MACID" >&2; exit 2;; esac
+login_matches "$MACID" || { echo "this login's key is tagged for another mac, not $MACID" >&2; exit 2; }
+M="$MACS/$MACID"
+b64d() { openssl base64 -d -A 2>/dev/null; }
+
+case "$ACT" in
+  check)
+    BUSY=$( { for f in "$M"/queue/*.job "$M"/running/*.job; do [ -e "$f" ] && sed -n 's/^PROJECT=//p' "$f"; done
+              for d in $(detached_active "$MACID"); do sed -n 's/^PROJECT=//p' "$M/detached/$d.job"; done; } \
+            | sort -u | tr '\n' ' ')
+    echo "BUSY ${BUSY% }"
+    while IFS="$(printf '\t')" read -r name src; do
+      [ -n "$name" ] || continue
+      p=$(printf '%s' "$src" | b64d)
+      # An empty path is a record gone bad, not a deleted project: never call that gone.
+      if [ -z "$p" ] || [ -d "$p" ]; then printf '%s\tpresent\n' "$name"; else printf '%s\tgone\n' "$name"; fi
+    done;;
+
+  legacy)
+    # A legacy name is the basename cut to 10 plus a hash of the full path, so it cannot be reversed - only
+    # matched: walk the directories that could have been synced, keep those whose basename gives the right
+    # prefix, and hash just those. Dependency and build trees are pruned; nobody syncs from inside them.
+    WANT=$(cat)
+    [ -n "$WANT" ] || exit 0
+    ROOTS=${REXEC_LEGACY_ROOTS:-/home /root /tmp /var/tmp /srv /opt}
+    PREFIXES=$(printf '%s\n' "$WANT" | sed 's/-[0-9a-f]\{6\}$//' | sort -u)
+    MATCH=$(for r in $ROOTS; do [ -d "$r" ] && printf '%s\n' "$r"; done \
+      | while IFS= read -r r; do
+          find "$r" -xdev \( -name node_modules -o -name .git -o -name target -o -name .venv -o -name venv \
+                            -o -name __pycache__ -o -name dist -o -name build -o -name .next \) -prune \
+               -o -type d -print 2>/dev/null
+        done \
+      | PRE="$PREFIXES" LC_ALL=C awk '
+          # Through the environment: BSD awk (the agent tests run this on a mac) rejects a newline in -v.
+          BEGIN { n = split(ENVIRON["PRE"], a, "\n"); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+          { b = $0; sub(/.*\//, "", b); gsub(/[^A-Za-z0-9_.-]/, "_", b); b = substr(b, 1, 10)
+            if (b == "") b = "proj"
+            if (b in want) print }' \
+      | while IFS= read -r d; do printf '%s\t%s\n' "$(ws_legacy_key "$d")" "$d"; done)
+    printf '%s\n' "$WANT" | while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      d=$(printf '%s\n' "$MATCH" | awk -F'\t' -v n="$name" '$1 == n { print $2; exit }')
+      if [ -n "$d" ]; then
+        ws_key "$d"
+        printf '%s\t%s\t%s\n' "$name" "$WS_NAME" "$(printf '%s' "$d" | openssl base64 -A)"
+      else
+        printf '%s\t-\n' "$name"
+      fi
+    done;;
+
+  *) echo "usage: rexec-ws check|legacy <MACID>" >&2; exit 2;;
+esac

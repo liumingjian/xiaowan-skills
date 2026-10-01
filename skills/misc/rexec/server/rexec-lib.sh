@@ -73,6 +73,48 @@ mac_of_job() {
   return 1
 }
 
+# ---- workspace names ----
+# A mac workspace is named so that `ls ~/rexec-workspace` says which repository made it:
+#   <repo>--<hash6>                    the repository's main checkout
+#   <repo>--wt-<worktree>--<hash6>     a linked git worktree of it
+#   <repo>[--wt-<worktree>]--<sub>--<hash6>   a subdirectory synced on its own (/ becomes _)
+#   <dir>--<hash6>                     a directory outside any git repository
+# The hash is of the full path, so one path always reuses one workspace (dependencies install once) and two
+# paths never share one - they would rsync --delete each other's files. <repo> is the main checkout's name
+# even inside a worktree; a worktree's own directory name says nothing about where it came from.
+# openssl rather than md5sum: the agent tests run this on the mac, which has no md5sum. Same digest.
+path_hash6() { printf '%s' "$1" | openssl md5 | sed 's/.*[= ]//' | cut -c1-6; }
+ws_clean()   { printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9_.-' '_' | cut -c1-40; }
+
+# ws_key DIR -> sets WS_REPO (the repository or directory name) and WS_NAME (the workspace name).
+ws_key() {
+  _d="$1"; _wt=""; _sub=""
+  _top=$(git -c safe.directory="*" -C "$_d" rev-parse --show-toplevel 2>/dev/null)
+  if [ -n "$_top" ]; then
+    _cd=$(git -c safe.directory="*" -C "$_d" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+    _gd=$(git -c safe.directory="*" -C "$_d" rev-parse --path-format=absolute --git-dir 2>/dev/null)
+    # /repo/.git -> repo; a bare /x/repo.git -> repo; a submodule's .git/modules/sub -> sub
+    case "$_cd" in */.git) WS_REPO=$(basename "${_cd%/.git}");; *) WS_REPO=$(basename "$_cd" .git);; esac
+    # Only a linked worktree has a git dir of its own apart from the shared one.
+    [ "$_gd" != "$_cd" ] && _wt=$(basename "$_top")
+    _dp=$(cd "$_d" && pwd -P)
+    case "$_dp" in "$_top"/*) _sub=$(printf '%s' "${_dp#"$_top"/}" | tr '/' '_');; esac
+  else
+    WS_REPO=$(basename "$_d")
+  fi
+  WS_REPO=$(ws_clean "$WS_REPO"); [ -n "$WS_REPO" ] || WS_REPO=proj
+  WS_NAME="$WS_REPO"
+  [ -n "$_wt" ]  && WS_NAME="$WS_NAME--wt-$(ws_clean "$_wt")"
+  [ -n "$_sub" ] && WS_NAME="$WS_NAME--$(ws_clean "$_sub")"
+  WS_NAME="$WS_NAME--$(path_hash6 "$_d")"
+}
+
+# The name the same path had before ws_key: basename cut to 10, then the hash. Only migration still needs it.
+ws_legacy_key() {
+  _s=$(printf '%s' "$(basename "$1")" | LC_ALL=C tr -c 'A-Za-z0-9_.-' '_' | cut -c1-10)
+  printf '%s-%s' "${_s:-proj}" "$(path_hash6 "$1")"
+}
+
 # ---- caller heartbeat ----
 # `rexec` writes the current time into alive/<ID> before it submits, and again on every poll of its wait
 # loop. A caller that is killed outright - ESC is trapped, but a compacted session, an OOM kill or a

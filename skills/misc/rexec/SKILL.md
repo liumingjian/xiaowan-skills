@@ -1,6 +1,6 @@
 ---
 name: rexec
-description: Dispatch work that has to actually run — and that eats memory or time — to the user's mac, bypassing this memory-starved server. Covers compiling and building, installing dependencies, creating virtualenvs, running test suites, starting services for end-to-end checks, and docker containers or image builds. Dispatches long builds to the mac's background with `--detach` and collects them later, so a job too long to wait for is not a job you have to babysit. Also takes `/rexec queue` to see the queue, `/rexec cancel <ID>` to cancel a job, and `/rexec macs` to see which macs are online.
+description: Dispatch work that has to actually run — and that eats memory or time — to the user's mac, bypassing this memory-starved server. Covers compiling and building, installing dependencies, creating virtualenvs, running test suites, starting services for end-to-end checks, and docker containers or image builds. Dispatches long builds to the mac's background with `--detach` and collects them later, so a job too long to wait for is not a job you have to babysit. Also takes `/rexec queue` to see the queue, `/rexec cancel <ID>` to cancel a job, `/rexec macs` to see which macs are online, and `/rexec gc` to clean up workspaces the mac no longer uses.
 ---
 
 # rexec
@@ -13,7 +13,7 @@ cannot reach the mac.
 
 The environment is fixed: SSH alias `vps-2g` (defined in the mac's `~/.ssh/config`, override with
 `REXEC_HOST`); each mac logs in with its own key `~/.ssh/vps-2g-rexec`, tagged `rexec-mac=<MACID>` in the
-server's `authorized_keys`; mac workspace `~/rexec-workspace/<project>-<pathhash>/`.
+server's `authorized_keys`; mac workspace `~/rexec-workspace/<repo>[--wt-<worktree>]--<pathhash>/`.
 
 **Multiple macs are first-class.** Each mac's agent has its own identity and its own queue on the server.
 **A job goes to this session's mac**: the one whose key its live ssh login used. A session with no live
@@ -27,8 +27,8 @@ the job is dispatched with `--detach`, which returns as soon as it is launched.
 
 ## Sub-commands
 
-When the user types `/rexec queue` or `/rexec cancel ...`, run the matching command and hand them the
-output — do not dispatch a job:
+When the user types `/rexec queue`, `/rexec cancel ...` or `/rexec gc`, run the matching command and hand
+them the output — do not dispatch a job:
 
 ```bash
 rexec --queue          # every mac's queue: what's running, what's waiting, what blocks it, and this session's default target
@@ -36,9 +36,13 @@ rexec --cancel <ID>    # cancel one job (IDs look like myproj-0041; globally uni
 rexec --cancel         # no ID: list the queue first, let the user pick
 rexec --macs           # which macs are registered, who is online, this session's default target
 rexec --use <name>     # set the default mac for when several are online (persists; --use none clears)
+rexec --gc             # dry run: which workspaces on the mac would be cleaned up, and why
+rexec --gc --apply     # act on that list - only after the user has seen the dry run and said yes
 ```
 
 Cancelling kills only that job's process group; other running jobs and the agent itself are untouched.
+The agent already cleans up hourly on its own; `--gc --apply` adds only what the hourly run leaves for a
+human (old-style workspace names it cannot trace to a directory on the server).
 
 ## Step 1: bring the channel online
 
@@ -133,10 +137,14 @@ Leave the light, static work on the server: reading and writing code, grep, type
 
 ## Usage notes
 
-- Syncs the **current working directory** by default (rsync, honours `.gitignore`) to
-  `~/rexec-workspace/<dirname>-<pathhash>/` on the mac, then runs there. The path hash gives
-  **same-named but different projects** their own directories, so they never `rsync --delete` each other's
-  files; one project always reuses one directory, so dependencies still install only once.
+- Syncs the **current working directory** by default (rsync, honours `.gitignore`) to a workspace on the
+  mac named after its repository — `~/rexec-workspace/<repo>--<pathhash>/`, or
+  `<repo>--wt-<worktree>--<pathhash>/` for a git worktree — then runs there. Job IDs carry the repository
+  name too. Each path gets its own workspace, so two checkouts never `rsync --delete` each other's files,
+  and one path always reuses its workspace, so dependencies install only once.
+- **Workspaces clean themselves up.** The agent deletes a workspace once its source directory is gone from
+  the server (a removed worktree, say) or no job has used it for 7 days. A worktree-heavy session leaves
+  nothing behind for long. `REFERENCE.md` has the rules.
 - stderr carries one bill line at the end:
   `--- [macbook-pro-3f9a] exit=0 | queued 4m12s | ran 6m03s | total 10m15s ---` (the mac that ran it is in brackets).
 - **Dependencies install once.** `.venv/ node_modules/ target/ dist/ build/ .next/` are protected on the
@@ -148,7 +156,7 @@ Leave the light, static work on the server: reading and writing code, grep, type
   branch); it costs the transfer of the whole history, so leave it off for builds and tests.
 - **Files in `.gitignore` are not synced** (`.env`, keys, and so on stay on the server). If a test needs
   them, ask the user to drop a copy into the matching workspace directory on the mac: filtered files are
-  protected too, so one drop lasts.
+  protected too, so one drop lasts — and an idle workspace holding one is kept rather than cleaned up.
 - Syncing is one-way (server → mac). Build artifacts do not come back; `cat` them in the command if needed.
 - Commands must run unattended (`vim` and installers that want keystrokes cannot work).
 - `--no-sync` and `--light` declare a **light job**, exempt from the mac's load gate — good for zero-cost probing.
@@ -166,5 +174,6 @@ Leave the light, static work on the server: reading and writing code, grep, type
 
 ## Troubleshooting
 
-How the target mac is resolved, load gate not releasing, a queue that has stopped moving, exit code
-meanings, agent environment variables — read `REFERENCE.md` in this directory.
+How the target mac is resolved, load gate not releasing, a queue that has stopped moving, a workspace that
+was cleaned up or kept, exit code meanings, agent environment variables — read `REFERENCE.md` in this
+directory.
