@@ -86,6 +86,7 @@ OUT=$(gc --dry-run)
 is "a dry run lists a deleted source"      1 "$(printf '%s\n' "$OUT" | grep -c 'would delete.*gone .*source gone')"
 is "...and the legacy rename"              1 "$(printf '%s\n' "$OUT" | grep -c "would rename  $OLD -> $NEW")"
 is "...and what rexec did not create"      1 "$(printf '%s\n' "$OUT" | grep -c '\.echo-cargo-target')"
+is "...and totals everything it would delete, old-style names included" 1 "$(printf '%s\n' "$OUT" | grep -c '^would free 4 workspace')"
 is "...and deletes nothing"                "yes yes yes" "$(has "$WS/gone") $(has "$WS/zzzz-abcdef") $(has "$WS/$OLD")"
 
 OUT=$(gc --auto)

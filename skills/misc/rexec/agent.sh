@@ -364,12 +364,11 @@ TAB=$(printf '\t')
 while IFS="$TAB" read -r old new src; do
   [ -n "$old" ] || continue
   if in_use "$old"; then report "in use        $old"; continue; fi
-  if [ "$new" = - ]; then
-    if [ "$MODE" = --apply ]; then delete "$old" "old-style name, no directory on the server hashes to it"
-    else report "$(printf 'would delete  %6s  %s  (old-style name, no directory on the server hashes to it; --apply deletes it)' "$(human "$(kb "$WS/$old")")" "$old")"; fi
-  elif [ -e "$WS/$new" ]; then
-    if [ "$MODE" = --apply ]; then delete "$old" "old-style copy of $new"
-    else report "$(printf 'would delete  %6s  %s  (old-style copy of %s; --apply deletes it)' "$(human "$(kb "$WS/$old")")" "$old" "$new")"; fi
+  if [ "$new" = - ] || [ -e "$WS/$new" ]; then
+    # Left for a human: --auto skips these, the dry run marks them, --apply deletes them.
+    why="old-style name, no directory on the server hashes to it"; [ "$new" = - ] || why="old-style copy of $new"
+    [ "$MODE" = --dry-run ] && why="$why; --apply deletes it"
+    [ "$MODE" = --auto ] || delete "$old" "$why"
   elif [ "$MODE" = --dry-run ]; then
     echo "would rename  $old -> $new"
   else
@@ -413,7 +412,9 @@ if [ "$MODE" != --auto ]; then
   done
   [ "$MODE" = --dry-run ] && echo "nothing was deleted; rexec --gc --apply acts on the list above"
 fi
-rm -rf "$TRASH"
+# Something on the mac can write into a directory while rm walks it (Spotlight, Finder's .DS_Store), and rm
+# then fails on the parent. One retry; whatever is still there goes next round, and is no failure.
+rm -rf "$TRASH" 2>/dev/null || { sleep 1; rm -rf "$TRASH" 2>/dev/null; } || true
 GC_EOF
 chmod +x "$RD/gc.sh"
 
