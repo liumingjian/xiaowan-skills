@@ -16,6 +16,7 @@
 #   --macs         list known macs and exit
 #   --queue [MAC]  show the queue and exit
 #   --cancel [ID]  cancel a job and exit
+#   --gc [--apply] list the mac's workspaces that are no longer used; --apply deletes them
 set -u
 # Resolve siblings from this script's own directory, so the tree works both from /var/lib/rexec/bin
 # (where /usr/local/bin/rexec is a symlink into it) and straight out of a checkout, which is what
@@ -30,7 +31,7 @@ fmt_dur() {
 }
 
 SYNC_DIR="$PWD"; TIMEOUT=900; SUBCWD=""; WEIGHT=normal; WANT_MAC="${REXEC_MAC:-}"; WITHGIT=0
-DETACH=0; SAW_TIMEOUT=0
+DETACH=0; SAW_TIMEOUT=0; GC=0; APPLY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --sync)    SYNC_DIR="$2"; shift 2;;
@@ -52,11 +53,21 @@ while [ $# -gt 0 ]; do
     --macs)    exec "$BIN/rexec-macs";;
     --queue)   shift; exec "$BIN/rexec-queue" "$@";;
     --cancel)  shift; exec "$BIN/rexec-cancel" "$@";;
+    --gc)      GC=1; SYNC_DIR="-"; WEIGHT=light; shift;;
+    --apply)   APPLY=1; shift;;
     --)        shift; break;;
     -*)        echo "rexec: unknown option $1" >&2; exit 2;;
     *)         break;;
   esac
 done
+# --gc is an ordinary light job: the server cannot reach the mac, so the queue is the only way to it, and
+# the agent's own gc.sh does the work there.
+if [ "$GC" = 1 ]; then
+  [ $# = 0 ] || { echo "rexec: --gc takes no command" >&2; exit 2; }
+  if [ "$APPLY" = 1 ]; then set -- 'bash "$HOME/.rexec/gc.sh" --apply'; else set -- 'bash "$HOME/.rexec/gc.sh" --dry-run'; fi
+elif [ "$APPLY" = 1 ]; then
+  echo "rexec: --apply only goes with --gc" >&2; exit 2
+fi
 [ $# -ge 1 ] || { echo "Usage: rexec [--mac NAME] [--sync DIR|--no-sync] [--with-git] [--light] [--timeout N|--detach] [--cwd SUB] '<command>'" >&2; exit 2; }
 CMD="$*"
 
@@ -113,10 +124,18 @@ if [ "$DETACH" = 1 ] && ! grep -qw detach "$M/caps" 2>/dev/null; then
   exit 2
 fi
 
-# --- project key: basename truncated to 10 + hash6 of the full path ---
-# One project always reuses one workspace (dependencies install once); same-named different projects stay apart.
+# --- --gc needs an agent that ships gc.sh ---
+if [ "$GC" = 1 ] && ! grep -qw gc "$M/caps" 2>/dev/null; then
+  echo "rexec: the agent on '$MACID' predates --gc." >&2
+  echo "Restart it on that mac (Ctrl-C the agent terminal first):" >&2
+  echo "  ssh vps-2g 'cat /var/lib/rexec/agent.sh' > ~/rexec-agent.sh && bash ~/rexec-agent.sh" >&2
+  exit 2
+fi
+
+# --- project key: the workspace name, which says which repository it came from (ws_key in rexec-lib.sh) ---
 if [ "$SYNC_DIR" = "-" ]; then
   PROJECT="__nosync__"; PROJ_SHORT="nosync"
+  [ "$GC" = 1 ] && PROJ_SHORT="gc"
 else
   SYNC_DIR=$(cd "$SYNC_DIR" 2>/dev/null && pwd) \
     || { echo "rexec: sync directory does not exist: $SYNC_DIR" >&2; exit 2; }
@@ -126,12 +145,12 @@ else
     echo "rexec: refusing to sync the root directory /. Use --sync <a project directory>, or --no-sync to probe only." >&2
     exit 2
   }
-  PROJ_SHORT=$(printf "%s" "$(basename "$SYNC_DIR")" | tr -c "A-Za-z0-9_.-" "_" | cut -c1-10)
-  [ -n "$PROJ_SHORT" ] || PROJ_SHORT=proj
-  PROJECT="$PROJ_SHORT-$(printf '%s' "$SYNC_DIR" | md5sum | cut -c1-6)"
+  ws_key "$SYNC_DIR"
+  PROJECT="$WS_NAME"
+  PROJ_SHORT=$(printf '%s' "$WS_REPO" | cut -c1-10)
 fi
 
-# --- short ID: <project10>-<4-digit seq>, at most 15 chars, exactly the log ID column width ---
+# --- short ID: <repo10>-<4-digit seq>, at most 15 chars, exactly the log ID column width ---
 # The sequence is global: IDs are unique across macs, so cancelling never needs to know which mac runs it.
 SEQ=$(flock "$ROOT/seq.lock" -c '
   n=$(cat /var/lib/rexec/seq 2>/dev/null || echo 0)

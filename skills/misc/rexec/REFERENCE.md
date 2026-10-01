@@ -68,6 +68,44 @@ Two consequences worth knowing:
   believes otherwise, so `rexec` refuses the job up front with **exit 2** and asks for an agent restart on
   that mac. Restarting the agent re-announces and clears it.
 
+## Workspace names and cleanup
+
+A workspace is named by `ws_key` in `server/rexec-lib.sh`: `<repo>--<hash6>` for a main checkout,
+`<repo>--wt-<worktree>--<hash6>` for a linked git worktree, an extra `--<sub>` when a subdirectory is
+synced on its own, and `<dir>--<hash6>` outside git. `<repo>` is the main checkout's directory name even
+inside a worktree. The hash is of the full server path, so every path - and therefore every worktree - gets
+a workspace of its own. That is what fills the disk, and what the cleanup exists for.
+
+The agent keeps one record per workspace in `~/.rexec/ws/<name>`: the server path it syncs from, and when a
+job last used it (stamped when a job starts and again when it ends, detached jobs included). Cleanup runs
+from `~/.rexec/gc.sh`, which the agent writes at startup: once at startup, then hourly, in the background.
+Each action shows in the agent log as a `CLEAN` line naming the workspace, its size, and the reason.
+
+| Workspace | What happens |
+|---|---|
+| a job is running, queued or detached in it | left alone, always |
+| its source directory is gone from the server | deleted with everything in it |
+| unused for `REXEC_GC_IDLE_DAYS` (7) | deleted - unless it holds files the server lacks |
+| idle, but holds files the server lacks (an `.env` dropped in by hand) | kept; logged once as `kept` with the file names |
+| old-style name `<basename10>-<hash6>`, its directory found on the server | renamed to the new name, dependencies intact |
+| old-style name, no directory on the server hashes to it | listed by `rexec --gc`; deleted only by `rexec --gc --apply` |
+| not created by rexec (`.echo-cargo-target-*`, `_nosync`) | listed by `rexec --gc` with its size, never deleted |
+
+"Files the server lacks" is an rsync dry run against the source without the `.gitignore` filter but with the
+sync's own excludes (`node_modules/`, `target/`, ...). A missing file whose parent directory is missing on
+the server too counts as build output (`coverage/`, `out/`), not as a hand-placed file.
+
+- **The server is unreachable:** nothing is cleaned that round - without it a deleted source and a busy
+  project look the same as an idle one.
+- **Old-style workspaces** are traced by hashing directories under `REXEC_LEGACY_ROOTS` on the server
+  (default `/home /root /tmp /var/tmp /srv /opt`). A job that claims a path whose old-style workspace still
+  exists renames it on the spot as well.
+- **A deleted workspace is not lost work:** its source still lives on the server, and the next job on
+  that path syncs it again and reinstalls dependencies. A dropped `.env` goes with a workspace whose source is
+  gone, since nothing could use it any more.
+- **`rexec --gc`** also prints the size of the big shared caches outside rexec (Docker's disk image,
+  `~/.npm`, `~/.cache`, `~/Library/Caches`, pnpm), as a pointer for the user. rexec never deletes them.
+
 ## Detached jobs
 
 `--detach` runs a job on the mac and returns as soon as it is launched. It exists because the alternative
@@ -237,6 +275,8 @@ On failure `rexec` writes the reason and the next step to stderr itself; this ta
 | `REXEC_COOLDOWN` | claim cooldown, seconds | 15 |
 | `REXEC_TAIL` | how often a detached job's log tail is pushed to the server, seconds | 15 |
 | `REXEC_LOG` | write the agent log to this file | no log file |
+| `REXEC_GC_EVERY` | seconds between workspace cleanups; 0 turns them off | 3600 |
+| `REXEC_GC_IDLE_DAYS` | days unused before a workspace is cleaned up | 7 |
 
 Server side: `REXEC_CALLER_GRACE` (default 90s) is how long a job may go without a caller heartbeat before
 the server treats it as abandoned, `REXEC_STRAND_GRACE` (default 120s) is how long a job may be missing from the agent's reported

@@ -10,7 +10,7 @@ mkdir -p "$R/macs" "$R/bin" "$R/logs"
 install -m 775 "$S/server/rexec"        "$S/server/rexec-claim"  "$S/server/rexec-report"   \
                "$S/server/rexec-queue"  "$S/server/rexec-cancel" "$S/server/rexec-macs"     \
                "$S/server/rexec-announce" "$S/server/rexec-detached" "$S/server/rexec-wait" \
-               "$S/server/rexec-tail" "$R/bin/"
+               "$S/server/rexec-tail" "$S/server/rexec-ws" "$R/bin/"
 install -m 664 "$S/server/rexec-lib.sh" "$R/bin/"
 install -m 775 "$S/agent.sh" "$R/agent.sh"
 # Shared between root and agent: group-owned by agent, setgid so new files inherit the group.

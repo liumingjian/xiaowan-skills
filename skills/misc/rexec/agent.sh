@@ -13,6 +13,8 @@
 #   REXEC_COOLDOWN  claim cooldown in seconds (only applies when CPU sits in RELAX..CPU_MAX), default 15
 #   REXEC_LOG       write the terminal log to this file (opened in append mode internally; do not use a shell > redirect)
 #   REXEC_TAIL      how often to push a detached job's log tail to the server, in seconds, default 15
+#   REXEC_GC_EVERY  seconds between workspace cleanups, default 3600; 0 turns the automatic cleanup off
+#   REXEC_GC_IDLE_DAYS  a workspace no job has used for this many days is cleaned up, default 7
 set -u
 HOST="${REXEC_HOST:-vps-2g}"
 WS="${REXEC_WS:-$HOME/rexec-workspace}"
@@ -22,6 +24,8 @@ MEM_MIN="${REXEC_MEM_MIN:-20}"
 COOLDOWN="${REXEC_COOLDOWN:-15}"
 TAIL_EVERY="${REXEC_TAIL:-15}"
 CPU_RELAX="${REXEC_CPU_RELAX:-$(( ${REXEC_CPU_MAX:-80} / 2 ))}"
+GC_EVERY="${REXEC_GC_EVERY:-3600}"
+GC_IDLE_DAYS="${REXEC_GC_IDLE_DAYS:-7}"
 
 # Use REXEC_LOG for a log file rather than a shell `>` redirect:
 #  - redirected to a file, bash's stdout is block-buffered, so log lines sit in the buffer instead of landing on disk;
@@ -35,7 +39,10 @@ JOBS="$RD/jobs"
 # Detached jobs are tracked separately from JOBS on purpose: everything under JOBS is wiped and killed when
 # a new agent starts, and a detached job is defined by surviving exactly that.
 DET="$RD/detached"
-mkdir -p "$WS" "$RD" "$JOBS" "$DET"
+# One record per workspace, named like it: SRC64 (the server path it syncs from) and USED (when a job last
+# used it). Kept outside the workspace, where rsync --delete would take it. gc.sh decides by these.
+WSM="$RD/ws"
+mkdir -p "$WS" "$RD" "$JOBS" "$DET" "$WSM"
 
 # Single instance: two agents fight over the queue, each claiming half the jobs and logging separately, which is brutal to diagnose.
 # The install command is idempotent and users re-run it often, so this has to be blocked here.
@@ -90,7 +97,7 @@ fi
 LABEL="${MACNAME:-$MACID}"
 # What this agent version can do. The server refuses a job whose flag is missing here, rather than
 # running it with the flag silently dropped.
-CAPS="git,reap,detach"
+CAPS="git,reap,detach,gc"
 
 
 # ---------- log format: TIME(8) EVENT(6) ID(15) sigil DETAIL ----------
@@ -218,7 +225,8 @@ BODY
   nohup perl -e 'setpgrp(0,0); exec @ARGV or die "exec failed: $!"' -- \
         /bin/bash "$J_DET/$J_ID.body" >> "$LOG" 2>&1 </dev/null &
   PG=$!
-  printf 'PGID=%s\nBOOT=%s\nSTART=%s\n' "$PG" "$J_BOOT" "$(date +%s)" > "$J_DET/$J_ID.meta"
+  # PROJECT is what keeps gc.sh away from the workspace this job is still building in.
+  printf 'PGID=%s\nBOOT=%s\nSTART=%s\nPROJECT=%s\n' "$PG" "$J_BOOT" "$(date +%s)" "$J_PROJ" > "$J_DET/$J_ID.meta"
   # Registered before this job leaves running/, so the project's workspace is never unclaimed for an instant.
   if ! $J_RSH "$J_HOST" "/var/lib/rexec/bin/rexec-detached start $J_MACID $J_ID $PG $J_BOOT $(printf '%s' "$LOG" | openssl base64 -A)" >/dev/null 2>&1; then
     kill -TERM -"$PG" 2>/dev/null
@@ -233,6 +241,181 @@ fi
 exec /bin/bash -lc "$J_CMD"
 RUNNER_EOF
 chmod +x "$RD/runner.sh"
+
+# ---------- workspace cleanup (a separate file: the agent runs it hourly, `rexec --gc` runs it as a job) ----------
+# A workspace is created for every path ever synced, and every worktree is a new path, so without this
+# ~/rexec-workspace grows by gigabytes a day. Run as a job it has no agent environment, hence gc.env.
+printf 'HOST=%q\nWS=%q\nMACID=%q\nSSH_OPTS=%q\nIDLE_DAYS=%q\n' \
+  "$HOST" "$WS" "$MACID" "$SSH_OPTS" "$GC_IDLE_DAYS" > "$RD/gc.env"
+cat > "$RD/gc.sh" <<'GC_EOF'
+#!/bin/bash
+# Usage: gc.sh --auto | --dry-run | --apply
+#   --auto     what the agent runs hourly: deletes, prints one line per deletion or rename, nothing else
+#   --dry-run  `rexec --gc`: the full report, touching nothing
+#   --apply    `rexec --gc --apply`: the full report, acted on - including what --auto leaves for a human
+#
+# What goes:
+#   - a workspace whose source directory no longer exists on the server - deleted with everything in it
+#   - a workspace no job has used for IDLE_DAYS - unless it holds files the server does not have (an .env
+#     dropped in by hand), in which case it is kept and reported, since that is the one thing a re-sync
+#     cannot bring back
+#   - a pre-ws_key workspace (<basename10>-<hash6>) is renamed once the server finds the directory it came
+#     from; one it cannot place goes only on --apply, after a human has seen the dry run
+# What stays: anything a job is running in, queued for, or detached in; and anything rexec did not create,
+# which is only reported.
+set -u
+RD="$HOME/.rexec"
+. "$RD/gc.env"
+MODE="${1:---auto}"
+WSM="$RD/ws"; JOBS="$RD/jobs"; DET="$RD/detached"; TRASH="$WS/.rexec-trash"
+NOW=$(date +%s)
+
+LOCK="$RD/gc.lock"
+take_lock() { mkdir "$LOCK" 2>/dev/null && { echo $$ > "$LOCK/pid"; return 0; }
+  _p=$(cat "$LOCK/pid" 2>/dev/null)
+  [ -n "$_p" ] && kill -0 "$_p" 2>/dev/null && return 1
+  rm -rf "$LOCK"; mkdir "$LOCK" 2>/dev/null && echo $$ > "$LOCK/pid"; }
+if ! take_lock; then
+  [ "$MODE" = --auto ] && exit 0
+  n=0; until take_lock; do n=$((n+1)); [ "$n" -ge 120 ] && { echo "another cleanup is still running"; exit 1; }; sleep 1; done
+fi
+trap 'rm -rf "$LOCK"' EXIT
+
+human() { awk -v k="${1:-0}" 'BEGIN { if (k >= 1048576) printf "%.1fG", k/1048576; else if (k >= 1024) printf "%.0fM", k/1024; else printf "%dK", k }'; }
+kb()    { du -sk "$1" 2>/dev/null | cut -f1; }
+b64d()  { openssl base64 -d -A 2>/dev/null; }
+meta()  { sed -n "s/^$2=//p" "$WSM/$1" 2>/dev/null; }
+srv()   { ssh $SSH_OPTS -o BatchMode=yes "$HOST" "/var/lib/rexec/bin/rexec-ws $1 $MACID"; }
+report(){ [ "$MODE" = --auto ] || printf '%s\n' "$1"; }
+# A job holds its workspace from the moment the agent records it (JOBS/<id>.meta, or DET/<id>.meta once
+# detached) to the moment it is reaped; the server knows the queued ones.
+in_use() { grep -qx "PROJECT=$1" "$JOBS"/*.meta "$DET"/*.meta 2>/dev/null \
+           || case " $BUSY " in *" $1 "*) true;; *) false;; esac; }
+
+FREED=0; NDEL=0
+delete() { # NAME REASON
+  _k=$(kb "$WS/$1"); _h=$(human "$_k")
+  if [ "$MODE" = --dry-run ]; then
+    printf 'would delete  %6s  %s  (%s)\n' "$_h" "$1" "$2"; FREED=$(( FREED + ${_k:-0} )); NDEL=$((NDEL+1)); return
+  fi
+  # The agent writes a job's record before it waits on this lock and launches the job, so either the job
+  # is seen below and the workspace stays, or the job starts after the move and gets a fresh directory.
+  mkdir "$WSM/$1.gc" 2>/dev/null || return
+  if in_use "$1"; then rmdir "$WSM/$1.gc"; return; fi
+  mkdir -p "$TRASH" && mv "$WS/$1" "$TRASH/$1.$$" && rm -f "$WSM/$1"
+  rmdir "$WSM/$1.gc"
+  printf 'deleted %s  %s  (%s)\n' "$_h" "$1" "$2"; FREED=$(( FREED + ${_k:-0} )); NDEL=$((NDEL+1))
+}
+
+# Files in workspace NAME that the server's SRC lacks, and that a re-sync would therefore not bring back.
+# The sync's own excludes stay (dependencies and build trees reinstall), the .gitignore filter goes: what
+# it hides is exactly what gets dropped in by hand. A file whose parent directory is missing on the server
+# too is a build output (coverage/, out/), not a hand-placed file. Exit 2: could not tell.
+dropped() { # NAME SRC
+  _o=$(rsync -n -a -i --delete -e "ssh $SSH_OPTS -o BatchMode=yes" \
+         --exclude=.git/ --exclude 'node_modules/' --exclude '.venv/' --exclude 'venv/' \
+         --exclude '__pycache__/' --exclude '.mypy_cache/' --exclude '.pytest_cache/' \
+         --exclude 'target/' --exclude 'dist/' --exclude 'build/' --exclude '.next/' \
+         "$HOST:$2/" "$WS/$1/" 2>/dev/null </dev/null) || return 2   # ssh would eat the caller's loop input
+  printf '%s\n' "$_o" | sed -n 's/^\*deleting  *//p' | awk '
+    { d[NR] = $0; if ($0 ~ /\/$/) dir[$0] = 1 }
+    END { for (i = 1; i <= NR; i++) { f = d[i]; if (f ~ /\/$/) continue
+            p = f; top = 1
+            while (sub(/\/[^\/]*$/, "", p)) if ((p "/") in dir) { top = 0; break }
+            if (top) print f } }'
+}
+
+# ---- sort the workspace root ----
+MANAGED=""; LEGACY=""; OTHER=""
+for e in "$WS"/* "$WS"/.[!.]*; do
+  [ -e "$e" ] || continue
+  n=$(basename "$e")
+  [ "$n" = .rexec-trash ] && continue
+  if [ -f "$WSM/$n" ]; then MANAGED="$MANAGED$n
+"
+  elif [ -d "$e" ] && printf '%s' "$n" | grep -Eq '^[A-Za-z0-9_.-]{1,10}-[0-9a-f]{6}$'; then LEGACY="$LEGACY$n
+"
+  else OTHER="$OTHER$n
+"
+  fi
+done
+# Records whose workspace is gone (deleted by hand) would otherwise sit there forever.
+for f in "$WSM"/*; do [ -f "$f" ] && [ ! -e "$WS/$(basename "$f")" ] && rm -f "$f"; done
+
+[ "$MODE" = --auto ] || echo "rexec workspace cleanup on $MACID  ($WS, idle limit ${IDLE_DAYS}d)"
+
+# ---- what the server knows: which sources still exist, what is queued ----
+CHK=""; SERVER=up; BUSY=""
+if [ -n "$MANAGED" ]; then
+  CHK=$(printf '%s' "$MANAGED" | while IFS= read -r n; do printf '%s\t%s\n' "$n" "$(meta "$n" SRC64)"; done | srv check) || SERVER=down
+  BUSY=$(printf '%s\n' "$CHK" | sed -n '1s/^BUSY *//p')
+fi
+LRES=""
+[ -n "$LEGACY" ] && { LRES=$(printf '%s' "$LEGACY" | srv legacy) || SERVER=down; }
+if [ "$SERVER" = down ]; then
+  # Without the server nothing here can be told apart from a project still in use, so touch nothing.
+  echo "server $HOST unreachable; nothing cleaned this round"
+  exit 0
+fi
+
+# ---- pre-ws_key workspaces ----
+TAB=$(printf '\t')
+# Here-strings rather than pipes throughout: a piped loop runs in a subshell and loses FREED and NDEL.
+while IFS="$TAB" read -r old new src; do
+  [ -n "$old" ] || continue
+  if in_use "$old"; then report "in use        $old"; continue; fi
+  if [ "$new" = - ]; then
+    if [ "$MODE" = --apply ]; then delete "$old" "old-style name, no directory on the server hashes to it"
+    else report "$(printf 'would delete  %6s  %s  (old-style name, no directory on the server hashes to it; --apply deletes it)' "$(human "$(kb "$WS/$old")")" "$old")"; fi
+  elif [ -e "$WS/$new" ]; then
+    if [ "$MODE" = --apply ]; then delete "$old" "old-style copy of $new"
+    else report "$(printf 'would delete  %6s  %s  (old-style copy of %s; --apply deletes it)' "$(human "$(kb "$WS/$old")")" "$old" "$new")"; fi
+  elif [ "$MODE" = --dry-run ]; then
+    echo "would rename  $old -> $new"
+  else
+    mv "$WS/$old" "$WS/$new" && printf 'SRC64=%s\nUSED=%s\n' "$src" "$NOW" > "$WSM/$new" \
+      && echo "renamed $old -> $new"
+  fi
+done <<< "$LRES"
+
+# ---- workspaces with a record ----
+while IFS="$TAB" read -r n st; do
+  [ -n "$n" ] || continue
+  src=$(meta "$n" SRC64 | b64d)
+  if in_use "$n"; then report "in use        $n"; continue; fi
+  # Without a source path neither rule can be applied - and an empty one would point rsync at the root.
+  if [ -z "$src" ]; then report "kept          $n  (no source path recorded)"; continue; fi
+  if [ "$st" = gone ]; then delete "$n" "source gone: $src"; continue; fi
+  used=$(meta "$n" USED); case "$used" in ''|*[!0-9]*) used=$NOW;; esac
+  age=$(( (NOW - used) / 86400 ))
+  [ "$age" -ge "$IDLE_DAYS" ] || continue
+  files=$(dropped "$n" "$src"); rc=$?
+  if [ "$rc" = 0 ] && [ -z "$files" ]; then delete "$n" "unused for ${age}d"; continue; fi
+  why="unused for ${age}d, but holds files the server does not have: $(printf '%s\n' "$files" | head -3 | tr '\n' ' ')"
+  [ "$rc" = 0 ] || why="unused for ${age}d, but could not compare it with $src"
+  # --auto says it once, not every hour; a job using the workspace again clears the mark.
+  if [ "$MODE" != --auto ]; then printf 'kept          %6s  %s  (%s)\n' "$(human "$(kb "$WS/$n")")" "$n" "$why"
+  elif [ -z "$(meta "$n" KEPT)" ]; then echo "kept $n ($why)"; echo "KEPT=1" >> "$WSM/$n"; fi
+done <<< "$(printf '%s\n' "$CHK" | sed '1d')"
+[ "$MODE" = --auto ] || [ "$NDEL" = 0 ] || printf '%s %s workspace(s), %s\n' \
+  "$([ "$MODE" = --dry-run ] && echo 'would free' || echo freed)" "$NDEL" "$(human "$FREED")"
+
+# ---- report only ----
+if [ "$MODE" != --auto ]; then
+  if [ -n "$OTHER" ]; then
+    echo "not created by rexec (left alone):"
+    printf '%s' "$OTHER" | while IFS= read -r n; do printf '  %6s  %s\n' "$(human "$(kb "$WS/$n")")" "$n"; done
+  fi
+  echo "outside rexec (report only):"
+  for p in "$HOME/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw" "$HOME/.npm" "$HOME/.cache" \
+           "$HOME/Library/Caches" "$HOME/Library/pnpm"; do
+    [ -e "$p" ] && printf '  %6s  ~%s\n' "$(human "$(kb "$p")")" "${p#"$HOME"}"
+  done
+  [ "$MODE" = --dry-run ] && echo "nothing was deleted; rexec --gc --apply acts on the list above"
+fi
+rm -rf "$TRASH"
+GC_EOF
+chmod +x "$RD/gc.sh"
 
 # ---------- load sampling: a background sampler writes a cache every 5s; the main loop only reads it, so polling never blocks ----------
 NCPU=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
@@ -261,6 +444,20 @@ kill_job() {
   p=$(pgid_of "$1")
   [ -n "$p" ] && { kill -TERM -"$p" 2>/dev/null; sleep 1; kill -KILL -"$p" 2>/dev/null; }
 }
+# ---- workspace records ----
+# Stamped when a job claims a workspace and again when it lets go of it, so "unused for N days" counts from
+# the end of the last job, however long it ran. SRC64 is kept from the claim when the caller has none.
+ws_touch() { # NAME [SRC64]
+  case "${1:-__nosync__}" in __nosync__) return 0;; esac
+  _s="${2:-$(sed -n 's/^SRC64=//p' "$WSM/$1" 2>/dev/null)}"
+  printf 'SRC64=%s\nUSED=%s\n' "$_s" "$(date +%s)" > "$WSM/.$1.tmp" && mv "$WSM/.$1.tmp" "$WSM/$1"
+}
+# The name a path's workspace had before names carried the repository; mirrors ws_legacy_key in rexec-lib.sh.
+ws_legacy_key() {
+  _s=$(printf '%s' "$(basename "$1")" | LC_ALL=C tr -c 'A-Za-z0-9_.-' '_' | cut -c1-10)
+  printf '%s-%s' "${_s:-proj}" "$(printf '%s' "$1" | openssl md5 | sed 's/.*[= ]//' | cut -c1-6)"
+}
+
 # ---- detached jobs ----
 # Tracked by process group, and re-adopted as-is when the agent restarts: their records live outside JOBS
 # and are never wiped. Nothing here ever kills one - only an explicit `rexec --cancel` does.
@@ -272,7 +469,7 @@ det_alive() { # a process group id means nothing across a reboot, so the boot ti
   p=$(det_pgid "$1"); case "$p" in ''|*[!0-9]*) return 1;; esac
   kill -0 -"$p" 2>/dev/null
 }
-det_clear() { rm -f "$DET/$1.meta" "$DET/$1.body" "$DET/$1.cmd" "$DET/$1.exit" "$DET/$1.reported"; }
+det_clear() { ws_touch "$(sed -n 's/^PROJECT=//p' "$DET/$1.meta" 2>/dev/null)"; rm -f "$DET/$1.meta" "$DET/$1.body" "$DET/$1.cmd" "$DET/$1.exit" "$DET/$1.reported"; }
 det_report() { # ID EXIT - the backstop for a job that could not report itself
   st=$(sed -n 's/^START=//p' "$DET/$1.meta" 2>/dev/null); case "$st" in ''|*[!0-9]*) st=$(date +%s);; esac
   tail -c 400000 "$DET/$1.log" 2>/dev/null | b64 \
@@ -330,6 +527,7 @@ out ""
 
 LAST_CLAIM=0
 LAST_TAIL=0
+LAST_GC=0; GC_PID=""
 GATE_STATE=init
 
 while true; do
@@ -372,6 +570,7 @@ while true; do
         125) say CANCEL "$id" '|' "$det";;
         *)   say FAIL   "$id" '|' "$det";;
       esac
+      ws_touch "$(sed -n 's/^PROJECT=//p' "$m")"
       rm -f "$JOBS/$id".*
       continue
     fi
@@ -414,6 +613,15 @@ while true; do
     det_clear "$did"
   done
   [ "$PUSH" = 1 ] && LAST_TAIL="$NOW"
+
+  # ---- 1c. workspace cleanup: at startup, then every GC_EVERY seconds, in the background ----
+  # du and a few ssh round trips take a while; polling must not wait on them.
+  if [ "$GC_EVERY" -gt 0 ] && [ $(( NOW - LAST_GC )) -ge "$GC_EVERY" ] \
+     && { [ -z "$GC_PID" ] || ! kill -0 "$GC_PID" 2>/dev/null; }; then
+    LAST_GC="$NOW"
+    ( bash "$RD/gc.sh" --auto 2>/dev/null | while IFS= read -r l; do say CLEAN - '|' "$l"; done ) </dev/null &
+    GC_PID=$!
+  fi
 
   NRUN=0; for m in "$JOBS"/*.meta; do [ -e "$m" ] && NRUN=$((NRUN+1)); done
   # Detached jobs are off the queue but very much on the machine. Counting them keeps the "nothing is
@@ -494,30 +702,36 @@ while true; do
       RUNDIR="$WS/_nosync"
     else
       RUNDIR="$WS/$PROJ"
-      # Migrate the old layout (it named directories by basename, so same-named different projects rsync --delete each other's files).
-      # OLD must be a real subdirectory of the workspace: basename "/" yields "/", which degrades OLD into $WS itself,
-      # turning this into "move the whole workspace into its own subdirectory". That is exactly how the old version synced the VPS root in.
-      OLDBASE=$(basename "$SYNC")
-      case "$OLDBASE" in
-        ''|'/'|'.'|'..') ;;
-        *) OLD="$WS/$OLDBASE"
-           [ -d "$OLD" ] && [ ! -d "$RUNDIR" ] && mv "$OLD" "$RUNDIR" 2>/dev/null;;
-      esac
+      # A workspace made before names carried the repository: move it over rather than reinstall everything.
+      # The name is checked as a plain directory name, so it can never degrade into $WS itself.
+      OLDK=$(ws_legacy_key "$SYNC")
+      if [ ! -d "$RUNDIR" ] && [ "$OLDK" != "$PROJ" ] && [ -d "$WS/$OLDK" ] && [ ! -f "$WSM/$OLDK" ] \
+         && ! grep -qx "PROJECT=$OLDK" "$DET"/*.meta 2>/dev/null; then
+        mv "$WS/$OLDK" "$RUNDIR" 2>/dev/null && say SYNC "$ID" '|' "workspace $OLDK renamed to $PROJ"
+      fi
+    fi
+
+    # The record comes first: it is what gc.sh checks, under the workspace's lock, before moving a workspace
+    # away. Written before the lock is waited out, a cleanup either sees this job and leaves the workspace,
+    # or finished moving it already and the job syncs into a fresh directory.
+    printf 'START=%s\nTIMEOUT=%s\nPROJECT=%s\nQUEUED=%s\n' \
+      "$NOW" "$TMO" "$PROJ" "$(( NOW - SUBMIT ))" > "$JOBS/$ID.meta"
+    if [ "$PROJ" != __nosync__ ]; then
+      n=0; while [ -d "$WSM/$PROJ.gc" ] && [ "$n" -lt 50 ]; do sleep 0.2; n=$((n+1)); done
+      rmdir "$WSM/$PROJ.gc" 2>/dev/null   # held 10s means its cleanup died mid-way
+      ws_touch "$PROJ" "$(printf '%s' "$SYNC" | b64)"
     fi
 
     : > "$RD/$ID.log"
     (
       J_ID="$ID" J_CMD="$CMD" J_SYNC="$SYNC" J_SUB="$SUB" J_GIT="$WGIT" \
       J_RUNDIR="$RUNDIR" J_HOST="$HOST" J_RSH="$RSH" J_JOBS="$JOBS" \
-      J_DETACH="$DTCH" J_DET="$DET" J_MACID="$MACID" J_BOOT="$BOOT" \
+      J_DETACH="$DTCH" J_DET="$DET" J_MACID="$MACID" J_BOOT="$BOOT" J_PROJ="$PROJ" \
       perl -e 'setpgrp(0,0); exec @ARGV or die "exec failed: $!"' -- \
            /bin/bash "$RD/runner.sh" >> "$RD/$ID.log" 2>&1
       # This wrapper deliberately stays in the agent's process group: kill -PGID cannot reach it, so the exit code survives
       echo $? > "$JOBS/$ID.exit.tmp" && mv "$JOBS/$ID.exit.tmp" "$JOBS/$ID.exit"
     ) </dev/null >/dev/null 2>&1 &
-
-    printf 'START=%s\nTIMEOUT=%s\nPROJECT=%s\nQUEUED=%s\n' \
-      "$NOW" "$TMO" "$PROJ" "$(( NOW - SUBMIT ))" > "$JOBS/$ID.meta"
     # only heavy jobs trigger the cooldown: a zero-cost probe should not stall the next heavy job for 25s
     [ "$WEIGHT" != light ] && LAST_CLAIM="$NOW"
     say RUN "$ID" '$' "$CMD"
