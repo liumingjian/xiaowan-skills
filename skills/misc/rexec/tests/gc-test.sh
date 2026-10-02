@@ -131,7 +131,9 @@ stop_agent
 echo "- ephemeral jobs, scratch directories and strays in ~"
 rm -rf "$WS"/* "$WSM"/* "$M/queue"/* "$M/results"/*
 ESRC="$T/src/ephem"; mkdir -p "$ESRC"; echo e > "$ESRC/a.txt"; ws_key "$ESRC"; ENAME=$WS_NAME
-# The job writes to ~ the way a careless command does, and reports where TMPDIR points.
+# The job writes to ~ the way a careless command does, and reports where TMPDIR points - under a profile that
+# sets TMPDIR itself, as many users' ~/.bash_profile does.
+echo 'export TMPDIR=/tmp' > "$T/home/.bash_profile"
 printf 'ID=ephem-0004\nCMD=%s\nSYNC=%s\nSUBCWD=\nTIMEOUT=900\nWEIGHT=light\nWITHGIT=0\nEPHEMERAL=1\nPROJECT=%s\nSUBMIT=%s\nSEQ=4\n' \
   "$(b64 'echo qa > ~/qa-data.log; mkdir ~/qa-dir; echo "$TMPDIR"')" "$(b64 "$ESRC")" "$ENAME" "$(date +%s)" > "$M/queue/ephem-0004.job"
 run_agent 3600
@@ -184,17 +186,24 @@ wait_for 20 gone7; is "an ephemeral detached job deletes its workspace once it i
 stop_agent
 
 echo "- the workspace moves out of ~"
-H2="$T/home2"; mkdir -p "$H2/rexec-workspace/old--abc123/node_modules" "$H2/.rexec"
+H2="$T/home2"; OW="$H2/rexec-workspace"; NW="$H2/.rexec/workspace"
+mkdir -p "$OW/busy--abc123/node_modules" "$OW/free--def456/node_modules" "$OW/dup--0a0a0a" "$OW/.cargo-target" "$OW/_nosync" "$H2/.rexec/detached" "$NW/dup--0a0a0a"
+: > "$OW/.DS_Store"
+# A running detached job: its body file names the directory it works in, which is all the agent has to go by.
+: > "$H2/.rexec/detached/x-0001.meta"; echo "ID='x-0001'; DET='d'; HOST='h'; MACID='m'; DIR='$OW/busy--abc123'" > "$H2/.rexec/detached/x-0001.body"
 start2() { HOME="$H2" PATH="$FAKE/bin:$PATH" REXEC_HOST=fake REXEC_MAC=$MAC REXEC_POLL=1 REXEC_GC_EVERY=0 \
     REXEC_LOG="$T/agent2.log" bash "$AGENT" >/dev/null 2>&1 &
   APID=$!; }
-mkdir -p "$H2/.rexec/detached"; : > "$H2/.rexec/detached/x-0001.meta"
-start2; wait_for 20 grep -qs "was not moved" "$T/agent2.log"; stop_agent
-is "a detached job still running keeps the old workspace where it is" "yes no" "$(has "$H2/rexec-workspace/old--abc123") $(has "$H2/.rexec/workspace/old--abc123")"
-is "...and the agent says why"                         1   "$(grep -c 'was not moved: a detached job' "$T/agent2.log")"
-rm -f "$H2/.rexec/detached/x-0001.meta"; rmdir "$H2/.rexec/workspace" 2>/dev/null
-start2; wait_for 20 test -d "$H2/.rexec/workspace/old--abc123/node_modules"; stop_agent
-is "otherwise ~/rexec-workspace moves into ~/.rexec, dependencies and all" "no yes" "$(has "$H2/rexec-workspace") $(has "$H2/.rexec/workspace/old--abc123/node_modules")"
+start2; wait_for 20 grep -qs "left in place" "$T/agent2.log"; stop_agent
+is "a workspace moves with its dependencies"           yes "$(has "$NW/free--def456/node_modules")"
+is "one a running detached job works in stays put"     "yes no" "$(has "$OW/busy--abc123") $(has "$NW/busy--abc123")"
+is "so does one not made by rexec"                     yes "$(has "$OW/.cargo-target")"
+is "so does one that already exists in the new place"  "yes" "$(has "$OW/dup--0a0a0a")"
+is "Finder litter and the nosync scratch directory go" "no no" "$(has "$OW/.DS_Store") $(has "$OW/_nosync")"
+is "the agent lists what it left"                      1   "$(grep -c 'left in place.*busy--abc123.*\.cargo-target\|left in place.*\.cargo-target.*busy--abc123' "$T/agent2.log")"
+rm -rf "$H2/.rexec/detached" "$OW/dup--0a0a0a" "$OW/.cargo-target"; mkdir -p "$H2/.rexec/detached"
+start2; wait_for 20 test -d "$NW/busy--abc123/node_modules"; stop_agent
+is "once the job is over the rest moves on the next start, and the old directory goes" "yes no" "$(has "$NW/busy--abc123/node_modules") $(has "$OW")"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ] || { echo "--- agent log"; tail -30 "$T/agent.log"; }
