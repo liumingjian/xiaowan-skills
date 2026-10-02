@@ -47,7 +47,7 @@ reads it.
 
 The agent derives its own identity name: `<first 12 chars of ComputerName>-<hardware UUID hash4>`, e.g.
 `macbook-pro-3f9a`. The hash suffix keeps two identically named machines from colliding. To rename, use
-`REXEC_MAC=custom-name bash ~/rexec-agent.sh`.
+`REXEC_MAC=custom-name bash ~/.rexec/agent.sh`.
 
 Each mac has its own queue, gate, and workspace, fully independent — including the same-project-serial
 rule, which is counted per mac: two commands from one project can run on macA and macB simultaneously,
@@ -85,11 +85,12 @@ Each action shows in the agent log as a `CLEAN` line naming the workspace, its s
 |---|---|
 | a job is running, queued or detached in it | left alone, always |
 | its source directory is gone from the server | deleted with everything in it |
-| unused for `REXEC_GC_IDLE_DAYS` (7) | deleted - unless it holds files the server lacks |
+| unused for `REXEC_GC_IDLE_DAYS` (3) | deleted - unless it holds files the server lacks |
 | idle, but holds files the server lacks (an `.env` dropped in by hand) | kept; logged once as `kept` with the file names |
 | old-style name `<basename10>-<hash6>`, its directory found on the server | renamed to the new name, dependencies intact |
 | old-style name, no directory on the server hashes to it | listed by `rexec --gc`; deleted only by `rexec --gc --apply` |
 | not created by rexec (`.echo-cargo-target-*`, `_nosync`) | listed by `rexec --gc` with its size, never deleted |
+| the job was run with `--ephemeral` | deleted when the job ends, unless another job is using it (a detached job: when it ends) |
 
 "Files the server lacks" is an rsync dry run against the source without the `.gitignore` filter but with the
 sync's own excludes (`node_modules/`, `target/`, ...). A missing file whose parent directory is missing on
@@ -103,6 +104,21 @@ the server too counts as build output (`coverage/`, `out/`), not as a hand-place
 - **A deleted workspace is not lost work:** its source still lives on the server, and the next job on
   that path syncs it again and reinstalls dependencies. A dropped `.env` goes with a workspace whose source is
   gone, since nothing could use it any more.
+- **Everything rexec keeps on the mac lives in `~/.rexec/`**: `workspace/`, `scratch/<job>/`, `home-trash/`,
+  the agent's records, and `agent.sh` itself. Agents older than this moved nothing: their workspace was
+  `~/rexec-workspace` and their install `~/rexec-agent.sh`. A new agent moves the former in at startup (not
+  while a detached job is running, since it holds absolute paths into it; it retries at every start and says
+  so in the log) and mentions the latter, which it never deletes. Setting `REXEC_WS` opts out of the move.
+- **Scratch directories.** Each job runs with `REXEC_SCRATCH=~/.rexec/scratch/<job id>` and `TMPDIR` pointing
+  at it. gc removes those whose job is over and that are older than `REXEC_GC_IDLE_DAYS`.
+- **Strays in `~`.** The job's runner (and a detached job's body) lists the visible entries of `~` before and
+  after the command. Whatever appeared is printed as a `[rexec] appeared in ~ ...` line at the end of the
+  output - so it is in `--wait`'s receipt too - and appended to `~/.rexec/strays` (name, job, time). It is
+  attribution by timing: a parallel job or the user can add an entry in the same window, which is why gc
+  only lists them. `rexec --gc` prints the ones still present; `--gc --apply` moves them to
+  `~/.rexec/home-trash/<time>/` and drops them after 7 days. The hourly run never touches `~`.
+- **`--ephemeral`** needs an agent that announces the `ephemeral` capability, like `--detach` and `--gc`.
+  The package managers' own caches (`~/.npm`, `~/.cache`, ...) are not in the workspace and survive it.
 - **`rexec --gc`** also prints the size of the big shared caches outside rexec (Docker's disk image,
   `~/.npm`, `~/.cache`, `~/Library/Caches`, pnpm), as a pointer for the user. rexec never deletes them.
 
@@ -267,7 +283,7 @@ On failure `rexec` writes the reason and the next step to stderr itself; this ta
 |---|---|---|
 | `REXEC_MAC` | this machine's identity name | derived automatically |
 | `REXEC_HOST` | ssh target | `vps-2g` |
-| `REXEC_WS` | workspace | `~/rexec-workspace` |
+| `REXEC_WS` | workspace | `~/.rexec/workspace` |
 | `REXEC_POLL` | poll interval | 2s |
 | `REXEC_CPU_MAX` | CPU ceiling % that closes the gate | 80 |
 | `REXEC_CPU_RELAX` | CPU floor % below which cooldown is ignored | 40 |
@@ -276,7 +292,7 @@ On failure `rexec` writes the reason and the next step to stderr itself; this ta
 | `REXEC_TAIL` | how often a detached job's log tail is pushed to the server, seconds | 15 |
 | `REXEC_LOG` | write the agent log to this file | no log file |
 | `REXEC_GC_EVERY` | seconds between workspace cleanups; 0 turns them off | 3600 |
-| `REXEC_GC_IDLE_DAYS` | days unused before a workspace is cleaned up | 7 |
+| `REXEC_GC_IDLE_DAYS` | days unused before a workspace (or a job's scratch directory) is cleaned up | 3 |
 
 Server side: `REXEC_CALLER_GRACE` (default 90s) is how long a job may go without a caller heartbeat before
 the server treats it as abandoned, `REXEC_STRAND_GRACE` (default 120s) is how long a job may be missing from the agent's reported

@@ -5,7 +5,7 @@
 # Environment variables (all have defaults):
 #   REXEC_HOST      ssh target, default vps-2g
 #   REXEC_MAC       this machine's identity on the server, derived from ComputerName + hardware UUID
-#   REXEC_WS        local workspace, default ~/rexec-workspace
+#   REXEC_WS        local workspace, default ~/.rexec/workspace (hidden, so nothing rexec-made shows in ~)
 #   REXEC_POLL      poll interval in seconds, default 2
 #   REXEC_CPU_MAX   CPU ceiling %; above it no new heavy job is claimed, default 80
 #   REXEC_MEM_MIN   free memory floor %; below it no new heavy job is claimed, default 20
@@ -14,10 +14,10 @@
 #   REXEC_LOG       write the terminal log to this file (opened in append mode internally; do not use a shell > redirect)
 #   REXEC_TAIL      how often to push a detached job's log tail to the server, in seconds, default 15
 #   REXEC_GC_EVERY  seconds between workspace cleanups, default 3600; 0 turns the automatic cleanup off
-#   REXEC_GC_IDLE_DAYS  a workspace no job has used for this many days is cleaned up, default 7
+#   REXEC_GC_IDLE_DAYS  a workspace no job has used for this many days is cleaned up, default 3
 set -u
 HOST="${REXEC_HOST:-vps-2g}"
-WS="${REXEC_WS:-$HOME/rexec-workspace}"
+WS="${REXEC_WS:-$HOME/.rexec/workspace}"
 POLL="${REXEC_POLL:-2}"
 CPU_MAX="${REXEC_CPU_MAX:-80}"
 MEM_MIN="${REXEC_MEM_MIN:-20}"
@@ -25,7 +25,7 @@ COOLDOWN="${REXEC_COOLDOWN:-15}"
 TAIL_EVERY="${REXEC_TAIL:-15}"
 CPU_RELAX="${REXEC_CPU_RELAX:-$(( ${REXEC_CPU_MAX:-80} / 2 ))}"
 GC_EVERY="${REXEC_GC_EVERY:-3600}"
-GC_IDLE_DAYS="${REXEC_GC_IDLE_DAYS:-7}"
+GC_IDLE_DAYS="${REXEC_GC_IDLE_DAYS:-3}"
 
 # Use REXEC_LOG for a log file rather than a shell `>` redirect:
 #  - redirected to a file, bash's stdout is block-buffered, so log lines sit in the buffer instead of landing on disk;
@@ -42,7 +42,17 @@ DET="$RD/detached"
 # One record per workspace, named like it: SRC64 (the server path it syncs from) and USED (when a job last
 # used it). Kept outside the workspace, where rsync --delete would take it. gc.sh decides by these.
 WSM="$RD/ws"
-mkdir -p "$WS" "$RD" "$JOBS" "$DET" "$WSM"
+mkdir -p "$RD"
+# The workspace used to be ~/rexec-workspace, a visible entry in ~. Move it in with its dependencies rather than
+# reinstall. A detached job holds an absolute path into it, so wait until none is left; the move is retried at
+# every start.
+OLDWS="$HOME/rexec-workspace"; WS_NOTE=""
+if [ -z "${REXEC_WS:-}" ] && [ -d "$OLDWS" ] && [ ! -L "$OLDWS" ]; then
+  if [ -e "$WS" ]; then WS_NOTE="$OLDWS was not moved: $WS already exists"
+  elif ls "$DET"/*.meta >/dev/null 2>&1; then WS_NOTE="$OLDWS was not moved: a detached job is still using it"
+  else mv "$OLDWS" "$WS" && WS_NOTE="$OLDWS moved to $WS"; fi
+fi
+mkdir -p "$WS" "$JOBS" "$DET" "$WSM" "$RD/scratch"
 
 # Single instance: two agents fight over the queue, each claiming half the jobs and logging separately, which is brutal to diagnose.
 # The install command is idempotent and users re-run it often, so this has to be blocked here.
@@ -97,7 +107,7 @@ fi
 LABEL="${MACNAME:-$MACID}"
 # What this agent version can do. The server refuses a job whose flag is missing here, rather than
 # running it with the flag silently dropped.
-CAPS="git,reap,detach,gc"
+CAPS="git,reap,detach,gc,ephemeral"
 
 
 # ---------- log format: TIME(8) EVENT(6) ID(15) sigil DETAIL ----------
@@ -168,6 +178,10 @@ cat > "$RD/runner.sh" <<'RUNNER_EOF'
 # The whole tree (rsync included) sits in that group, so a cancel kills it cleanly and can never reach the agent itself.
 set -u
 echo $$ > "$J_JOBS/$J_ID.pgid"
+# A directory of the job's own for logs, screenshots and QA data: what a command would otherwise drop in ~.
+mkdir -p "$J_SCRATCH"
+export REXEC_SCRATCH="$J_SCRATCH" TMPDIR="$J_SCRATCH"
+. "$HOME/.rexec/stray.sh"
 if [ "$J_SYNC" != "-" ]; then
   : > "$J_JOBS/$J_ID.syncing"
   mkdir -p "$J_RUNDIR" || exit 91
@@ -208,8 +222,12 @@ if [ "${J_DETACH:-0}" = 1 ]; then
 ID='$J_ID'; DET='$J_DET'; HOST='$J_HOST'; MACID='$J_MACID'; DIR='$DIR'
 START=\$(date +%s)
 cd "\$DIR" || exit 91
+. "\$HOME/.rexec/stray.sh"
+stray_before "\$DET/\$ID.home"
 /bin/bash -lc "\$(cat "\$DET/\$ID.cmd")" >> "\$DET/\$ID.log" 2>&1
 EC=\$?
+# Before the log is shipped, so the warning reaches the caller's receipt like any other output.
+stray_after "\$ID" "\$DET/\$ID.home" >> "\$DET/\$ID.log" 2>&1
 echo \$EC > "\$DET/\$ID.exit"
 RAN=\$(( \$(date +%s) - START ))
 n=0
@@ -226,7 +244,7 @@ BODY
         /bin/bash "$J_DET/$J_ID.body" >> "$LOG" 2>&1 </dev/null &
   PG=$!
   # PROJECT is what keeps gc.sh away from the workspace this job is still building in.
-  printf 'PGID=%s\nBOOT=%s\nSTART=%s\nPROJECT=%s\n' "$PG" "$J_BOOT" "$(date +%s)" "$J_PROJ" > "$J_DET/$J_ID.meta"
+  printf 'PGID=%s\nBOOT=%s\nSTART=%s\nPROJECT=%s\nEPHEMERAL=%s\n' "$PG" "$J_BOOT" "$(date +%s)" "$J_PROJ" "${J_EPH:-0}" > "$J_DET/$J_ID.meta"
   # Registered before this job leaves running/, so the project's workspace is never unclaimed for an instant.
   if ! $J_RSH "$J_HOST" "/var/lib/rexec/bin/rexec-detached start $J_MACID $J_ID $PG $J_BOOT $(printf '%s' "$LOG" | openssl base64 -A)" >/dev/null 2>&1; then
     kill -TERM -"$PG" 2>/dev/null
@@ -238,18 +256,43 @@ BODY
   exit 0
 fi
 
-exec /bin/bash -lc "$J_CMD"
+# Not exec'd: the runner has to outlive the command to see what it left in ~. It is still the group leader, so
+# a cancel or timeout kills both, and the caller's exit code is the command's.
+stray_before "$HOME/.rexec/$J_ID.home"
+/bin/bash -lc "$J_CMD"
+rc=$?
+stray_after "$J_ID" "$HOME/.rexec/$J_ID.home"
+exit $rc
 RUNNER_EOF
 chmod +x "$RD/runner.sh"
 
+# ---------- what a job leaves in ~ ----------
+# Sourced by runner.sh and by detached job bodies. The commands a job runs can write anywhere, and ~ is where
+# a stray `> ~/qa.log` or `mkdir ~/qa-data` lands; rexec cannot stop that, so it says so at the end of the
+# job and records the names for `rexec --gc`. Visible entries only: dotfiles do not clutter anything.
+# Another job, or the user, can add an entry in the same window, so the wording is "appeared", not "made".
+cat > "$RD/stray.sh" <<'STRAY_EOF'
+stray_before() { ls "$HOME" 2>/dev/null | LC_ALL=C sort > "$1"; }
+stray_after() { # JOB_ID BEFORE_FILE
+  _new=$(ls "$HOME" 2>/dev/null | LC_ALL=C sort | LC_ALL=C comm -13 "$2" -)
+  rm -f "$2"
+  [ -n "$_new" ] || return 0
+  printf '%s\n' "$_new" | while IFS= read -r _n; do
+    printf '%s\t%s\t%s\n' "$_n" "$1" "$(date +%s)" >> "$HOME/.rexec/strays"
+  done
+  echo "[rexec] appeared in ~ while this job ran: $(printf '%s' "$_new" | tr '\n' ' ')- write job output to \$REXEC_SCRATCH; rexec --gc lists them"
+}
+STRAY_EOF
+
 # ---------- workspace cleanup (a separate file: the agent runs it hourly, `rexec --gc` runs it as a job) ----------
 # A workspace is created for every path ever synced, and every worktree is a new path, so without this
-# ~/rexec-workspace grows by gigabytes a day. Run as a job it has no agent environment, hence gc.env.
+# the workspace grows by gigabytes a day. Run as a job it has no agent environment, hence gc.env.
 printf 'HOST=%q\nWS=%q\nMACID=%q\nSSH_OPTS=%q\nIDLE_DAYS=%q\n' \
   "$HOST" "$WS" "$MACID" "$SSH_OPTS" "$GC_IDLE_DAYS" > "$RD/gc.env"
 cat > "$RD/gc.sh" <<'GC_EOF'
 #!/bin/bash
-# Usage: gc.sh --auto | --dry-run | --apply
+# Usage: gc.sh --auto | --dry-run | --apply | --drop NAME
+#   --drop     an --ephemeral job's end: delete workspace NAME unless something else is using it
 #   --auto     what the agent runs hourly: deletes, prints one line per deletion or rename, nothing else
 #   --dry-run  `rexec --gc`: the full report, touching nothing
 #   --apply    `rexec --gc --apply`: the full report, acted on - including what --auto leaves for a human
@@ -268,6 +311,7 @@ RD="$HOME/.rexec"
 . "$RD/gc.env"
 MODE="${1:---auto}"
 WSM="$RD/ws"; JOBS="$RD/jobs"; DET="$RD/detached"; TRASH="$WS/.rexec-trash"
+HTRASH="$RD/home-trash"; STRAYS="$RD/strays"; BUSY=""
 NOW=$(date +%s)
 
 LOCK="$RD/gc.lock"
@@ -324,6 +368,17 @@ dropped() { # NAME SRC
             while (sub(/\/[^\/]*$/, "", p)) if ((p "/") in dir) { top = 0; break }
             if (top) print f } }'
 }
+
+# Something on the mac can write into a directory while rm walks it (Spotlight, Finder's .DS_Store), and rm
+# then fails on the parent. One retry; whatever is still there goes next round, and is no failure.
+empty_trash() { rm -rf "$TRASH" 2>/dev/null || { sleep 1; rm -rf "$TRASH" 2>/dev/null; } || true; }
+
+if [ "$MODE" = --drop ]; then
+  # The name is a plain directory name or nothing: it can never degrade into $WS itself.
+  case "${2:-}" in ''|*/*|.*) exit 0;; esac
+  [ -d "$WS/$2" ] && delete "$2" "ephemeral job"
+  empty_trash; exit 0
+fi
 
 # ---- sort the workspace root ----
 MANAGED=""; LEGACY=""; OTHER=""
@@ -399,6 +454,47 @@ done <<< "$(printf '%s\n' "$CHK" | sed '1d')"
 [ "$MODE" = --auto ] || [ "$NDEL" = 0 ] || printf '%s %s workspace(s), %s\n' \
   "$([ "$MODE" = --dry-run ] && echo 'would free' || echo freed)" "$NDEL" "$(human "$FREED")"
 
+# ---- scratch directories of jobs that are long over, and home-trash past its week ----
+if [ "$MODE" != --dry-run ]; then
+  for d in "$RD"/scratch/*; do
+    [ -d "$d" ] || continue
+    id=$(basename "$d")
+    if [ -e "$JOBS/$id.meta" ] || [ -e "$DET/$id.meta" ]; then continue; fi
+    [ -n "$(find "$d" -maxdepth 0 -mtime +"$IDLE_DAYS" 2>/dev/null)" ] && rm -rf "$d"
+  done
+  for d in "$HTRASH"/*; do
+    [ -d "$d" ] || continue
+    e=$(basename "$d"); case "$e" in ''|*[!0-9]*) continue;; esac
+    [ $(( NOW - e )) -ge 604800 ] && rm -rf "$d"
+  done
+fi
+
+# ---- strays: entries that appeared in ~ while a job ran (see stray.sh) ----
+# One record per name still there; a name the user already removed drops out of the list.
+if [ -s "$STRAYS" ]; then
+  # A function, not an inline case: the mac's bash 3.2 cannot parse a case pattern inside $( ).
+  stray_live() {
+    case "$1" in ''|*/*|.*|rexec-agent.sh|rexec-workspace) return 1;; esac
+    [ -e "$HOME/$1" ] || [ -L "$HOME/$1" ]
+  }
+  LIVE=$(awk -F'\t' '!seen[$1]++' "$STRAYS" | while IFS="$TAB" read -r n j t; do
+    if stray_live "$n"; then printf '%s\t%s\t%s\n' "$n" "$j" "$t"; fi
+  done)
+  if [ "$MODE" != --dry-run ]; then
+    printf '%s\n' "$LIVE" | sed '/^$/d' > "$STRAYS.tmp" && mv "$STRAYS.tmp" "$STRAYS"
+  fi
+  if [ -n "$LIVE" ] && [ "$MODE" != --auto ]; then
+    echo "appeared in ~ while rexec jobs ran (rexec cannot tell them from your own files; --apply moves them to ~/.rexec/home-trash for 7 days):"
+    while IFS="$TAB" read -r n j t; do
+      [ -n "$n" ] || continue
+      printf '  %6s  ~/%s  (job %s)\n' "$(human "$(kb "$HOME/$n")")" "$n" "$j"
+      if [ "$MODE" = --apply ]; then
+        mkdir -p "$HTRASH/$NOW" && mv "$HOME/$n" "$HTRASH/$NOW/$n" && echo "    moved to ~/.rexec/home-trash/$NOW/$n"
+      fi
+    done <<< "$LIVE"
+  fi
+fi
+
 # ---- report only ----
 if [ "$MODE" != --auto ]; then
   if [ -n "$OTHER" ]; then
@@ -412,9 +508,7 @@ if [ "$MODE" != --auto ]; then
   done
   [ "$MODE" = --dry-run ] && echo "nothing was deleted; rexec --gc --apply acts on the list above"
 fi
-# Something on the mac can write into a directory while rm walks it (Spotlight, Finder's .DS_Store), and rm
-# then fails on the parent. One retry; whatever is still there goes next round, and is no failure.
-rm -rf "$TRASH" 2>/dev/null || { sleep 1; rm -rf "$TRASH" 2>/dev/null; } || true
+empty_trash
 GC_EOF
 chmod +x "$RD/gc.sh"
 
@@ -453,6 +547,12 @@ ws_touch() { # NAME [SRC64]
   _s="${2:-$(sed -n 's/^SRC64=//p' "$WSM/$1" 2>/dev/null)}"
   printf 'SRC64=%s\nUSED=%s\n' "$_s" "$(date +%s)" > "$WSM/.$1.tmp" && mv "$WSM/.$1.tmp" "$WSM/$1"
 }
+# --ephemeral: the workspace goes when the job does. gc.sh checks under the workspace's lock that nothing else
+# is using it, so a detached job (whose record is still in DET at this point) or a neighbour keeps it.
+ws_drop() { # NAME
+  case "${1:-__nosync__}" in __nosync__) return 0;; esac
+  ( bash "$RD/gc.sh" --drop "$1" 2>/dev/null | while IFS= read -r l; do say CLEAN - '|' "$l"; done ) </dev/null &
+}
 # The name a path's workspace had before names carried the repository; mirrors ws_legacy_key in rexec-lib.sh.
 ws_legacy_key() {
   _s=$(printf '%s' "$(basename "$1")" | LC_ALL=C tr -c 'A-Za-z0-9_.-' '_' | cut -c1-10)
@@ -470,7 +570,12 @@ det_alive() { # a process group id means nothing across a reboot, so the boot ti
   p=$(det_pgid "$1"); case "$p" in ''|*[!0-9]*) return 1;; esac
   kill -0 -"$p" 2>/dev/null
 }
-det_clear() { ws_touch "$(sed -n 's/^PROJECT=//p' "$DET/$1.meta" 2>/dev/null)"; rm -f "$DET/$1.meta" "$DET/$1.body" "$DET/$1.cmd" "$DET/$1.exit" "$DET/$1.reported"; }
+det_clear() {
+  _p=$(sed -n 's/^PROJECT=//p' "$DET/$1.meta" 2>/dev/null); _e=$(sed -n 's/^EPHEMERAL=//p' "$DET/$1.meta" 2>/dev/null)
+  ws_touch "$_p"
+  rm -f "$DET/$1.meta" "$DET/$1.body" "$DET/$1.cmd" "$DET/$1.exit" "$DET/$1.reported" "$DET/$1.home"
+  [ "$_e" = 1 ] && ws_drop "$_p"
+}
 det_report() { # ID EXIT - the backstop for a job that could not report itself
   st=$(sed -n 's/^START=//p' "$DET/$1.meta" 2>/dev/null); case "$st" in ''|*[!0-9]*) st=$(date +%s);; esac
   tail -c 400000 "$DET/$1.log" 2>/dev/null | b64 \
@@ -501,6 +606,8 @@ trap stop_agent INT TERM
 
 # ---------- connection ----------
 out "rexec-agent  $MACID  ->  $HOST  $WS"
+[ -n "$WS_NOTE" ] && out "$WS_NOTE"
+[ -f "$HOME/rexec-agent.sh" ] && out "~/rexec-agent.sh is the old install location; the agent now lives in ~/.rexec/agent.sh, so it can be deleted"
 master_up
 if ! ssh $SSH_OPTS -o BatchMode=yes "$HOST" true 2>/tmp/rexec-sshtest.$$; then
   echo "Cannot connect to '$HOST' with key-based auth:" >&2
@@ -509,7 +616,7 @@ if ! ssh $SSH_OPTS -o BatchMode=yes "$HOST" true 2>/tmp/rexec-sshtest.$$; then
   Troubleshooting:
     1) verify by hand:  ssh -o BatchMode=yes vps-2g true && echo OK
     2) key has a passphrase:  ssh-add --apple-use-keychain ~/.ssh/vps-2g-rexec
-    3) different alias or key:  REXEC_HOST=your-alias bash ~/rexec-agent.sh
+    3) different alias or key:  REXEC_HOST=your-alias bash ~/.rexec/agent.sh
     4) a new mac needs its own key: see "Adding a mac" in the rexec skill's REFERENCE.md
 MSG
   rm -f /tmp/rexec-sshtest.$$; kill "$SAMPLER_PID" 2>/dev/null; exit 1
@@ -571,8 +678,11 @@ while true; do
         125) say CANCEL "$id" '|' "$det";;
         *)   say FAIL   "$id" '|' "$det";;
       esac
-      ws_touch "$(sed -n 's/^PROJECT=//p' "$m")"
-      rm -f "$JOBS/$id".*
+      pj=$(sed -n 's/^PROJECT=//p' "$m"); eph=$(sed -n 's/^EPHEMERAL=//p' "$m")
+      ws_touch "$pj"
+      rm -f "$JOBS/$id".* "$RD/$id.home"
+      # A job that detached itself is still in DET here, so its workspace survives this and goes at det_clear.
+      [ "$eph" = 1 ] && ws_drop "$pj"
       continue
     fi
 
@@ -694,6 +804,8 @@ while true; do
     WEIGHT=$(printf '%s\n' "$BODY" | sed -n 's/^WEIGHT=//p')
     WGIT=$(printf   '%s\n' "$BODY" | sed -n 's/^WITHGIT=//p')
     DTCH=$(printf   '%s\n' "$BODY" | sed -n 's/^DETACH=//p')
+    EPH=$(printf    '%s\n' "$BODY" | sed -n 's/^EPHEMERAL=//p')
+    case "$EPH" in 1) ;; *) EPH=0;; esac
     case "$WGIT" in 1) ;; *) WGIT=0;; esac
     case "$DTCH" in 1) ;; *) DTCH=0;; esac
     case "$TMO"    in ''|*[!0-9]*) TMO=900;; esac
@@ -715,8 +827,8 @@ while true; do
     # The record comes first: it is what gc.sh checks, under the workspace's lock, before moving a workspace
     # away. Written before the lock is waited out, a cleanup either sees this job and leaves the workspace,
     # or finished moving it already and the job syncs into a fresh directory.
-    printf 'START=%s\nTIMEOUT=%s\nPROJECT=%s\nQUEUED=%s\n' \
-      "$NOW" "$TMO" "$PROJ" "$(( NOW - SUBMIT ))" > "$JOBS/$ID.meta"
+    printf 'START=%s\nTIMEOUT=%s\nPROJECT=%s\nQUEUED=%s\nEPHEMERAL=%s\n' \
+      "$NOW" "$TMO" "$PROJ" "$(( NOW - SUBMIT ))" "$EPH" > "$JOBS/$ID.meta"
     if [ "$PROJ" != __nosync__ ]; then
       n=0; while [ -d "$WSM/$PROJ.gc" ] && [ "$n" -lt 50 ]; do sleep 0.2; n=$((n+1)); done
       rmdir "$WSM/$PROJ.gc" 2>/dev/null   # held 10s means its cleanup died mid-way
@@ -728,6 +840,7 @@ while true; do
       J_ID="$ID" J_CMD="$CMD" J_SYNC="$SYNC" J_SUB="$SUB" J_GIT="$WGIT" \
       J_RUNDIR="$RUNDIR" J_HOST="$HOST" J_RSH="$RSH" J_JOBS="$JOBS" \
       J_DETACH="$DTCH" J_DET="$DET" J_MACID="$MACID" J_BOOT="$BOOT" J_PROJ="$PROJ" \
+      J_EPH="$EPH" J_SCRATCH="$RD/scratch/$ID" \
       perl -e 'setpgrp(0,0); exec @ARGV or die "exec failed: $!"' -- \
            /bin/bash "$RD/runner.sh" >> "$RD/$ID.log" 2>&1
       # This wrapper deliberately stays in the agent's process group: kill -PGID cannot reach it, so the exit code survives

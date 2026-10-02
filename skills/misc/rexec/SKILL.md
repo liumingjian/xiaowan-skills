@@ -13,7 +13,7 @@ cannot reach the mac.
 
 The environment is fixed: SSH alias `vps-2g` (defined in the mac's `~/.ssh/config`, override with
 `REXEC_HOST`); each mac logs in with its own key `~/.ssh/vps-2g-rexec`, tagged `rexec-mac=<MACID>` in the
-server's `authorized_keys`; mac workspace `~/rexec-workspace/<repo>[--wt-<worktree>]--<pathhash>/`.
+server's `authorized_keys`; mac workspace `~/.rexec/workspace/<repo>[--wt-<worktree>]--<pathhash>/` (hidden: rexec adds nothing visible to the mac's `~`).
 
 **Multiple macs are first-class.** Each mac's agent has its own identity and its own queue on the server.
 **A job goes to this session's mac**: the one whose key its live ssh login used. A session with no live
@@ -36,7 +36,7 @@ rexec --cancel <ID>    # cancel one job (IDs look like myproj-0041; globally uni
 rexec --cancel         # no ID: list the queue first, let the user pick
 rexec --macs           # which macs are registered, who is online, this session's default target
 rexec --use <name>     # set the default mac for when several are online (persists; --use none clears)
-rexec --gc             # dry run: which workspaces on the mac would be cleaned up, and why
+rexec --gc             # dry run: which workspaces on the mac would be cleaned up, and why - and what jobs left in its `~`
 rexec --gc --apply     # act on that list - only after the user has seen the dry run and said yes
 ```
 
@@ -68,13 +68,13 @@ Hand the user this command verbatim, ask them to run it **in a terminal on the m
 (or, when it names none, the mac they are using), then **stop and wait for their reply** before continuing:
 
 ```bash
-ssh vps-2g 'cat /var/lib/rexec/agent.sh' > ~/rexec-agent.sh && bash ~/rexec-agent.sh
+mkdir -p ~/.rexec && ssh vps-2g 'cat /var/lib/rexec/agent.sh' > ~/.rexec/agent.sh && bash ~/.rexec/agent.sh
 ```
 
 That one command installs and starts the agent, pulling the latest version each time. Tell the user two
 things: the agent occupies a terminal tab for as long as it runs, and it is only up once
 `polling every 2s, ctrl-c to stop` appears; Ctrl-C stops it. Its first line prints its identity, e.g.
-`rexec-agent  macbook-pro-3f9a  ->  vps-2g  ~/rexec-workspace`.
+`rexec-agent  macbook-pro-3f9a  ->  vps-2g  ~/.rexec/workspace`.
 
 **`AMBIGUOUS`** — several macs are online, this session has no live login naming one, and no default is
 set. Show the user the table, ask which mac to use, then run `rexec --use <name>`: the default persists on
@@ -138,13 +138,19 @@ Leave the light, static work on the server: reading and writing code, grep, type
 ## Usage notes
 
 - Syncs the **current working directory** by default (rsync, honours `.gitignore`) to a workspace on the
-  mac named after its repository — `~/rexec-workspace/<repo>--<pathhash>/`, or
+  mac named after its repository — `~/.rexec/workspace/<repo>--<pathhash>/`, or
   `<repo>--wt-<worktree>--<pathhash>/` for a git worktree — then runs there. Job IDs carry the repository
   name too. Each path gets its own workspace, so two checkouts never `rsync --delete` each other's files,
   and one path always reuses its workspace, so dependencies install only once.
 - **Workspaces clean themselves up.** The agent deletes a workspace once its source directory is gone from
-  the server (a removed worktree, say) or no job has used it for 7 days. A worktree-heavy session leaves
+  the server (a removed worktree, say) or no job has used it for 3 days. `--ephemeral` deletes it the moment the job ends instead (a one-off check of a throwaway checkout); package-manager caches in `~` survive, but `node_modules/` and `.venv/` go with it. A worktree-heavy session leaves
   nothing behind for long. `REFERENCE.md` has the rules.
+- **Write job output to `$REXEC_SCRATCH`, never to `~`.** Every job gets its own directory there, also
+  exported as `TMPDIR`; logs, screenshots and QA data belong in it, and it is removed after 3 idle days.
+  A command that writes into `~` leaves clutter in the user's home: rexec cannot stop it, but the receipt
+  ends with `[rexec] appeared in ~ while this job ran: <names>` when it happens. Fix the command, and tell
+  the user - `rexec --gc` lists those entries and `--gc --apply` (after the user has seen the dry run) moves
+  them to `~/.rexec/home-trash` for a week.
 - stderr carries one bill line at the end:
   `--- [macbook-pro-3f9a] exit=0 | queued 4m12s | ran 6m03s | total 10m15s ---` (the mac that ran it is in brackets).
 - **Dependencies install once.** `.venv/ node_modules/ target/ dist/ build/ .next/` are protected on the
