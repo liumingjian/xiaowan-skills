@@ -106,11 +106,16 @@ the server too counts as build output (`coverage/`, `out/`), not as a hand-place
   gone, since nothing could use it any more.
 - **Everything rexec keeps on the mac lives in `~/.rexec/`**: `workspace/`, `scratch/<job>/`, `home-trash/`,
   the agent's records, and `agent.sh` itself. Agents older than this moved nothing: their workspace was
-  `~/rexec-workspace` and their install `~/rexec-agent.sh`. A new agent moves the former in at startup (not
-  while a detached job is running, since it holds absolute paths into it; it retries at every start and says
-  so in the log) and mentions the latter, which it never deletes. Setting `REXEC_WS` opts out of the move.
+  `~/rexec-workspace` and their install `~/rexec-agent.sh`. A new agent moves the former in at startup,
+  workspace by workspace, and mentions the latter, which it never deletes. What stays is named in the agent
+  log, and the move is retried at every start; the old directory goes once it is empty. Three kinds stay: a
+  workspace a running detached job works in (the job holds absolute paths into it), an entry rexec did not
+  make (a `CARGO_TARGET_DIR` someone pointed there; moving it would break whatever names its path), and one
+  that already exists in the new place. Setting `REXEC_WS` opts out of the move.
 - **Scratch directories.** Each job runs with `REXEC_SCRATCH=~/.rexec/scratch/<job id>` and `TMPDIR` pointing
-  at it. gc removes those whose job is over and that are older than `REXEC_GC_IDLE_DAYS`.
+  at it. `TMPDIR` is set again inside the command, after the login shell's profile has run, because a
+  profile that exports its own (`export TMPDIR=/tmp` is common) would otherwise win. gc removes scratch
+  directories whose job is over and that are older than `REXEC_GC_IDLE_DAYS`.
 - **Strays in `~`.** The job's runner (and a detached job's body) lists the visible entries of `~` before and
   after the command. Whatever appeared is printed as a `[rexec] appeared in ~ ...` line at the end of the
   output - so it is in `--wait`'s receipt too - and appended to `~/.rexec/strays` (name, job, time). It is

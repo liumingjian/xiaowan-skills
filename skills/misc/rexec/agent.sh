@@ -42,17 +42,35 @@ DET="$RD/detached"
 # One record per workspace, named like it: SRC64 (the server path it syncs from) and USED (when a job last
 # used it). Kept outside the workspace, where rsync --delete would take it. gc.sh decides by these.
 WSM="$RD/ws"
-mkdir -p "$RD"
-# The workspace used to be ~/rexec-workspace, a visible entry in ~. Move it in with its dependencies rather than
-# reinstall. A detached job holds an absolute path into it, so wait until none is left; the move is retried at
-# every start.
-OLDWS="$HOME/rexec-workspace"; WS_NOTE=""
-if [ -z "${REXEC_WS:-}" ] && [ -d "$OLDWS" ] && [ ! -L "$OLDWS" ]; then
-  if [ -e "$WS" ]; then WS_NOTE="$OLDWS was not moved: $WS already exists"
-  elif ls "$DET"/*.meta >/dev/null 2>&1; then WS_NOTE="$OLDWS was not moved: a detached job is still using it"
-  else mv "$OLDWS" "$WS" && WS_NOTE="$OLDWS moved to $WS"; fi
-fi
 mkdir -p "$WS" "$JOBS" "$DET" "$WSM" "$RD/scratch"
+
+# The workspace used to be ~/rexec-workspace, a visible entry in ~. Move rexec's own workspaces into $WS, with
+# their dependencies, rather than reinstall. Entry by entry, and retried at every start, because some stay:
+#   - one a running detached job works in: the job holds an absolute path into it (its body file names it);
+#   - one that is not rexec's (a CARGO_TARGET_DIR the user pointed there, say): something else may name its path;
+#   - one that already exists in $WS.
+# What stays is listed in the log; the old directory goes once it is empty.
+migrate_old_ws() {
+  [ -z "${REXEC_WS:-}" ] && [ -d "$OLDWS" ] && [ ! -L "$OLDWS" ] || return 0
+  _busy=$(sed -n "s#.*DIR='$OLDWS/\([^'/]*\).*#\1#p" "$DET"/*.body 2>/dev/null)
+  _moved=0; _left=""
+  for _e in "$OLDWS"/* "$OLDWS"/.[!.]*; do
+    [ -e "$_e" ] || continue
+    _n=$(basename "$_e")
+    case "$_n" in .DS_Store|.rexec-trash|_nosync) rm -rf "$_e"; continue;; esac
+    if [ ! -f "$WSM/$_n" ] && ! printf '%s' "$_n" | grep -Eq -e '--[0-9a-f]{6}$' -e '^[A-Za-z0-9_.-]{1,10}-[0-9a-f]{6}$'; then
+      _left="$_left $_n"; continue
+    fi
+    if [ -e "$WS/$_n" ] || printf '%s\n' "$_busy" | grep -qxF -e "$_n"; then _left="$_left $_n"; continue; fi
+    mv "$_e" "$WS/$_n" && _moved=$((_moved + 1))
+  done
+  rmdir "$OLDWS" 2>/dev/null
+  [ "$_moved" = 0 ] && [ -z "$_left" ] && return 0
+  WS_NOTE="$OLDWS: moved $_moved workspace(s) to $WS"
+  [ -z "$_left" ] || WS_NOTE="$WS_NOTE; left in place (in use, not made by rexec, or already in $WS):$_left"
+}
+OLDWS="$HOME/rexec-workspace"; WS_NOTE=""
+migrate_old_ws
 
 # Single instance: two agents fight over the queue, each claiming half the jobs and logging separately, which is brutal to diagnose.
 # The install command is idempotent and users re-run it often, so this has to be blocked here.
@@ -181,6 +199,10 @@ echo $$ > "$J_JOBS/$J_ID.pgid"
 # A directory of the job's own for logs, screenshots and QA data: what a command would otherwise drop in ~.
 mkdir -p "$J_SCRATCH"
 export REXEC_SCRATCH="$J_SCRATCH" TMPDIR="$J_SCRATCH"
+# The command runs in a login shell, and a profile that sets TMPDIR (a user's ~/.bash_profile often does) would
+# undo the line above. So the command sets it again, once the profile has run; a detached job's .cmd file gets
+# the same prefix, since J_CMD is what it writes out.
+J_CMD='export TMPDIR="$REXEC_SCRATCH"'$'\n'"$J_CMD"
 . "$HOME/.rexec/stray.sh"
 if [ "$J_SYNC" != "-" ]; then
   : > "$J_JOBS/$J_ID.syncing"
