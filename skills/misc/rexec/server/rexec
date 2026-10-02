@@ -6,6 +6,7 @@
 #   --with-git     include .git in the sync (opt-in; excluded by default)
 #   --light        declare a light job explicitly, exempt from the load gate
 #   --timeout N    run timeout in seconds (default 900; queue time excluded)
+#   --ephemeral    delete the mac workspace when the job ends (a one-off run on a throwaway checkout)
 #   --detach       launch on the mac and return at once; the job outlives this caller and the agent
 #   --wait ID      block until a detached job finishes, then print its receipt
 #   --tail ID      show the latest progress of a detached job and return
@@ -31,13 +32,14 @@ fmt_dur() {
 }
 
 SYNC_DIR="$PWD"; TIMEOUT=900; SUBCWD=""; WEIGHT=normal; WANT_MAC="${REXEC_MAC:-}"; WITHGIT=0
-DETACH=0; SAW_TIMEOUT=0; GC=0; APPLY=0
+EPHEMERAL=0; DETACH=0; SAW_TIMEOUT=0; GC=0; APPLY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --sync)    SYNC_DIR="$2"; shift 2;;
     --no-sync) SYNC_DIR="-"; WEIGHT=light; shift;;
     --light)   WEIGHT=light; shift;;
     --with-git) WITHGIT=1; shift;;
+    --ephemeral) EPHEMERAL=1; shift;;
     --timeout) TIMEOUT="$2"; SAW_TIMEOUT=1; shift 2;;
     --detach)  DETACH=1; shift;;
     --wait)    shift; exec "$BIN/rexec-wait" "$@";;
@@ -68,7 +70,7 @@ if [ "$GC" = 1 ]; then
 elif [ "$APPLY" = 1 ]; then
   echo "rexec: --apply only goes with --gc" >&2; exit 2
 fi
-[ $# -ge 1 ] || { echo "Usage: rexec [--mac NAME] [--sync DIR|--no-sync] [--with-git] [--light] [--timeout N|--detach] [--cwd SUB] '<command>'" >&2; exit 2; }
+[ $# -ge 1 ] || { echo "Usage: rexec [--mac NAME] [--sync DIR|--no-sync] [--with-git] [--ephemeral] [--light] [--timeout N|--detach] [--cwd SUB] '<command>'" >&2; exit 2; }
 CMD="$*"
 
 # --timeout is enforced by the agent, with a kill aimed at the job's process group; a detached job is in a
@@ -88,9 +90,9 @@ NOW=$(date +%s)
 if [ "$MACID" = "__none__" ]; then
   echo "rexec: no rexec agent is online, and no live ssh login names a mac." >&2
   echo "Run this in a terminal on the mac you want to use:" >&2
-  echo "  bash ~/rexec-agent.sh" >&2
+  echo "  bash ~/.rexec/agent.sh" >&2
   echo "If it is not installed yet:" >&2
-  echo "  ssh vps-2g 'cat /var/lib/rexec/agent.sh' > ~/rexec-agent.sh && bash ~/rexec-agent.sh" >&2
+  echo "  mkdir -p ~/.rexec && ssh vps-2g 'cat /var/lib/rexec/agent.sh' > ~/.rexec/agent.sh && bash ~/.rexec/agent.sh" >&2
   mac_list_hint
   exit 69
 fi
@@ -99,7 +101,7 @@ if ! mac_online "$MACID"; then
   HB=$(mac_hb "$MACID")
   if [ "$HB" = 0 ]; then WHEN="never sent a heartbeat"; else WHEN="heartbeat stopped $(( NOW - HB ))s ago"; fi
   echo "rexec: the agent on target mac '$MACID' is not online ($WHEN)." >&2
-  echo "Run this on that mac:  bash ~/rexec-agent.sh" >&2
+  echo "Run this on that mac:  bash ~/.rexec/agent.sh" >&2
   mac_list_hint
   exit 69
 fi
@@ -110,7 +112,7 @@ fi
 if [ "$WITHGIT" = 1 ] && ! grep -qw git "$M/caps" 2>/dev/null; then
   echo "rexec: the agent on '$MACID' predates --with-git." >&2
   echo "Restart it on that mac (Ctrl-C the agent terminal first):" >&2
-  echo "  ssh vps-2g 'cat /var/lib/rexec/agent.sh' > ~/rexec-agent.sh && bash ~/rexec-agent.sh" >&2
+  echo "  mkdir -p ~/.rexec && ssh vps-2g 'cat /var/lib/rexec/agent.sh' > ~/.rexec/agent.sh && bash ~/.rexec/agent.sh" >&2
   exit 2
 fi
 
@@ -120,7 +122,16 @@ fi
 if [ "$DETACH" = 1 ] && ! grep -qw detach "$M/caps" 2>/dev/null; then
   echo "rexec: the agent on '$MACID' predates --detach." >&2
   echo "Restart it on that mac (Ctrl-C the agent terminal first):" >&2
-  echo "  ssh vps-2g 'cat /var/lib/rexec/agent.sh' > ~/rexec-agent.sh && bash ~/rexec-agent.sh" >&2
+  echo "  mkdir -p ~/.rexec && ssh vps-2g 'cat /var/lib/rexec/agent.sh' > ~/.rexec/agent.sh && bash ~/.rexec/agent.sh" >&2
+  exit 2
+fi
+
+# --- --ephemeral needs an agent that deletes the workspace afterwards ---
+# An older agent would ignore the field and leave the workspace behind, which is what the caller asked not to happen.
+if [ "$EPHEMERAL" = 1 ] && ! grep -qw ephemeral "$M/caps" 2>/dev/null; then
+  echo "rexec: the agent on '$MACID' predates --ephemeral." >&2
+  echo "Restart it on that mac (Ctrl-C the agent terminal first):" >&2
+  echo "  mkdir -p ~/.rexec && ssh vps-2g 'cat /var/lib/rexec/agent.sh' > ~/.rexec/agent.sh && bash ~/.rexec/agent.sh" >&2
   exit 2
 fi
 
@@ -128,7 +139,7 @@ fi
 if [ "$GC" = 1 ] && ! grep -qw gc "$M/caps" 2>/dev/null; then
   echo "rexec: the agent on '$MACID' predates --gc." >&2
   echo "Restart it on that mac (Ctrl-C the agent terminal first):" >&2
-  echo "  ssh vps-2g 'cat /var/lib/rexec/agent.sh' > ~/rexec-agent.sh && bash ~/rexec-agent.sh" >&2
+  echo "  mkdir -p ~/.rexec && ssh vps-2g 'cat /var/lib/rexec/agent.sh' > ~/.rexec/agent.sh && bash ~/.rexec/agent.sh" >&2
   exit 2
 fi
 
@@ -181,6 +192,7 @@ JOB="$M/queue/.$ID.tmp"
   echo "TIMEOUT=$TIMEOUT"
   echo "WEIGHT=$WEIGHT"
   echo "WITHGIT=$WITHGIT"
+  echo "EPHEMERAL=$EPHEMERAL"
   echo "DETACH=$DETACH"
   echo "PROJECT=$PROJECT"
   echo "SUBMIT=$NOW"

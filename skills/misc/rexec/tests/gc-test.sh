@@ -128,6 +128,74 @@ is "...moved over from the legacy name, deps and all"    "no yes" "$(has "$WS/$P
 is "...and stamps its record"                            "$PSRC" "$(sed -n 's/^SRC64=//p' "$WSM/$PNEW" | openssl base64 -d -A)"
 stop_agent
 
+echo "- ephemeral jobs, scratch directories and strays in ~"
+rm -rf "$WS"/* "$WSM"/* "$M/queue"/* "$M/results"/*
+ESRC="$T/src/ephem"; mkdir -p "$ESRC"; echo e > "$ESRC/a.txt"; ws_key "$ESRC"; ENAME=$WS_NAME
+# The job writes to ~ the way a careless command does, and reports where TMPDIR points.
+printf 'ID=ephem-0004\nCMD=%s\nSYNC=%s\nSUBCWD=\nTIMEOUT=900\nWEIGHT=light\nWITHGIT=0\nEPHEMERAL=1\nPROJECT=%s\nSUBMIT=%s\nSEQ=4\n' \
+  "$(b64 'echo qa > ~/qa-data.log; mkdir ~/qa-dir; echo "$TMPDIR"')" "$(b64 "$ESRC")" "$ENAME" "$(date +%s)" > "$M/queue/ephem-0004.job"
+run_agent 3600
+done4() { [ -f "$M/results/ephem-0004.done" ]; }
+wait_for 30 done4
+EOUT=$(cat "$M/results/ephem-0004.out" 2>/dev/null)
+is "a job's TMPDIR is its own scratch directory"       "$T/home/.rexec/scratch/ephem-0004" "$(printf '%s\n' "$EOUT" | sed -n 2p)"
+is "...which exists"                                   yes "$(has "$T/home/.rexec/scratch/ephem-0004")"
+is "a receipt names what appeared in ~"                1   "$(printf '%s\n' "$EOUT" | grep -c 'appeared in ~.*qa-data.log.*qa-dir')"
+is "...and the record keeps the names"                 2   "$(grep -c 'ephem-0004' "$T/home/.rexec/strays" 2>/dev/null)"
+gone4() { [ ! -e "$WS/$ENAME" ]; }
+wait_for 20 gone4; is "--ephemeral deletes the workspace when the job ends" 0 "$?"
+stop_agent
+
+OUT=$(gc --dry-run)
+is "a dry run lists the strays, naming the job"        2   "$(printf '%s\n' "$OUT" | grep -c '~/qa-.*ephem-0004')"
+is "...and moves nothing"                              "yes yes" "$(has "$T/home/qa-data.log") $(has "$T/home/qa-dir")"
+OUT=$(gc --auto)
+is "the hourly run leaves them alone"                  "yes yes" "$(has "$T/home/qa-data.log") $(has "$T/home/qa-dir")"
+rm -rf "$T/home/qa-dir"
+OUT=$(gc --apply)
+is "--apply moves a stray to the home trash"           "no yes" "$(has "$T/home/qa-data.log") $(has "$T/home/.rexec/home-trash"/*/qa-data.log)"
+is "...and forgets one the user already removed"       0   "$(grep -c 'qa-dir' "$T/home/.rexec/strays")"
+
+# A job that is gone for good loses its scratch directory after the idle limit; a running one never does.
+mkdir -p "$T/home/.rexec/scratch/old-0005" "$T/home/.rexec/scratch/old-0006" "$T/home/.rexec/jobs"
+touch -t 202001010000 "$T/home/.rexec/scratch/old-0005" "$T/home/.rexec/scratch/old-0006"
+printf 'PROJECT=x\n' > "$T/home/.rexec/jobs/old-0006.meta"
+gc --auto >/dev/null
+is "an old scratch directory is removed"               "no yes" "$(has "$T/home/.rexec/scratch/old-0005") $(has "$T/home/.rexec/scratch/old-0006")"
+rm -f "$T/home/.rexec/jobs/old-0006.meta"
+
+# home-trash older than a week goes
+mkdir -p "$T/home/.rexec/home-trash/1577836800/stale"
+gc --auto >/dev/null
+is "the home trash is emptied after a week"            no  "$(has "$T/home/.rexec/home-trash/1577836800")"
+
+echo "- the same for a detached job"
+DSRC="$T/src/detach"; mkdir -p "$DSRC"; echo d > "$DSRC/a.txt"; ws_key "$DSRC"; DNAME=$WS_NAME
+printf 'ID=detach-0007\nCMD=%s\nSYNC=%s\nSUBCWD=\nTIMEOUT=900\nWEIGHT=light\nWITHGIT=0\nDETACH=1\nEPHEMERAL=1\nPROJECT=%s\nSUBMIT=%s\nSEQ=7\n' \
+  "$(b64 'sleep 1; echo qa > ~/det-data.log; echo "$TMPDIR"')" "$(b64 "$DSRC")" "$DNAME" "$(date +%s)" > "$M/queue/detach-0007.job"
+run_agent 3600
+done7() { [ -f "$M/detached/detach-0007.done" ]; }
+wait_for 30 done7
+DOUT=$(cat "$M/detached/detach-0007.out" 2>/dev/null)
+is "a detached job gets its scratch directory too"      1 "$(printf '%s\n' "$DOUT" | grep -c "^$T/home/.rexec/scratch/detach-0007$")"
+is "...and its receipt names what appeared in ~"        1 "$(printf '%s\n' "$DOUT" | grep -c 'appeared in ~.*det-data.log')"
+gone7() { [ ! -e "$WS/$DNAME" ]; }
+wait_for 20 gone7; is "an ephemeral detached job deletes its workspace once it is over" 0 "$?"
+stop_agent
+
+echo "- the workspace moves out of ~"
+H2="$T/home2"; mkdir -p "$H2/rexec-workspace/old--abc123/node_modules" "$H2/.rexec"
+start2() { HOME="$H2" PATH="$FAKE/bin:$PATH" REXEC_HOST=fake REXEC_MAC=$MAC REXEC_POLL=1 REXEC_GC_EVERY=0 \
+    REXEC_LOG="$T/agent2.log" bash "$AGENT" >/dev/null 2>&1 &
+  APID=$!; }
+mkdir -p "$H2/.rexec/detached"; : > "$H2/.rexec/detached/x-0001.meta"
+start2; wait_for 20 grep -qs "was not moved" "$T/agent2.log"; stop_agent
+is "a detached job still running keeps the old workspace where it is" "yes no" "$(has "$H2/rexec-workspace/old--abc123") $(has "$H2/.rexec/workspace/old--abc123")"
+is "...and the agent says why"                         1   "$(grep -c 'was not moved: a detached job' "$T/agent2.log")"
+rm -f "$H2/.rexec/detached/x-0001.meta"; rmdir "$H2/.rexec/workspace" 2>/dev/null
+start2; wait_for 20 test -d "$H2/.rexec/workspace/old--abc123/node_modules"; stop_agent
+is "otherwise ~/rexec-workspace moves into ~/.rexec, dependencies and all" "no yes" "$(has "$H2/rexec-workspace") $(has "$H2/.rexec/workspace/old--abc123/node_modules")"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ] || { echo "--- agent log"; tail -30 "$T/agent.log"; }
 rm -rf "$T"

@@ -74,7 +74,7 @@ mac_of_job() {
 }
 
 # ---- workspace names ----
-# A mac workspace is named so that `ls ~/rexec-workspace` says which repository made it:
+# A mac workspace is named so that `ls ~/.rexec/workspace` says which repository made it:
 #   <repo>--<hash6>                    the repository's main checkout
 #   <repo>--wt-<worktree>--<hash6>     a linked git worktree of it
 #   <repo>[--wt-<worktree>]--<sub>--<hash6>   a subdirectory synced on its own (/ becomes _)
