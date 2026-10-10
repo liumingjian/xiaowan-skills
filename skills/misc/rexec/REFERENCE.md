@@ -1,319 +1,92 @@
-# rexec troubleshooting reference
+# rexec reference
 
-The normal dispatch path never needs this file. Read it when the target mac cannot be resolved, when the
-load gate will not release, when you need an exit code's meaning, or when tuning the agent's environment
-variables.
+Read this file for initial setup, service management, interrupted work, output filtering, or artifact publication. The normal dispatch workflow is in [SKILL.md](SKILL.md).
 
-## Choosing the target mac
+## Fixed channel
 
-One VPS can have several macs attached. Machines are told apart by **ssh key, never by IP**: home IPs
-rotate, and a proxy can give one mac several addresses at once. Each mac logs in with its own key
-(`~/.ssh/vps-2g-rexec`), whose line in the server's `~agent/.ssh/authorized_keys` ends with the comment
-`rexec-mac=<MACID>`. sshd runs with `ExposeAuthInfo yes` (`/etc/ssh/sshd_config.d/50-rexec.conf`), so each
-login gets `$SSH_USER_AUTH`, a file naming the key it used, which sshd deletes when the login ends.
+The only pair is `vps-cc` and one Mac mini. The Mac uses the existing SSH alias with its proxy, host-key policy, and 120-second connection timeout. That alias uses Cloudflare Access/Tunnel and local SOCKS; public SSH is closed. The runtime does not discover machines, select a host, or fail over.
 
-Resolution order:
+A private dedicated worker credential binds the pair. Setup never prints it. Routing and receipts use opaque identifiers, not ComputerName, hostname, hardware UUID, source IP, or SSH fingerprints. Legacy machine flags and `REXEC_HOST`/`REXEC_MAC` overrides are rejected.
 
-1. `--mac <name or prefix>` (or the `REXEC_MAC` environment variable) — explicit; any unique prefix works,
-   e.g. `--mac studio`.
-2. **Login key** — the mac whose key this session's live ssh login used, taken **whether or not its agent is
-   currently up**. If it is down, that is exit **69** and a prompt to start the agent *on that mac*: a
-   different mac being online does not make it the target, and silently borrowing it runs the job on a
-   machine that has neither the user's attention nor the files they expect.
-3. **Exactly one mac online** — use it. An agent only runs where the user started it.
-4. **Several online** — the default set with `rexec --use <name>` (stored in `/var/lib/rexec/default`), if
-   it is one of them.
-5. Otherwise exit **3** and list the candidates. Set a default or re-run with `--mac`; do not guess.
+## Setup and service
 
-Step 2 only trusts a **live** login. A long-lived process such as a Claude daemon keeps the
-`SSH_USER_AUTH` of the login that started it, but sshd deleted that file when the login ended, so its
-background jobs skip step 2 instead of inheriting a stale mac.
+The repository provides deployment and user-service tooling; changing the checkout does not deploy the VPS or install the Mac service. Live setup needs the user's instruction.
 
-The agent's own logins are checked as well: `rexec-announce` and `rexec-claim` refuse a MACID other than the
-one the login key is tagged with. An untagged key (the old shared key) is let through.
+After the VPS installation is available, use the Mac wrapper:
 
-**Adding a mac.** On the mac, generate its own key, tagged with the identity the agent prints on its first
-line, and point the `vps-2g` alias at it:
+The VPS requires Python 3. Run `sudo bash install.sh` from this skill directory as the SSH account that will submit jobs. The installer preserves that initiating account as the owner of `/var/lib/rexec`, installs the three fixed endpoints under `/usr/local/bin`, and refuses an ambiguous direct-root installation. It does not provision a credential or start a service. On the Mac, `agent.sh` uses `uv` to locate Python; install the worker from a stable copy of the skill so its executable and package paths remain available.
 
 ```bash
-ssh-keygen -t ed25519 -N "" -C rexec-mac=<MACID> -f ~/.ssh/vps-2g-rexec
+bash agent.sh setup
+bash agent.sh service install
+bash agent.sh service start
+bash agent.sh service status
+bash agent.sh view [JOB]
 ```
 
-Then append `~/.ssh/vps-2g-rexec.pub` to the server's `~agent/.ssh/authorized_keys`, set
-`IdentityFile ~/.ssh/vps-2g-rexec` under `Host vps-2g` in the mac's `~/.ssh/config`, and restart the agent.
+`setup` provisions the dedicated credential through `vps-cc`. `service install` prepares the user LaunchAgent with explicit Python and program paths, environment, private stdout/stderr files, and restart policy. The service does not depend on interactive shell startup. Closing `view` leaves the service and supervisors running. `view` displays only safe events.
 
-The `origin` file under each mac is only the last IP it called from, shown in `rexec --macs`; routing never
-reads it.
+Supervisors run in separate sessions. The LaunchAgent also sets `AbandonProcessGroup` to preserve independent execution during worker shutdown, following [Apple's launchd contract](https://github.com/apple-oss-distributions/launchd/blob/main/man/launchd.plist.5).
 
-The agent derives its own identity name: `<first 12 chars of ComputerName>-<hardware UUID hash4>`, e.g.
-`macbook-pro-3f9a`. The hash suffix keeps two identically named machines from colliding. To rename, use
-`REXEC_MAC=custom-name bash ~/.rexec/agent.sh`.
+```bash
+bash agent.sh service stop
+```
 
-Each mac has its own queue, gate, and workspace, fully independent — including the same-project-serial
-rule, which is counted per mac: two commands from one project can run on macA and macB simultaneously,
-because each has its own workspace directory.
+Stopping the worker pauses claims and reporting. Healthy job supervisors keep running with their own deadlines. Restarting the worker reconciles the local journal and durable outbox before claiming new work. Use `rexec cancel JOB` to stop a particular job.
 
-## Syncing `.git`
+## Submission and snapshots
 
-The sync excludes `.git` by default: history is dead weight for a build, and on a long-lived repo it is the
-single largest thing in the tree. `--with-git` includes it.
+The VPS CLI is:
 
-Two consequences worth knowing:
+```bash
+rexec [--background] [--timeout SECONDS] [--sync DIR | --no-sync] [--cwd RELATIVE] [--with-git] [--request-id ID] 'shell command'
+rexec status [JOB]
+rexec queue
+rexec wait JOB [--wait-timeout SECONDS]
+rexec trace JOB [--after SEQUENCE]
+rexec cancel JOB
+rexec artifacts JOB --into DIR
+rexec gc [--apply]
+```
 
-- rsync leaves excluded paths on the receiver untouched, so a `.git` created **inside** the workspace (a
-  disposable baseline, say) survives every default sync — and is overwritten by the server's history the
-  first time `--with-git` runs.
-- The agent advertises its capabilities at announce time (`macs/<id>/caps`). An agent that predates
-  `--with-git` ignores the flag rather than failing, which would sync without history while the caller
-  believes otherwise, so `rexec` refuses the job up front with **exit 2** and asks for an agent restart on
-  that mac. Restarting the agent re-announces and clears it.
+Default submission durably enqueues, then waits. `--background` returns acceptance JSON immediately. Retrying a submission with the same `--request-id` is idempotent; retain that ID when recovering a lost acceptance response. Execution deadlines are finite, default 1800 seconds and range 1 to 86400. Wait timeout is separate from execution timeout.
 
-## Workspace names and cleanup
+`--no-sync` supplies an empty snapshot, not a previous project checkout. Submission freezes the input snapshot. The worker verifies its digest before extraction; rejected sync does not execute stale files. Sync excludes fixed secret paths, dependency caches, `.codex-out/`, and `.git` by default. Explicit history transfer excludes Git hooks and local credential configuration. Snapshot validation rejects unsafe paths, links, special files, and excessive file counts or bytes. Snapshot exclusions are fixed; do not infer them from `.gitignore`. Keep handoffs outside excluded secret and dependency paths.
 
-A workspace is named by `ws_key` in `server/rexec-lib.sh`: `<repo>--<hash6>` for a main checkout,
-`<repo>--wt-<worktree>--<hash6>` for a linked git worktree, an extra `--<sub>` when a subdirectory is
-synced on its own, and `<dir>--<hash6>` outside git. `<repo>` is the main checkout's directory name even
-inside a worktree. The hash is of the full server path, so every path - and therefore every worktree - gets
-a workspace of its own. That is what fills the disk, and what the cleanup exists for.
+Commands sharing a source workspace execute serially. Other workspaces can execute up to the configured concurrency bound. Tool-native dependency caches can persist, but cache reuse must respect ownership and prevent concurrent unsafe mutation. For Python work, use `uv` and reuse a suitable environment. Dependencies needed inside a network-restricted tool must be prepared before delegation.
 
-The agent keeps one record per workspace in `~/.rexec/ws/<name>`: the server path it syncs from, and when a
-job last used it (stamped when a job starts and again when it ends, detached jobs included). Cleanup runs
-from `~/.rexec/gc.sh`, which the agent writes at startup: once at startup, then hourly, in the background.
-Each action shows in the agent log as a `CLEAN` line naming the workspace, its size, and the reason.
+## Recovery and results
 
-| Workspace | What happens |
+The VPS owns durable submission, claims, cancellation intent, safe events, and committed results. The Mac owns the execution journal, supervisors, private raw logs, and durable result outbox. SQLite transactions and fsynced immutable blobs preserve these records.
+
+A claim request is durable before transport, so losing its response can be retried without claiming another job. Execution starts only after a durable launch record and gated supervisor agreement. Once start is reserved, arbitrary commands are never replayed automatically. Supervisors own the process group, finite deadline, and bounded log draining independently of SSH, the worker, or the caller.
+
+Lost contact, expired authorization, and sleep are connectivity conditions. Inspect status and trace after contact returns. Missing execution evidence produces an unknown outcome and keeps its workspace reserved. A reboot or unverifiable reused PID is not permission to rerun a command or signal that PID.
+
+The Mac seals a result before publication and retains its outbox until the VPS returns a matching job/digest acknowledgment after durable commit. Identical publication retries return the same acknowledgment; conflicting publications fail. Result completion and receipt acknowledgment are separate events. Repeated `wait` remains readable. Consumer and artifact acknowledgments follow validation and successful local writes.
+
+| Result | Exit behavior |
 |---|---|
-| a job is running, queued or detached in it | left alone, always |
-| its source directory is gone from the server | deleted with everything in it |
-| unused for `REXEC_GC_IDLE_DAYS` (3) | deleted - unless it holds files the server lacks |
-| idle, but holds files the server lacks (an `.env` dropped in by hand) | kept; logged once as `kept` with the file names |
-| old-style name `<basename10>-<hash6>`, its directory found on the server | renamed to the new name, dependencies intact |
-| old-style name, no directory on the server hashes to it | listed by `rexec --gc`; deleted only by `rexec --gc --apply` |
-| not created by rexec (`.echo-cargo-target-*`, `_nosync`) | listed by `rexec --gc` with its size, never deleted |
-| the job was run with `--ephemeral` | deleted when the job ends, unless another job is using it (a detached job: when it ends) |
+| Command completed | Actual command exit code |
+| Execution deadline expired | 124 |
+| Explicitly cancelled | 125 |
+| Wait deadline expired | 75, still pending |
+| Unknown execution | Distinct nonzero status with a fixed reason code |
 
-"Files the server lacks" is an rsync dry run against the source without the `.gitignore` filter but with the
-sync's own excludes (`node_modules/`, `target/`, ...). A missing file whose parent directory is missing on
-the server too counts as build output (`coverage/`, `out/`), not as a hand-placed file.
+Use the receipt's outcome to distinguish an infrastructure state from a program that returns the same numeric code. Wait interruption and viewer closure never cancel execution.
 
-- **The server is unreachable:** nothing is cleaned that round - without it a deleted source and a busy
-  project look the same as an idle one.
-- **Old-style workspaces** are traced by hashing directories under `REXEC_LEGACY_ROOTS` on the server
-  (default `/home /root /tmp /var/tmp /srv /opt`). A job that claims a path whose old-style workspace still
-  exists renames it on the spot as well.
-- **A deleted workspace is not lost work:** its source still lives on the server, and the next job on
-  that path syncs it again and reinstalls dependencies. A dropped `.env` goes with a workspace whose source is
-  gone, since nothing could use it any more.
-- **Everything rexec keeps on the mac lives in `~/.rexec/`**: `workspace/`, `scratch/<job>/`, `home-trash/`,
-  the agent's records, and `agent.sh` itself. Agents older than this moved nothing: their workspace was
-  `~/rexec-workspace` and their install `~/rexec-agent.sh`. A new agent moves the former in at startup,
-  workspace by workspace, and mentions the latter, which it never deletes. What stays is named in the agent
-  log, and the move is retried at every start; the old directory goes once it is empty. Three kinds stay: a
-  workspace a running detached job works in (the job holds absolute paths into it), an entry rexec did not
-  make (a `CARGO_TARGET_DIR` someone pointed there; moving it would break whatever names its path), and one
-  that already exists in the new place. Setting `REXEC_WS` opts out of the move.
-- **Scratch directories.** Each job runs with `REXEC_SCRATCH=~/.rexec/scratch/<job id>` and `TMPDIR` pointing
-  at it. `TMPDIR` is set again inside the command, after the login shell's profile has run, because a
-  profile that exports its own (`export TMPDIR=/tmp` is common) would otherwise win. gc removes scratch
-  directories whose job is over and that are older than `REXEC_GC_IDLE_DAYS`.
-- **Strays in `~`.** The job's runner (and a detached job's body) lists the visible entries of `~` before and
-  after the command. Whatever appeared is printed as a `[rexec] appeared in ~ ...` line at the end of the
-  output - so it is in `--wait`'s receipt too - and appended to `~/.rexec/strays` (name, job, time). It is
-  attribution by timing: a parallel job or the user can add an entry in the same window, which is why gc
-  only lists them. `rexec --gc` prints the ones still present; `--gc --apply` moves them to
-  `~/.rexec/home-trash/<time>/` and drops them after 7 days. The hourly run never touches `~`.
-- **`--ephemeral`** needs an agent that announces the `ephemeral` capability, like `--detach` and `--gc`.
-  The package managers' own caches (`~/.npm`, `~/.cache`, ...) are not in the workspace and survive it.
-- **`rexec --gc`** also prints the size of the big shared caches outside rexec (Docker's disk image,
-  `~/.npm`, `~/.cache`, `~/Library/Caches`, pnpm), as a pointer for the user. rexec never deletes them.
+## Output and artifacts
 
-## Detached jobs
+One export implementation produces all outbound receipts, safe events, result summaries, manifests, and artifact contents. Receipts/status/trace are bounded JSON. Safe events correlate by opaque `job_id` and sequence, and contain phase, elapsed time or duration, attempt, outcome, and fixed reason codes. Command text, private absolute paths, raw SSH stderr, credentials, and physical machine identifiers are private.
 
-`--detach` runs a job on the mac and returns as soon as it is launched. It exists because the alternative
-for a long build — a bigger `--timeout` — makes the job's survival depend on the caller's, and a session
-that is compacted or killed takes a two-hour build with it.
+Necessary command output is capped. Filtering strips terminal controls and redacts known private home/workspace paths, addresses, fingerprint patterns, credentials, and configured private literals. A filtering failure returns empty output with `OUTPUT_BLOCKED`; it never substitutes raw output. This protects known data in constrained publication. It cannot prevent an arbitrary program from intentionally encoding hidden data and does not sandbox execution.
 
-What it escapes, and how:
+Raw logs stay owner-only on the Mac and are capped while pipes continue draining. Truncation is explicit. Diagnose from safe receipts and trace first; inspect local private logs only when the user explicitly requests it. The runtime does not enumerate unrelated home files.
 
-- **`perl setpgrp` puts it in a process group of its own.** Every implicit kill in rexec is aimed at a
-  process group: cancel, timeout, and the sweep a new agent does over its predecessor's leftovers. None of
-  them can name this one. `nohup` on top of that makes closing the agent's terminal harmless.
-- **It reports its own result.** When the command exits, the detached process ssh's back to the server
-  itself, over its own connection rather than the agent's multiplexed one, and records the exit code and
-  log tail under `macs/<id>/detached/<ID>`. A detached job therefore finishes correctly on a mac whose
-  agent stopped hours ago. The agent is only the backstop, for a process killed before it could report.
-- **`--cancel` still reaches it**, because the agent records its process group id. Surviving every
-  *implicit* death is the goal; being unkillable is not.
+To publish results, write only the requested regular UTF-8 text files beneath `$REXEC_ARTIFACTS`, using safe relative names. Artifacts have file/count/byte bounds. Links, traversal, binary content, secrets, configuration files, and raw logs are refused. Prose is sanitized before hashing. A patch that needs sanitization is refused rather than modified, because rewriting a patch can corrupt it. Artifact refusal has no raw fallback.
 
-What it does not escape:
+`rexec artifacts JOB --into DIR` validates paths and hashes before atomic destination writes and acknowledgment. Artifact bytes never travel as base64 stdout. `delegate-to-codex` publishes only `response.md`, `changes.patch`, and `status.json`; its Codex JSONL and stderr stay on the Mac.
 
-- **The project's workspace slot.** A detached job left `running/` the moment it was launched, but it is
-  still building in that directory, so the scheduler keeps it counted: a later job from the same project
-  waits, exactly as it would for a foreground one. Other projects are unaffected. It also counts toward
-  the "nothing is running, let one job through regardless" escape hatch in the load gate, so three
-  detached builds cannot make the mac look idle.
-- **A mac reboot.** Process group ids mean nothing across a boot, so the record carries the boot time too.
+## Retention
 
-Collecting it:
-
-- `rexec --wait <ID>` blocks until it finishes, then prints the same receipt a foreground job would have:
-  log tail, bill line, exit code. Waiting twice is fine, and a job that finished before anyone waited is
-  collected just the same — its record is kept for a week.
-- `rexec --tail <ID> [-n N]` reads a snapshot of the log that the agent pushes to the server every
-  `REXEC_TAIL` seconds (default 15). It never touches the mac, so it is free, and at most that stale. The
-  full log lives on the mac at `~/.rexec/detached/<ID>.log` for a week.
-- **When the agent is offline, nothing judges a detached job.** The process reports itself; the agent is
-  what notices when it never got the chance. With the agent down, `--wait` says so on stderr and keeps
-  waiting rather than declaring a job dead because the user closed a terminal. Once the agent is back, a
-  process group that is gone is reported as **exit 129** on its first poll.
-- Like `--with-git`, an agent that predates `--detach` makes `rexec` refuse the job with **exit 2** and ask
-  for a restart on that mac. Running it as a normal job instead would give the caller a receipt for
-  something it believes is detached, which would then die at the 900s timeout.
-
-## Parallelism and queueing
-
-- **Parallel across projects, serial within a project.** Two commands from one project share a workspace
-  directory, and running them together would shred each other's files.
-- **First-come, first-served, but a blocked job is stepped over.** Each poll claims the earliest job that
-  can actually run. Only same-project jobs queue behind each other; work from other projects flows past.
-  Execution order is therefore no longer globally predictable — project B can overtake project A — which is
-  the price of the property that matters more: one long build can no longer stop the whole mac. It used to.
-  `--queue` states what each job is blocked by.
-- **Load gate, three bands.** The agent samples the mac's CPU and memory pressure every few seconds and
-  decides whether to accept another **heavy** job:
-  - CPU below `REXEC_CPU_RELAX` (default 40%) — take it immediately, no cooldown. This is the normal path
-    for cross-project parallelism.
-  - 40% to 80% — take at most one job per `REXEC_COOLDOWN` (default 15s), damping the overshoot that comes
-    from CPU readings lagging reality.
-  - Above `REXEC_CPU_MAX` (default 80%), or free memory below 20% — close the gate and leave the machine to
-    whatever the user is doing; it reopens on its own once things settle.
-  - Two exemptions: **light jobs** (`--no-sync` / `--light`) ignore the gate entirely, and when nothing at
-    all is running one job is claimed regardless of the gate (otherwise a persistently busy mac would stall
-    the queue forever). Detached jobs count as running for that second exemption.
-- Queue time does **not** count against `--timeout`, which measures run time only, so yielding for a long
-  while never causes a false timeout.
-
-## When the caller dies without saying so
-
-The mirror image of the section below, and the other half of a queue that stops moving. Pressing ESC is a
-clean stop: `rexec` traps it and cancels the job properly. A session that is killed outright is not — it is
-compacted away, OOM-killed on a small VPS, or loses its ssh link — and it leaves behind a job that nobody
-will ever collect.
-
-Every `rexec` client therefore writes the current time into `macs/<id>/alive/<ID>`, once before it submits
-and again on every second of its wait loop. `rexec-claim` reads it on each poll:
-
-- a **queued** job whose heartbeat stopped more than `REXEC_CALLER_GRACE` (default 90s) ago is dropped;
-- a **running** one gets a cancel marker, and the agent terminates it like any other cancel.
-
-This closes the gap that made a restart useless. Nothing else expires a *queued* job — `rexec-announce`
-only ever reaped running ones — so an abandoned job kept its place in the queue across every agent restart,
-and while it sat there its project-mates sat behind it. Restarting the agent was the one action that could
-not fix it, which is exactly the action a stuck queue invites.
-
-A job carrying **no** heartbeat file at all is left alone: it came from a client that predates this, and
-grandfathering costs one stale job that finishes by itself, where the opposite default would reap every
-in-flight job the moment the server is upgraded.
-
-## When the agent dies without saying so
-
-Ctrl-C is a clean stop: the agent kills every job it is running and reports each one, so no caller is left
-waiting. `kill -9`, a closed terminal, a lost ssh session or a sleeping mac are not, and they used to leave
-two kinds of wreckage that **restarting the agent did not clear** — which is a trap, because restarting is
-the one thing a user reaches for when the queue stops moving:
-
-- **On the mac**, the job's process group kept running. A build can burn cores for days, and the load gate
-  reads that CPU and refuses to claim anything new.
-- **On the server**, the job stayed listed as running, so every later job from the same project queued
-  behind a job that had already died, and nothing ever timed it out: `--timeout` is enforced by the agent,
-  and that agent is gone.
-
-Three mechanisms now clear it, and none of them needs the user to do anything beyond restarting the agent:
-
-1. **The agent, at startup**, kills the process groups its predecessor left behind, before wiping the job
-   records that name them. Process group IDs mean nothing across a reboot, so they are only killed when the
-   boot time recorded with them still matches — after a reboot the processes are gone anyway.
-2. **`rexec-announce`, at startup**, finishes every job the server still has marked running for that mac. A
-   freshly started agent runs nothing by definition, so all of them are stale.
-3. **`rexec-claim`, on every poll**, compares the running list the agent reports with the server's own. A job
-   only the server still holds is stranded and gets finished, after a grace period (`REXEC_STRAND_GRACE`,
-   default 120s) that covers the gap between claiming a job and the agent's next poll. This catches an agent
-   that is alive but lost track of a job, and needs no restart at all. The agent keeps a finished job on
-   that list until its result has actually reached the server, retrying the report on every poll (the
-   terminal shows `WARN ... retrying every poll`). Otherwise one report lost to a flaky link turned a job
-   that finished fine into a 129. Detached jobs get the same grace, because the first poll after a launch
-   can go out before the launch is registered.
-4. **`rexec-claim`, by age**, is what reaches a mac whose agent predates mechanism 3 and therefore sends no
-   list. With nothing to compare against it goes by age alone: the agent is what enforces `--timeout`, so an
-   entry outliving its own timeout by a wide margin (`REXEC_STRAND_SLACK`, default 300s) proves no agent is
-   there to enforce anything. A job the agent does report as running is never reaped by age, however long it
-   has been going.
-
-Stranded jobs finish with **exit 129** and an explanation in their output, so whoever was blocked on them is
-released instead of waiting forever. An agent older than this reports no running list, which limits it to
-mechanism 4 until it restarts.
-
-## Blast radius of a cancel
-
-`--cancel` kills **only that job's process group**. Other running jobs and the agent itself are untouched.
-A job still waiting in the queue is simply removed without touching the mac at all. Cancelled jobs exit
-with **125**. IDs are globally unique and searched across every mac, so you never need to know which mac a
-job is on.
-
-## Exit codes
-
-- `3` — several macs are online, and neither a live login nor the `rexec --use` default picks one; or a
-  `--mac` name matches no mac or several. Set a default or re-run with `--mac`.
-- `69` — the agent on **this session's mac** is offline or has never been started there, or no agent is
-  online at all. Go back to the `OFFLINE` branch of step 1 in SKILL.md to walk the user through starting
-  it, then re-run the command. Not a cue to retarget another mac with `--mac`.
-- `90` — rsync failed. `91` — target directory does not exist.
-- `124` — run timed out (exceeded `--timeout`; queue time excluded).
-- `125` — job cancelled (`--cancel`, or the caller pressed ESC). For a detached job `--cancel` is the only
-  thing that produces it.
-- `129` — the job was stranded: the agent that was running it died without reporting (kill -9, closed
-  terminal, mac asleep), so the server finished it on the agent's behalf. For a detached job it means the
-  process group is gone without a result — killed from outside, or the mac rebooted. Re-run the command.
-- `130` — the agent on the mac was stopped with Ctrl-C, taking the job with it.
-- `70` — no such job on any mac: it vanished from the queue without producing a result (someone cleaned
-  the state tree by hand), or a `--wait` / `--tail` names an ID that never existed or has aged out of the
-  week-long detached history. Re-run the command.
-- anything else — the real exit code of the command itself on the mac.
-
-On failure `rexec` writes the reason and the next step to stderr itself; this table is only a quick lookup.
-
-## Agent environment variables (rarely worth changing)
-
-| Variable | Purpose | Default |
-|---|---|---|
-| `REXEC_MAC` | this machine's identity name | derived automatically |
-| `REXEC_HOST` | ssh target | `vps-2g` |
-| `REXEC_WS` | workspace | `~/.rexec/workspace` |
-| `REXEC_POLL` | poll interval | 2s |
-| `REXEC_CPU_MAX` | CPU ceiling % that closes the gate | 80 |
-| `REXEC_CPU_RELAX` | CPU floor % below which cooldown is ignored | 40 |
-| `REXEC_MEM_MIN` | free memory floor % | 20 |
-| `REXEC_COOLDOWN` | claim cooldown, seconds | 15 |
-| `REXEC_TAIL` | how often a detached job's log tail is pushed to the server, seconds | 15 |
-| `REXEC_LOG` | write the agent log to this file | no log file |
-| `REXEC_GC_EVERY` | seconds between workspace cleanups; 0 turns them off | 3600 |
-| `REXEC_GC_IDLE_DAYS` | days unused before a workspace (or a job's scratch directory) is cleaned up | 3 |
-
-Server side: `REXEC_CALLER_GRACE` (default 90s) is how long a job may go without a caller heartbeat before
-the server treats it as abandoned, `REXEC_STRAND_GRACE` (default 120s) is how long a job may be missing from the agent's reported
-running list before the server treats it as stranded, `REXEC_STRAND_SLACK` (default 300s) is how far past its
-own `--timeout` a job may sit in the running list before the same happens, and `REXEC_ROOT` relocates the
-state tree (tests only).
-
-The agent sends everything through one multiplexed ssh connection (ControlMaster) and rebuilds it on
-the next poll whenever it is gone. sshd drops it when the home link stalls (`Timeout, client not
-responding` in the server's auth log). The agent used to build it only once, at startup, so after the
-first stall every poll, sync and report opened a fresh login, and those are the connections a flaky link
-cuts before the handshake (`Connection closed by <vps> port <port>`, `connection lost, retrying in 5s`).
-
-`tests/queue-test.sh` covers the server side and runs anywhere. `tests/agent-test.sh` runs the real agent
-against the real server scripts through a fake `ssh` that can drop reports or kill the master, and needs a
-mac: `rexec 'bash skills/misc/rexec/tests/agent-test.sh'`. Neither touches the live queue or agent.
-
-To get the agent log on disk use `REXEC_LOG`, not a shell `>` redirect — bash's block buffering holds log
-lines in the buffer instead of writing them out.
+Low disk space pauses claims and spawn. GC preserves active jobs, unknown execution, and unacknowledged results. Acknowledged results have a default retention of seven days. `rexec gc` previews eligible cleanup; `rexec gc --apply` applies it. Cleanup does not cancel work or scan unrelated home files.

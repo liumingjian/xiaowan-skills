@@ -1,82 +1,31 @@
 ---
 name: delegate-to-codex
-description: Send this project to Codex on the user's Mac for a second opinion or a patch. Use when the user wants a spec, plan, page, or change reviewed by Codex, or an agreed plan carried out by Codex.
+description: Send this project to Codex on the paired Mac mini for a second opinion or a patch.
 ---
 
 # Delegate to Codex
 
-The mirror of `delegate-to-cc`: that one hands work from Codex to Claude Code on `vps-2g`, this one hands
-work from here to the **Codex CLI on the user's Mac**. Codex is a **second opinion**, never the authority.
-You own the handoff, the final judgment, and verification.
-
-The server cannot reach the Mac (home NAT), so the only channel is the `rexec` skill: the Mac's resident
-agent pulls the job. `rexec` also decides **which** Mac — the one this session ssh'd in from, identified by
-`ComputerName` plus a hardware-UUID hash rather than by IP, so a changing IP never misroutes a job.
-`scripts/delegate.sh` wraps all of it.
+Use the Codex CLI on the paired Mac mini through `rexec`. You own the handoff, final judgment, and verification. This skill is user-invoked and consumes Codex quota.
 
 ## Process
 
-1. **Dispatch a sub-agent.** Codex output runs to thousands of lines; keeping it out of this context is the
-   point. Give the sub-agent this file, the handoff path, and the mode, and require **a receipt back**:
-   verdict, findings, artifact paths, `THREAD_ID`. Fifty lines, no transcript.
-
-2. **Choose one mode.**
-
-   - `consult` (default) for review, diagnosis, architecture, or a recommendation. Codex is sandboxed
-     read-only and the patch comes back empty.
-   - `implement` when the user wants Codex to carry out an agreed plan. Codex may edit the synced copy and
-     run commands in it.
-
-   The mode is settled when the requested deliverable is either advice or a patch.
-
-   **Settle the model.** The default is `gpt-6-astra` at `xhigh` effort. Unless the user has already named
-   a model or effort in this conversation, ask once before dispatching, showing the default and the
-   override format:
-
-   ```
-   model:<model>
-   effort:<effort>
-   ```
-
-   Either line may be omitted; an omitted line keeps its default, and a reply that accepts the default
-   settles it. Pass the result as `--model` and `--effort`.
-
-3. **Write the handoff** as Markdown, following `references/handoff.md` beside this file. Save it under
-   the project root and check that `.gitignore` does not match it: `rexec` syncs the directory, and a
-   handoff it would never carry is refused rather than sent as a dangling path.
-
-4. **Install dependencies first, if the task needs them.** The Codex sandbox has **no network**, so a build
-   or test run inside it fails on a missing dependency. Split the work the way the two channels split:
-   **`rexec` runs, Codex thinks and writes.** Use `/rexec` to install and warm the workspace, then delegate.
-
-5. **Run it from the project root** (`rexec` syncs the current directory). Resolve `SKILL_DIR` to the
-   directory holding this file:
+1. Dispatch a subagent with this file and the handoff path. Require a receipt of at most fifty lines with verdict, findings, artifact paths, `JOB_ID`, and `THREAD_ID`. The subagent runs the delegation and never applies a patch.
+2. Choose `consult` for advice or review, or `implement` for an agreed change. Consult is read-only and returns an empty patch; implement can edit and run checks in the synced copy. The default model is `gpt-6-astra` with `xhigh` effort. If the user already chose a model or effort, use it. Otherwise settle the choice once before dispatch and pass it through `--model` and `--effort`.
+3. Write the handoff under the project root using [references/handoff.md](references/handoff.md). Keep it outside rexec's fixed secret and dependency exclusions. If the task needs dependencies, prepare the workspace through `rexec` first; the Codex workspace-write sandbox has no network.
+4. From the project root, run the wrapper, resolving `SKILL_DIR` to this skill's directory:
 
    ```bash
    "$SKILL_DIR/scripts/delegate.sh" --mode consult --prompt-file ./handoff.md \
      --model gpt-6-astra --effort xhigh
    ```
 
-   Add `--with-git` when the review depends on history — a base-branch or single-commit review, or "what
-   changed and why". It syncs the whole repository history, so leave it off otherwise. Add
-   `--resume <THREAD_ID>` to continue an earlier Codex thread. See `--help` for mac, timeout, and output
-   options. A successful run prints `STATUS=0` plus paths for `response.md`, `changes.patch`, and
-   `codex.jsonl`; the bulk stays on disk under `.codex-out/`, never in context. On any other status, read the
-   error line — it names the next action — and report the failed delegation rather than retrying blind.
-   On `GITIGNORE_HINT`, add `.codex-out/` to `.gitignore`.
+   Add `--with-git` for history-based review and `--resume THREAD_ID` for explicit continuation. See `--help` for timeout and output options. The wrapper submits durably in the background, prints `JOB_ID`, waits, and fetches `response.md`, `changes.patch`, and `status.json` under `.codex-out/`. `STATUS=0` indicates Codex success. Other command exit codes pass through; 124 means execution timeout, 125 cancellation, and 75 a pending wait. Read the safe error and status before deciding whether another submission is appropriate.
+5. Read the response in full. For implement mode, run `git apply --check`, inspect every hunk, and show the diff to the user. Apply accepted changes yourself and rerun the relevant checks through `rexec`. Finish when every hunk has a deliberate disposition and accepted changes pass verification. Codex's own test claims guide review; they do not replace your checks.
 
-6. **Adjudicate here.** Read `response.md` in full. For `implement`, run `git apply --check` as a preflight,
-   then inspect **every hunk** and show the user the diff. Apply only what the user accepts, and apply it
-   yourself — the sub-agent never applies a patch. Codex's own test runs help it converge and are not
-   evidence: re-run the checks through `/rexec` on the applied result.
+## Recovery and privacy
 
-   Done when every hunk is accepted or rejected on purpose, and the accepted ones pass a real run.
+`rexec` connects only `vps-cc` and the paired Mac mini. Setup and user-service management belong to the [rexec skill](../../misc/rexec/SKILL.md). A closed viewer, interrupted wait, or lost conversation leaves the job running until completion, explicit cancellation, or its finite deadline. Recover with `rexec wait JOB` and `rexec artifacts JOB --into DIR`; never automatically resubmit an unknown outcome.
 
-## Notes
+Codex JSONL and stderr remain bounded private files on the Mac. Use the safe response, patch, and status as evidence. Output filtering can block export, and a patch requiring sanitization is refused intact. There is no raw-log fallback or automatic private-log inspection. Filtering covers known private data; it cannot prevent a program deliberately encoding hidden data.
 
-- The Mac workspace is not a clone of your repo unless you ask for one: `rexec` excludes `.git` by default.
-  In `implement` mode `delegate.sh` commits a disposable baseline there purely to diff against, so the patch
-  holds Codex's edits and nothing else. `--with-git` brings the real history over, which is what makes
-  `codex exec review --base <branch>` possible in the handoff.
-- `--with-git` needs a Mac agent new enough to know the flag. If `rexec` refuses, ask the user to restart the
-  agent on that Mac; a second Mac being ready is not a reason to retarget.
+`implement` records a disposable baseline inside the synced workspace so its patch contains only Codex's changes. Consult leaves history intact. `--with-git` transfers real history with rexec's credential/hook exclusions. Validate the returned patch before use and keep returned results in the fixed-excluded `.codex-out/` directory or outside the synced source. `.gitignore` does not control rexec transfer.

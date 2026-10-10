@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-# Runs on the Mac, inside the rexec workspace (cwd). Emits one base64 tarball on stdout.
+umask 077
 
 mode="${1:-}"
 prompt_rel="${2:-}"
@@ -11,114 +10,138 @@ effort="${5:-}"
 
 case "$mode" in
   consult|implement) ;;
-  *) printf 'invalid mode: %s\n' "$mode" >&2; exit 64 ;;
+  *) printf 'invalid delegate mode\n' >&2; exit 64 ;;
 esac
 [[ -f "$prompt_rel" && -s "$prompt_rel" ]] || {
-  printf 'handoff not found in the synced workspace: %s\n' "$prompt_rel" >&2
+  printf 'handoff not found in the frozen workspace\n' >&2
   exit 65
 }
-
-export PATH="$HOME/.local/bin:$PATH"
+[[ -n "${REXEC_ARTIFACTS:-}" && -d "$REXEC_ARTIFACTS" && ! -L "$REXEC_ARTIFACTS" ]] || {
+  printf 'dedicated artifact directory unavailable\n' >&2
+  exit 70
+}
+command -v python3 >/dev/null 2>&1 || { printf 'python3 unavailable\n' >&2; exit 66; }
 codex_bin="$(command -v codex || true)"
-if [[ -z "$codex_bin" ]]; then
-  codex_bin="$(bash -ilc 'command -v codex' 2>/dev/null | tail -n 1)"
-fi
 [[ -n "$codex_bin" && -x "$codex_bin" ]] || {
-  printf 'codex CLI not found on this Mac.\n' >&2
+  printf 'codex CLI unavailable on the paired Mac mini\n' >&2
   exit 66
 }
 
-out="$(mktemp -d "${TMPDIR:-/tmp}/delegate-to-codex.XXXXXXXX")"
-trap 'rm -rf -- "$out"' EXIT
+private_out="$(mktemp -d "${TMPDIR:?}/delegate-private.XXXXXXXX")"
+out="$REXEC_ARTIFACTS"
+for artifact in response.md changes.patch status.json; do
+  [[ ! -e "$out/$artifact" && ! -L "$out/$artifact" ]] || exit 70
+done
 
-# A baseline to diff Codex's edits against. Only implement mode needs one, and skipping it in consult
-# mode leaves real history (synced by `rexec --with-git`) pristine for Codex to review against a base branch.
 if [[ "$mode" == "implement" ]]; then
-  if [[ ! -d .git ]]; then
+  if [[ ! -e .git ]]; then
     git init -q
   fi
-  git config user.name "Codex Delegate"
-  git config user.email "codex-delegate@localhost"
-  git add -Af
-  git commit -qm baseline --allow-empty
+  git -c core.hooksPath=/dev/null -c commit.gpgsign=false \
+    -c user.name='Codex Delegate' -c user.email='codex-delegate@localhost' add -A
+  git -c core.hooksPath=/dev/null -c commit.gpgsign=false \
+    -c user.name='Codex Delegate' -c user.email='codex-delegate@localhost' \
+    commit -qm baseline --allow-empty
 fi
 
-prompt="$out/full-prompt.md"
+prompt="$private_out/full-prompt.md"
 case "$mode" in
   consult)
-    cat >"$prompt" <<'EOF'
+    cat >"$prompt" <<'PROMPT'
 You are the second-opinion engineer, working in a synced copy of the project. Read only; the sandbox
 blocks writes. Inspect every relevant file before deciding, ground the recommendation in repository
 evidence, name the strongest alternative, and state where your confidence ends. Match depth to the
 decision. The handoff follows.
 
 --- HANDOFF ---
-EOF
+PROMPT
     sandbox="read-only"
     ;;
   implement)
-    cat >"$prompt" <<'EOF'
+    cat >"$prompt" <<'PROMPT'
 You are the implementation engineer, working in a synced copy of the project. Edit files here and run
-commands to check your own work; the sandbox has no network, so installing dependencies fails and is
-not your job. Implement the smallest complete solution, preserve unrelated behaviour, and end with the
-exact checks the caller should re-run plus the remaining risks. Your test runs help you converge; they
-are not the caller's evidence. The handoff follows.
+commands to check your own work; the sandbox has no network, so dependencies must already be available.
+Implement the smallest complete solution, preserve unrelated behavior, and end with the exact checks
+the caller should rerun plus remaining risks. Your test runs help you converge; the caller verifies the
+accepted patch independently. The handoff follows.
 
 --- HANDOFF ---
-EOF
+PROMPT
     sandbox="workspace-write"
     ;;
 esac
 cat "$prompt_rel" >>"$prompt"
 
 codex_args=(exec)
-if [[ -n "$resume_id" ]]; then
-  codex_args+=(resume)
-fi
-# `codex exec resume` takes neither -s nor -C, so the sandbox goes through -c and the
-# working directory is simply this process's cwd (the rexec workspace).
+[[ -z "$resume_id" ]] || codex_args+=(resume)
+# Resume uses the process cwd; sandbox settings go through configuration for both modes.
 codex_args+=(
   -c "sandbox_mode=$sandbox"
   --json
   --skip-git-repo-check
   -o "$out/response.md"
 )
-if [[ -n "$model" ]]; then
-  codex_args+=(-m "$model")
-fi
-if [[ -n "$effort" ]]; then
-  codex_args+=(-c "model_reasoning_effort=$effort")
-fi
-# The session id is positional and must follow the options.
-if [[ -n "$resume_id" ]]; then
-  codex_args+=("$resume_id")
-fi
+[[ -z "$model" ]] || codex_args+=(-m "$model")
+[[ -z "$effort" ]] || codex_args+=(-c "model_reasoning_effort=$effort")
+[[ -z "$resume_id" ]] || codex_args+=("$resume_id")
 codex_args+=(-)
 
 set +e
-"$codex_bin" "${codex_args[@]}" <"$prompt" >"$out/codex.jsonl" 2>"$out/codex.stderr"
+python3 - "$private_out" "$prompt" "$codex_bin" "${codex_args[@]}" <<'RUN'
+import pathlib, subprocess, sys, threading
+private = pathlib.Path(sys.argv[1])
+limit = 4 * 1024 * 1024
+marker = b"\n[delegate log truncated]\n"
+
+def drain(pipe, path):
+    remaining = limit - len(marker)
+    truncated = False
+    with path.open("xb") as destination:
+        while block := pipe.read(65536):
+            kept = min(len(block), remaining)
+            destination.write(block[:kept])
+            remaining -= kept
+            if kept < len(block) and not truncated:
+                destination.write(marker)
+                truncated = True
+    pipe.close()
+
+with open(sys.argv[2], "rb") as prompt:
+    process = subprocess.Popen(sys.argv[3:], stdin=prompt, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    readers = [threading.Thread(target=drain, args=(pipe, private / name))
+               for pipe, name in ((process.stdout, "codex.jsonl"), (process.stderr, "codex.stderr"))]
+    for reader in readers:
+        reader.start()
+    status = process.wait()
+    for reader in readers:
+        reader.join()
+sys.exit(status if status >= 0 else 128 - status)
+RUN
 codex_status=$?
 set -e
 
 [[ -f "$out/response.md" ]] || : >"$out/response.md"
 : >"$out/changes.patch"
 if [[ "$mode" == "implement" ]]; then
-  git add -Af
-  git diff --cached --binary --no-ext-diff >"$out/changes.patch"
+  git -c core.hooksPath=/dev/null add -A
+  git diff --cached --binary --no-ext-diff --no-textconv >"$out/changes.patch"
 fi
 
-sed -n 's/.*"thread_id":"\([^"]*\)".*/\1/p' "$out/codex.jsonl" | head -n 1 >"$out/thread-id"
-printf '%s\n' "$codex_status" >"$out/status"
-
-tar_opts=()
-for opt in --no-xattrs --no-mac-metadata; do
-  if tar "$opt" -cf /dev/null -T /dev/null >/dev/null 2>&1; then
-    tar_opts+=("$opt")
-  fi
-done
-COPYFILE_DISABLE=1 tar ${tar_opts[@]+"${tar_opts[@]}"} -czf "$out/results.tar.gz" -C "$out" \
-  response.md changes.patch codex.jsonl codex.stderr thread-id status
-
-printf '===DELEGATE_TO_CODEX_RESULTS_B64===\n'
-base64 <"$out/results.tar.gz"
-printf '===DELEGATE_TO_CODEX_END===\n'
+python3 - "$private_out/codex.jsonl" "$out/status.json" "$codex_status" <<'PY'
+import json, re, sys
+thread = None
+with open(sys.argv[1], encoding="utf-8", errors="replace") as events:
+    for line in events:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        candidate = event.get("thread_id") if isinstance(event, dict) else None
+        if isinstance(candidate, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", candidate):
+            thread = candidate
+            break
+with open(sys.argv[2], "x", encoding="utf-8") as destination:
+    json.dump({"status": int(sys.argv[3]), "thread_id": thread}, destination)
+    destination.write("\n")
+PY
+exit "$codex_status"

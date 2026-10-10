@@ -1,185 +1,49 @@
 ---
 name: rexec
-description: Dispatch work that has to actually run — and that eats memory or time — to the user's mac, bypassing this memory-starved server. Covers compiling and building, installing dependencies, creating virtualenvs, running test suites, starting services for end-to-end checks, and docker containers or image builds. Dispatches long builds to the mac's background with `--detach` and collects them later, so a job too long to wait for is not a job you have to babysit. Also takes `/rexec queue` to see the queue, `/rexec cancel <ID>` to cancel a job, `/rexec macs` to see which macs are online, and `/rexec gc` to clean up workspaces the mac no longer uses.
+description: Run builds, dependency installation, test suites, services for end-to-end checks, and other memory-intensive or long-running commands from vps-cc on the user's Mac mini. Use for durable background work, collecting results or text artifacts, inspecting the queue or safe trace, cancelling jobs, and cleaning retained work.
 ---
 
 # rexec
 
-This server is memory-starved; tests and builds routinely fail on it. `rexec` **dispatches** that work to
-the user's mac (8 cores / 16GB): the server writes a job into a queue, a resident agent on the mac polls
-for it, rsyncs the code over, runs it locally, and ships back the output and exit code.
-Pull-based rather than reverse SSH because the user's home connection sits behind NAT — the server
-cannot reach the mac.
+`rexec` sends a frozen project snapshot from `vps-cc` to one Mac mini. A user background service pulls jobs; independent supervisors execute them with finite deadlines. Jobs survive conversation loss, interrupted waits, closed viewers, and worker restarts.
 
-The environment is fixed: SSH alias `vps-2g` (defined in the mac's `~/.ssh/config`, override with
-`REXEC_HOST`); each mac logs in with its own key `~/.ssh/vps-2g-rexec`, tagged `rexec-mac=<MACID>` in the
-server's `authorized_keys`; mac workspace `~/.rexec/workspace/<repo>[--wt-<worktree>]--<pathhash>/` (hidden: rexec adds nothing visible to the mac's `~`).
+## Workflow
 
-**Multiple macs are first-class.** Each mac's agent has its own identity and its own queue on the server.
-**A job goes to this session's mac**: the one whose key its live ssh login used. A session with no live
-login (a background job) goes to the only online mac, or, when several are online, to the default set with
-`rexec --use <name>`. A different mac having an agent up is never a substitute for the named one, and rexec
-asks you to start the agent on the right one instead of quietly using it. IP addresses play no part.
-**Jobs from different projects run in parallel; jobs from the same project run serially** (they share one
-workspace), counted per mac.
-The caller blocks until the result arrives, and gets a bill of queue time and run time at the end — unless
-the job is dispatched with `--detach`, which returns as soon as it is launched.
+1. Run `rexec status` to inspect existing work. For initial setup, authorization, or service management, read [REFERENCE.md](REFERENCE.md#setup-and-service). Report the required action without installing or changing a live service unless the user requested it.
+2. Submit the command from the project root. The default sync captures the current directory; use `--sync DIR` for another source, `--cwd RELATIVE` for a subdirectory, or `--no-sync` for a fresh empty workspace when checking system tools. Add `--with-git` only when the command needs history. Keep the command unattended and its necessary output short. Preserve the command's exit status when narrowing output.
 
-## Sub-commands
+   ```bash
+   rexec "bash -o pipefail -c 'pytest -q 2>&1 | tail -30'"
+   rexec --sync ./project --cwd frontend 'npm run build'
+   rexec --no-sync 'node --version'
+   ```
 
-When the user types `/rexec queue`, `/rexec cancel ...` or `/rexec gc`, run the matching command and hand
-them the output — do not dispatch a job:
+3. For work to collect later, submit with `--background` and save `job_id` from the acceptance JSON. Every job has an execution deadline of 1 to 86400 seconds, default 1800. Set `--timeout` to the required finite bound. A receipt saying accepted confirms submission, not completion.
 
-```bash
-rexec --queue          # every mac's queue: what's running, what's waiting, what blocks it, and this session's default target
-rexec --cancel <ID>    # cancel one job (IDs look like myproj-0041; globally unique, found across all macs)
-rexec --cancel         # no ID: list the queue first, let the user pick
-rexec --macs           # which macs are registered, who is online, this session's default target
-rexec --use <name>     # set the default mac for when several are online (persists; --use none clears)
-rexec --gc             # dry run: which workspaces on the mac would be cleaned up, and why - and what jobs left in its `~`
-rexec --gc --apply     # act on that list - only after the user has seen the dry run and said yes
-```
+   ```bash
+   rexec --background --timeout 3600 'cargo build --release'
+   rexec wait JOB --wait-timeout 60
+   rexec trace JOB --after 0
+   ```
 
-Cancelling kills only that job's process group; other running jobs and the agent itself are untouched.
-The agent already cleans up hourly on its own; `--gc --apply` adds only what the hourly run leaves for a
-human (old-style workspace names it cannot trace to a directory on the server).
+4. Read the terminal receipt and exit status. Successful completion returns 0; command failures pass through their exit codes. Timeout returns 124, cancellation 125, and an expired wait returns pending with 75. Connectivity loss or unknown execution is not evidence that the command failed. Inspect `rexec status JOB` and `rexec trace JOB`; reconcile before deciding whether another submission is safe. See [REFERENCE.md](REFERENCE.md#recovery-and-results) for recovery and acknowledgment behavior.
+5. Fetch requested text artifacts with `rexec artifacts JOB --into DIR`. Commands publish them as bounded regular UTF-8 files beneath `$REXEC_ARTIFACTS`. Use `$TMPDIR` for private scratch files. Verify the collected result before claiming the work passed. See [REFERENCE.md](REFERENCE.md#output-and-artifacts) for export limits.
 
-## Step 1: bring the channel online
+## Management
+
+When the user requests queue, status, trace, cancellation, or cleanup, run the corresponding command directly:
 
 ```bash
-bash /home/agent/.claude/skills/rexec/status.sh
+rexec status [JOB]
+rexec queue
+rexec trace JOB [--after SEQUENCE]
+rexec cancel JOB
+rexec gc
+rexec gc --apply
 ```
 
-The first line is the state of **this session's mac**, and the table below it marks that mac with `->`.
-`ONLINE` means go to step 2. Handle the other states below, then re-run this command to confirm.
+Inspect the cleanup preview before applying it. Explicit cancellation stops only that job. Closing a viewer or interrupting `wait` leaves execution running until completion, explicit cancellation, or its deadline.
 
-**`NOT_INSTALLED`** — the server side is not deployed. Install it yourself; do not bother the user:
+## Privacy
 
-```bash
-bash /home/agent/.claude/skills/rexec/install.sh
-```
-
-Then handle it as `OFFLINE`.
-
-**`OFFLINE`** — either this session's login names a mac whose agent is not running, or no agent is
-online at all. In the first case some *other* mac may well show `ONLINE` in the table; it is a different
-machine, so it is not the target — do not reach for `--mac` to route around this.
-Hand the user this command verbatim, ask them to run it **in a terminal on the mac `status.sh` names**
-(or, when it names none, the mac they are using), then **stop and wait for their reply** before continuing:
-
-```bash
-mkdir -p ~/.rexec && ssh vps-2g 'cat /var/lib/rexec/agent.sh' > ~/.rexec/agent.sh && bash ~/.rexec/agent.sh
-```
-
-That one command installs and starts the agent, pulling the latest version each time. Tell the user two
-things: the agent occupies a terminal tab for as long as it runs, and it is only up once
-`polling every 2s, ctrl-c to stop` appears; Ctrl-C stops it. Its first line prints its identity, e.g.
-`rexec-agent  macbook-pro-3f9a  ->  vps-2g  ~/.rexec/workspace`.
-
-**`AMBIGUOUS`** — several macs are online, this session has no live login naming one, and no default is
-set. Show the user the table, ask which mac to use, then run `rexec --use <name>`: the default persists on
-the server for every session. For a one-off choice, pass `--mac <name>` on **every** rexec call instead —
-that flag does not persist between calls.
-
-**The agent is single-instance, per mac.** Starting a second one is blocked, and the existing pid is
-printed. This is deliberate: two agents fight over the queue, each claiming half the jobs, which is
-brutal to diagnose. To restart, Ctrl-C the original terminal first.
-
-**Completion criterion: `status.sh` prints `ONLINE`, or `AMBIGUOUS` with a mac the user named.** Re-run it
-once the user replies, and only enter step 2 once you have seen it.
-
-## Step 2: dispatch the verification work
-
-**Exit codes pass through verbatim, so judging pass/fail needs no full output.**
-What comes back from rexec should be a **receipt** — the minimum evidence needed to judge pass/fail,
-not a log. The full log stays on the mac; go get it separately if you actually need it.
-
-**Completion criterion: every rexec call narrows its output, and every receipt fits in a few dozen lines.**
-
-```bash
-rexec 'set -o pipefail; pytest -q 2>&1 | tail -30'
-rexec 'set -o pipefail; npm ci --silent && npm test 2>&1 | tail -40'
-rexec 'set -o pipefail; cargo test --release 2>&1 | tail -40'
-rexec --no-sync 'node -v; python3 -V; docker ps'        # already short, leave it alone
-# to do more work after the pipe, save the exit code explicitly with ec=$?
-rexec --sync /home/agent/repo/myproj --cwd frontend \
-      'npm run build > /tmp/b.log 2>&1; ec=$?; tail -40 /tmp/b.log; exit $ec'
-```
-
-### Long jobs go to the background
-
-**A job you would give more than the default timeout is a job for `--detach`.** Raising `--timeout` is the
-wrong lever: it holds the caller hostage to a build it cannot outlive, and a session that dies mid-wait
-takes the job with it. Dispatch it detached, get an ID back in seconds, and collect the same receipt later.
-
-```bash
-rexec --detach 'set -o pipefail; cargo build --release 2>&1 | tail -20'   # -> proj-0042
-rexec --tail proj-0042              # progress, any time, costs nothing
-rexec --wait proj-0042              # blocks; prints the usual receipt and exit code
-```
-
-A detached job outlives this session **and** the agent on the mac: closing the agent's terminal, or losing
-the session, does not touch it. Only `rexec --cancel <ID>` stops it. `--detach` and `--timeout` are
-mutually exclusive, because a detached job has no run timeout — that is the point of it.
-
-**`set -o pipefail` is mandatory.** `| tail` replaces the exit code with `tail`'s, which is always 0, and
-exit-code passthrough is what this whole thing rests on — without it, narrowing the output silently
-destroys the pass/fail signal, which is worse than not narrowing at all.
-
-**Why narrow:** output above roughly 30KB gets persisted to a file, leaving only a **2KB preview** in
-context; output below 30KB lands in context **in full**, so a single 28KB result costs ~7000 tokens.
-Test and build output sits right in that band, which makes not narrowing far more expensive than it looks.
-
-**If it overflows anyway and gets persisted:** the preview shows the **start**, while build and test
-verdicts live at the **end** — `tail -50 <persisted file path>` rather than reading the whole thing.
-
-Leave the light, static work on the server: reading and writing code, grep, type checking.
-
-## Usage notes
-
-- Syncs the **current working directory** by default (rsync, honours `.gitignore`) to a workspace on the
-  mac named after its repository — `~/.rexec/workspace/<repo>--<pathhash>/`, or
-  `<repo>--wt-<worktree>--<pathhash>/` for a git worktree — then runs there. Job IDs carry the repository
-  name too. Each path gets its own workspace, so two checkouts never `rsync --delete` each other's files,
-  and one path always reuses its workspace, so dependencies install only once.
-- **Workspaces clean themselves up.** The agent deletes a workspace once its source directory is gone from
-  the server (a removed worktree, say) or no job has used it for 3 days. `--ephemeral` deletes it the moment the job ends instead (a one-off check of a throwaway checkout); package-manager caches in `~` survive, but `node_modules/` and `.venv/` go with it. A worktree-heavy session leaves
-  nothing behind for long. `REFERENCE.md` has the rules.
-- **Write job output to `$REXEC_SCRATCH`, never to `~`.** Every job gets its own directory there, also
-  exported as `TMPDIR`; logs, screenshots and QA data belong in it, and it is removed after 3 idle days.
-  A command that writes into `~` leaves clutter in the user's home: rexec cannot stop it, but the receipt
-  ends with `[rexec] appeared in ~ while this job ran: <names>` when it happens. Fix the command, and tell
-  the user - `rexec --gc` lists those entries and `--gc --apply` (after the user has seen the dry run) moves
-  them to `~/.rexec/home-trash` for a week.
-- stderr carries one bill line at the end:
-  `--- [macbook-pro-3f9a] exit=0 | queued 4m12s | ran 6m03s | total 10m15s ---` (the mac that ran it is in brackets).
-- **Dependencies install once.** `.venv/ node_modules/ target/ dist/ build/ .next/` are protected on the
-  mac and survive `rsync --delete`. Run
-  `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt` once and it holds; after that
-  `rexec '.venv/bin/pytest -q'` reuses it and the round trip takes seconds.
-- **`.git` is not synced**, so the workspace is not a repo and history-based commands fail there. Pass
-  `--with-git` when the command needs real history (`git log`, `git diff main`, a review against a base
-  branch); it costs the transfer of the whole history, so leave it off for builds and tests.
-- **Files in `.gitignore` are not synced** (`.env`, keys, and so on stay on the server). If a test needs
-  them, ask the user to drop a copy into the matching workspace directory on the mac: filtered files are
-  protected too, so one drop lasts — and an idle workspace holding one is kept rather than cleaned up.
-- Syncing is one-way (server → mac). Build artifacts do not come back; `cat` them in the command if needed.
-- Commands must run unattended (`vim` and installers that want keystrokes cannot work).
-- `--no-sync` and `--light` declare a **light job**, exempt from the mac's load gate — good for zero-cost probing.
-- **Interrupt means cancel.** Pressing ESC on a `rexec` call in the session terminates the job on the mac
-  too, so nothing is orphaned. A session that dies without ESC — compacted, OOM-killed, ssh dropped — stops
-  sending the heartbeat that says someone is still waiting, and the server drops the job within 90s rather
-  than leaving it to block the queue.
-- **A detached job keeps its project's workspace** for as long as it runs, so a later `rexec` on the same
-  project waits for it rather than `rsync --delete`-ing the files out from under it. Other projects are
-  unaffected. Its full log stays on the mac for a week; `--tail` reads a snapshot the agent pushes every
-  15s, so it costs nothing and is at most that stale.
-- **An agent that dies without a clean Ctrl-C is cleaned up automatically** — leftover processes on the mac
-  and the jobs the server still thinks are running, which would otherwise block the queue for every later
-  job. They end as **exit 129**; just re-run the command. `REFERENCE.md` has the details.
-
-## Troubleshooting
-
-How the target mac is resolved, load gate not releasing, a queue that has stopped moving, a workspace that
-was cleaned up or kept, exit code meanings, agent environment variables — read `REFERENCE.md` in this
-directory.
+Use structured receipts, safe traces, and validated text artifacts as the returned evidence. Raw command logs and SSH diagnostics remain private on the Mac. Export strips known private data and terminal controls; a filter failure returns `OUTPUT_BLOCKED` without a raw fallback. This is known-data filtering, not a sandbox or a guarantee against a program deliberately encoding hidden data. Read [REFERENCE.md](REFERENCE.md#output-and-artifacts) when publishing a new artifact type or investigating blocked output. Local private logs require an explicit user request before inspection.

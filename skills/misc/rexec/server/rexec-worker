@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -eu
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+  BASE="$(cd "$(dirname "$SELF")" && pwd)"
+  LINK="$(readlink "$SELF")"
+  case "$LINK" in /*) SELF="$LINK";; *) SELF="$BASE/$LINK";; esac
+done
+BASE="$(cd "$(dirname "$SELF")/../runtime" && pwd)"
+export PYTHONPATH="$BASE"
+exec python3 -m rexec_runtime rpc "$@"
