@@ -1,0 +1,218 @@
+import argparse
+import base64
+import contextlib
+import json
+import math
+import os
+from pathlib import Path
+import sys
+import time
+
+from .common import Refusal, atomic, digest, encode, opaque, read_json, reject_legacy, root_path
+from .export import Publisher, relative
+
+
+def print_json(value):
+    sys.stdout.buffer.write(encode(value) + b"\n")
+    sys.stdout.buffer.flush()
+
+
+def arguments():
+    parser = argparse.ArgumentParser(prog="rexec", add_help=True)
+    # argparse's default diagnostic contains arbitrary user text. Only fixed errors escape.
+    def error(message):
+        raise Refusal()
+    parser.error = error
+    parser.add_argument("--background", action="store_true")
+    parser.add_argument("--timeout", type=int, default=1800)
+    sync = parser.add_mutually_exclusive_group()
+    sync.add_argument("--sync")
+    sync.add_argument("--no-sync", action="store_true")
+    parser.add_argument("--cwd", default=".")
+    parser.add_argument("--with-git", action="store_true")
+    parser.add_argument("--request-id")
+    parser.add_argument("items", nargs="*")
+    parser.add_argument("--wait-timeout", type=float)
+    parser.add_argument("--after", type=int, default=0)
+    parser.add_argument("--into")
+    parser.add_argument("--apply", action="store_true")
+    return parser.parse_args()
+
+
+def write_artifacts(bundle, destination):
+    Publisher().validate_bundle(bundle)
+    target = Path(destination)
+    if target.is_symlink():
+        raise Refusal("ARTIFACT_BLOCKED")
+    target.mkdir(parents=True, exist_ok=True)
+    from .common import fsync_dir
+    fsync_dir(target.parent)
+    root_fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for item in bundle["artifacts"]:
+            parts = relative(item["name"]).split("/")
+            data = base64.b64decode(item["data"], validate=True)
+            if digest(data) != item["digest"]:
+                raise Refusal("ARTIFACT_BLOCKED")
+            parent_fd = os.dup(root_fd)
+            temporary = ".rexec-" + opaque()
+            try:
+                for directory in parts[:-1]:
+                    with contextlib.suppress(FileExistsError):
+                        os.mkdir(directory, mode=0o700, dir_fd=parent_fd)
+                        os.fsync(parent_fd)
+                    child_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+                    os.close(parent_fd)
+                    parent_fd = child_fd
+                fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(data)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.rename(temporary, parts[-1], src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            except OSError:
+                raise Refusal("ARTIFACT_BLOCKED")
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(temporary, dir_fd=parent_fd)
+                os.close(parent_fd)
+    finally:
+        os.close(root_fd)
+    return [{key: item[key] for key in ("name", "digest", "size")} for item in bundle["artifacts"]]
+
+
+def server_cli():
+    from .server import Server
+    args = arguments()
+    if args.wait_timeout is not None and (not math.isfinite(args.wait_timeout) or not 0 <= args.wait_timeout <= 86400):
+        raise Refusal()
+    server = Server(root_path("server"))
+    words = args.items
+    if not words:
+        raise Refusal()
+    action = words[0]
+    if action == "status":
+        if len(words) > 2:
+            raise Refusal()
+        print_json(server.status(words[1]) if len(words) == 2 else {"channel": server.channel(), "jobs": server.queue()})
+        return 0
+    if action == "queue":
+        if len(words) != 1:
+            raise Refusal()
+        print_json({"jobs": server.queue()})
+        return 0
+    if action == "gc":
+        if len(words) != 1:
+            raise Refusal()
+        print_json(server.gc(args.apply))
+        return 0
+    if action in {"cancel", "trace", "wait", "artifacts"}:
+        if len(words) != 2:
+            raise Refusal()
+        job = words[1]
+        if action == "cancel":
+            print_json(server.cancel(job))
+            return 0
+        if action == "trace":
+            if args.after < 0:
+                raise Refusal()
+            print_json({"job_id": job, "events": server.trace(job, args.after)})
+            return 0
+        if action == "artifacts":
+            if not args.into:
+                raise Refusal()
+            row = server.job(job)
+            if not row["result_digest"]:
+                print_json({"job_id": job, "state": "pending"})
+                return 75
+            bundle = server.bundle(row)
+            files = write_artifacts(bundle, args.into)
+            server.ack(job, row["result_digest"], artifacts=True)
+            print_json({"job_id": job, "artifacts": files})
+            return 0
+    else:
+        if len(words) != 1:
+            raise Refusal()
+        result = server.submit(words[0], None if args.no_sync else args.sync or os.getcwd(), args.cwd, args.timeout, args.request_id or opaque(), args.with_git)
+        job = result["job_id"]
+        if args.background:
+            print_json(result)
+            return 0
+    deadline = time.monotonic() + args.wait_timeout if args.wait_timeout is not None else None
+    while True:
+        row = server.job(job)
+        if row["result_digest"]:
+            result = server.status(job)
+            # Successful delivery to stdout is the consumer receipt boundary.
+            print_json(result)
+            server.ack(job, row["result_digest"])
+            if not server.bundle(row)["artifacts"]:
+                server.ack(job, row["result_digest"], artifacts=True)
+            return result["exit_code"]
+        if deadline is not None and time.monotonic() >= deadline:
+            print_json({"job_id": job, "state": "pending", "reason": "WAIT_TIMEOUT"})
+            return 75
+        time.sleep(0.1)
+
+
+def main():
+    reject_legacy()
+    role = sys.argv[1] if len(sys.argv) > 1 else "server"
+    if role == "server":
+        sys.argv.pop(1)
+        return server_cli()
+    if role in {"rpc", "provision"}:
+        from .server import Server
+        server = Server(root_path("server"))
+        if role == "provision":
+            sys.stdout.write(server.provision() + "\n")
+            sys.stdout.flush()
+        else:
+            print_json(server.rpc(read_json(sys.stdin.buffer)))
+        return 0
+    from .local import Local, gate, supervise, worker
+    root = root_path("local")
+    if role == "worker":
+        worker(root)
+    elif role == "supervise" and len(sys.argv) == 3:
+        supervise(root, sys.argv[2])
+    elif role == "gate" and len(sys.argv) == 6:
+        gate(int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5])
+    elif role == "agent":
+        from .service import service, setup
+        words = sys.argv[2:]
+        if words == ["setup"]:
+            print_json(setup(root))
+        elif len(words) == 2 and words[0] == "service":
+            print_json(service(root, words[1]))
+        elif len(words) in {1, 2} and words[0] == "view":
+            print_json({"events": Local(root).view(words[1] if len(words) == 2 else None)})
+        else:
+            raise Refusal()
+    else:
+        raise Refusal()
+    return 0
+
+
+if __name__ == "__main__":
+    os.umask(0o077)
+    try:
+        sys.exit(main())
+    except Refusal as error:
+        print_json({"error": error.reason})
+        sys.exit(error.code)
+    except (KeyboardInterrupt, BrokenPipeError):
+        sys.exit(75)
+    except Exception:
+        if len(sys.argv) > 1 and sys.argv[1] in {"worker", "supervise"}:
+            import traceback
+            location = root_path("local") / "worker.failure"
+            if sys.argv[1] == "supervise" and len(sys.argv) == 3:
+                location = root_path("local") / "jobs" / sys.argv[2] / "supervisor.failure"
+            with contextlib.suppress(Exception):
+                from .common import MAX_LOG
+                atomic(location, traceback.format_exc().encode()[:MAX_LOG])
+        else:
+            print_json({"error": "INTERNAL_FAILURE"})
+        sys.exit(70)

@@ -1,30 +1,26 @@
 #!/usr/bin/env bash
-# Deploy the rexec channel on the server (idempotent).
-# The client runs as the `agent` user, while the mac's agent reaches the server side over ssh as root,
-# so the state tree lives in /var/lib/rexec (group `agent`, setgid, group-writable) rather than under
-# /root, which is 0700. /root/.rexec stays as a symlink to it for the root-side callers.
 set -eu
-S="$(cd "$(dirname "$0")" && pwd -P)"   # deploy from wherever this checkout lives
-R=/var/lib/rexec
-mkdir -p "$R/macs" "$R/bin" "$R/logs"
-install -m 775 "$S/server/rexec"        "$S/server/rexec-claim"  "$S/server/rexec-report"   \
-               "$S/server/rexec-queue"  "$S/server/rexec-cancel" "$S/server/rexec-macs"     \
-               "$S/server/rexec-announce" "$S/server/rexec-detached" "$S/server/rexec-wait" \
-               "$S/server/rexec-tail" "$S/server/rexec-ws" "$R/bin/"
-install -m 664 "$S/server/rexec-lib.sh" "$R/bin/"
-install -m 775 "$S/agent.sh" "$R/agent.sh"
-# Shared between root and agent: group-owned by agent, setgid so new files inherit the group.
-chgrp -R agent "$R" 2>/dev/null || sudo chgrp -R agent "$R"
-# The mac's agent reaches the server as root, so parts of the state tree are root-owned and these two
-# cannot touch them - they already carry the right bits, having been created under this umask. Without
-# the guard `set -e` aborts the deploy here, before the symlinks below, on every re-install after a mac
-# has ever connected.
-chmod -R g+rwX "$R" 2>/dev/null || true
-find "$R" -type d -exec chmod g+s {} + 2>/dev/null || true
-sudo ln -sfn "$R" /root/.rexec
-sudo ln -sfn "$R/bin/rexec" /usr/local/bin/rexec
-# Clear the flat single-mac-era layout: drop empty dirs and the global heartbeat file so they are not
-# confused with the same-named things under macs/<id>/.
-for d in queue running results cancel; do rmdir "$R/$d" 2>/dev/null || true; done
-rm -f "$R/agent.alive" "$R/gate.status"
-echo "Server side deployed: $R/ (rexec linked into /usr/local/bin/, /root/.rexec -> $R)"
+BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STATE="${REXEC_STATE_DIR:-/var/lib/rexec}"
+BIN="${REXEC_INSTALL_BIN_DIR:-/usr/local/bin}"
+OWNER_UID="${SUDO_UID:-$(id -u)}"
+OWNER_GID="${SUDO_GID:-$(id -g)}"
+case "$OWNER_UID:$OWNER_GID" in *[!0-9:]*|0:*) printf '{"error":"INSTALL_OWNER_REQUIRED"}\n'; exit 2;; esac
+if [ "$STATE" = / ] || [ -L "$STATE" ] || [ -L "$BIN" ] || [ -L "$STATE/bin" ] || [ -L "$STATE/runtime" ]; then
+  printf '{"error":"PRIVATE_STORAGE_REQUIRED"}\n'; exit 2
+fi
+if [ -e "$STATE/macs" ]; then
+  printf '{"error":"LEGACY_STATE_REQUIRES_REVIEW"}\n'; exit 2
+fi
+umask 077
+mkdir -p "$STATE/bin" "$STATE/runtime" "$BIN"
+chmod 700 "$STATE" "$STATE/bin" "$STATE/runtime"
+cp -R "$BASE/runtime/rexec_runtime" "$STATE/runtime/"
+for NAME in rexec rexec-worker rexec-provision; do
+  install -m 755 "$BASE/server/$NAME" "$STATE/bin/$NAME"
+  ln -sfn "$STATE/bin/$NAME" "$BIN/$NAME"
+done
+if [ "$(id -u)" = 0 ]; then
+  chown -R "$OWNER_UID:$OWNER_GID" "$STATE"
+fi
+printf '{"installed":true,"services_started":false}\n'
