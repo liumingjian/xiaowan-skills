@@ -9,7 +9,7 @@ import secrets
 import shutil
 import time
 
-from .common import CODE, HEALTH_WINDOW, HISTORY, MAX_RECONCILE, RETENTION, Refusal, atomic, connect, digest, encode, event, immutable, opaque, private_dir, transaction, valid_id
+from .common import CATEGORIES, CODE, HEALTH_WINDOW, HISTORY, MAX_NOTE, MAX_RECONCILE, RETENTION, Refusal, atomic, connect, digest, encode, event, immutable, opaque, private_dir, transaction, valid_id
 from .export import Publisher
 from .snapshot import freeze, safe_name
 
@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS summaries(job_id TEXT PRIMARY KEY, created REAL NOT NULL, fingerprint TEXT NOT NULL, timeout INTEGER NOT NULL, channel TEXT NOT NULL, claimed REAL, completed REAL, outcome TEXT, exit_code INTEGER, reason TEXT, log_truncated INTEGER, artifacts INTEGER, start_s REAL, run_s REAL, cancelled INTEGER NOT NULL DEFAULT 0, status_calls INTEGER NOT NULL DEFAULT 0, wait_calls INTEGER NOT NULL DEFAULT 0, trace_calls INTEGER NOT NULL DEFAULT 0, wait_timeouts INTEGER NOT NULL DEFAULT 0, read REAL, fetched REAL);
 CREATE TABLE IF NOT EXISTS health(batch TEXT NOT NULL, at REAL NOT NULL, reason TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(batch,reason));
 CREATE TABLE IF NOT EXISTS cli_errors(at REAL NOT NULL, action TEXT NOT NULL, reason TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS feedback(id INTEGER PRIMARY KEY, at REAL NOT NULL, job_id TEXT, category TEXT NOT NULL, note TEXT NOT NULL);
 """
 # Per-job usage counters that a CLI call can bump; read and fetched record the first time.
 USAGE = {"status": "status_calls", "wait": "wait_calls", "trace": "trace_calls", "wait_timeout": "wait_timeouts"}
@@ -126,6 +127,19 @@ class Server:
             event(self.db, job, "QUEUED", "ACCEPTED")
             self.summarize(self.job(job), channel)
         return self.status(job)
+
+    def feedback(self, job, category, note):
+        """Store an agent's note; it is reported in aggregate and never joins the trace."""
+        if job is not None:
+            self.job(job)
+        if category not in CATEGORIES:
+            raise Refusal("FEEDBACK_CATEGORY")
+        note = self.publisher.sanitize(note or "").strip()
+        if len(note) > MAX_NOTE:
+            raise Refusal("FEEDBACK_TOO_LONG")
+        with transaction(self.db):
+            cursor = self.db.execute("INSERT INTO feedback(at,job_id,category,note) VALUES(?,?,?,?)", (time.time(), job, category, note))
+        return {"feedback_id": cursor.lastrowid, "job_id": job, "category": category, "recorded": True}
 
     def job(self, job):
         valid_id(job)
@@ -245,7 +259,7 @@ class Server:
         if apply:
             with transaction(self.db):
                 # History outlives job records so trends survive the seven-day cleanup.
-                for table, column in (("summaries", "created"), ("health", "at"), ("cli_errors", "at")):
+                for table, column in (("summaries", "created"), ("health", "at"), ("cli_errors", "at"), ("feedback", "at")):
                     self.db.execute("DELETE FROM " + table + " WHERE " + column + "<?", (time.time() - HISTORY,))
                 for row in rows:
                     self.db.execute("DELETE FROM settings WHERE key LIKE ?", ("event:" + row[0] + ":%",))

@@ -21,6 +21,8 @@ MAX_RECONCILE = 102
 RETENTION = 7 * 86400
 HISTORY = 90 * 86400
 HEALTH_WINDOW = 3600
+MAX_NOTE = 280
+CATEGORIES = {"confusing_output", "unexpected_failure", "slow", "missing_capability", "docs_unclear", "other"}
 MIN_FREE = 256 * 1024 * 1024
 ID = re.compile(r"^[a-f0-9]{32}$")
 # Failure and error reasons are fixed identifiers, never free text.

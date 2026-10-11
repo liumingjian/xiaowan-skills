@@ -46,6 +46,16 @@ rexec gc --apply
 
 Inspect the cleanup preview before applying it. Explicit cancellation stops only that job. Closing a viewer or interrupting `wait` leaves execution running until completion, explicit cancellation, or its deadline.
 
+## Feedback
+
+When rexec surprises you or gets in your way (a confusing receipt, an unexplained failure, slowness, a missing capability, unclear docs), record one note as you move on:
+
+```bash
+rexec feedback [JOB] --category confusing_output|unexpected_failure|slow|missing_capability|docs_unclear|other --note 'what you expected and what happened'
+```
+
+Reserve it for surprises; a job that behaved as documented needs no note. Keep the note to 280 characters of plain description, without command text, paths, or output. The user reviews notes to improve rexec.
+
 ## Privacy
 
 Use structured receipts, safe traces, and validated text artifacts as the returned evidence. Raw command logs and SSH diagnostics remain private on the Mac. Export strips known private data and terminal controls; a filter failure returns `OUTPUT_BLOCKED` without a raw fallback. This is known-data filtering, not a sandbox or a guarantee against a program deliberately encoding hidden data. Read [REFERENCE.md](REFERENCE.md#output-and-artifacts) when publishing a new artifact type or investigating blocked output. Local private logs require an explicit user request before inspection.
