@@ -603,6 +603,34 @@ sys.exit(result.returncode)
         self.assertFalse((self.mac / "jobs" / job).exists())
         self.assertFalse((self.mac / "outbox" / job).exists())
 
+    def test_tick_claims_and_prepares_several_jobs(self):
+        jobs = []
+        for index in range(3):
+            other = self.root / f"tick{index}"
+            other.mkdir()
+            jobs.append(self.server.submit("true", other, ".", 10, opaque())["job_id"])
+        class IsolatedTransport:
+            def call(inner, action, **parameters):
+                return self.server.rpc({"token": self.server.provision(), "action": action, **parameters})
+        local = Local(self.mac, IsolatedTransport())
+        with patch.object(local, "launch"):
+            local.tick()
+        self.assertEqual({row[0] for row in local.db.execute("SELECT id FROM jobs WHERE state='READY'")}, set(jobs))
+        self.assertIsNotNone(self.server.channel()["worker_timing"])
+
+    def test_finished_job_drops_workspace_and_snapshot(self):
+        job = self.submit()
+        local = Local(self.mac)
+        local.receive(self.server.claim(opaque()))
+        local.prepare(job)
+        self.assertTrue((self.mac / "jobs" / job / "workspace").is_dir())
+        local.terminal(job, "completed", 0, "COMPLETED")
+        local.gc()
+        for name in ("workspace", "tmp", "artifacts"):
+            self.assertFalse((self.mac / "jobs" / job / name).exists())
+        self.assertEqual(list((self.mac / "snapshots").iterdir()), [])
+        self.assertTrue((self.mac / "outbox" / job).is_file())
+
     def test_invalid_wait_deadline_has_no_submission_side_effect(self):
         environment = dict(self.environment, REXEC_STATE_DIR=str(self.remote))
         for timeout in ("-1", "nan", "inf", "86401"):

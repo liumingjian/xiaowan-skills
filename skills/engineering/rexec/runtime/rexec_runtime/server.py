@@ -1,6 +1,7 @@
 import base64
 import hmac
 import json
+import math
 from pathlib import Path
 import secrets
 import shutil
@@ -9,6 +10,8 @@ import time
 from .common import MAX_RECONCILE, RETENTION, Refusal, atomic, connect, digest, encode, event, immutable, opaque, private_dir, transaction, valid_id
 from .export import Publisher
 from .snapshot import freeze, safe_name
+
+GC_INTERVAL = 3600
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, request TEXT UNIQUE NOT NULL, spec_digest TEXT NOT NULL, workspace TEXT NOT NULL, command TEXT NOT NULL, cwd TEXT NOT NULL, timeout INTEGER NOT NULL, snapshot TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('QUEUED','CLAIMED','RESULT_STORED')), claim TEXT UNIQUE, cancel INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, completed REAL, result_digest TEXT, ack INTEGER NOT NULL DEFAULT 0, artifact_ack INTEGER NOT NULL DEFAULT 0);
@@ -93,8 +96,9 @@ class Server:
         reserved = self.db.execute("SELECT COUNT(*) FROM jobs WHERE state='CLAIMED'").fetchone()[0]
         unknown = self.db.execute("SELECT COUNT(*) FROM jobs WHERE state='CLAIMED' AND result_digest IS NOT NULL").fetchone()[0]
         worker_state = self.db.execute("SELECT value FROM settings WHERE key='worker_state'").fetchone()
+        timing = self.db.execute("SELECT value FROM settings WHERE key='worker_timing'").fetchone()
         state = "AUTHORIZATION_REQUIRED" if not (self.root / "worker.token").exists() else "OFFLINE" if age is None or age > 180 else "LOW_SPACE" if worker_state and worker_state[0] == "LOW_SPACE" else "UNCERTAIN" if unknown else "READY"
-        return {"state": state, "last_contact_age_seconds": age, "reserved": reserved}
+        return {"state": state, "last_contact_age_seconds": age, "reserved": reserved, "worker_timing": json.loads(timing[0]) if timing else None}
 
     def queue(self):
         return [self.status(row[0]) for row in self.db.execute("SELECT id FROM jobs ORDER BY created DESC LIMIT 100")]
@@ -196,8 +200,19 @@ class Server:
             state = request.get("state")
             if state not in {"READY", "LOW_SPACE"}:
                 raise Refusal()
+            timing = request.get("timing")
+            if timing is not None and (not isinstance(timing, dict) or set(timing) != {"tick", "rpc"} or any(type(v) not in {int, float} or not math.isfinite(v) or not 0 <= v <= 86400 for v in timing.values())):
+                raise Refusal()
             with transaction(self.db):
                 self.db.execute("INSERT OR REPLACE INTO settings VALUES('worker_state',?)", (state,))
+                if timing is not None:
+                    self.db.execute("INSERT OR REPLACE INTO settings VALUES('worker_timing',?)", (json.dumps(timing),))
+                last_gc = self.db.execute("SELECT value FROM settings WHERE key='last_gc'").fetchone()
+                due = not last_gc or time.time() - float(last_gc[0]) >= GC_INTERVAL
+                if due:
+                    self.db.execute("INSERT OR REPLACE INTO settings VALUES('last_gc',?)", (str(time.time()),))
+            if due:
+                self.gc(True)
             return {"connected": True}
         if action == "claim":
             return self.claim(request.get("request_id"))
