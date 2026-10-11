@@ -53,7 +53,7 @@ Default submission durably enqueues, then waits. `--background` returns acceptan
 
 `--no-sync` supplies an empty snapshot, not a previous project checkout. Submission freezes the input snapshot. The worker verifies its digest before extraction; rejected sync does not execute stale files. Sync excludes fixed secret paths, dependency caches, `.codex-out/`, and `.git` by default. Explicit history transfer excludes Git hooks and local credential configuration. Snapshot validation rejects unsafe paths, links, special files, and excessive file counts or bytes. Snapshot exclusions are fixed; do not infer them from `.gitignore`. Keep handoffs outside excluded secret and dependency paths.
 
-Commands sharing a source workspace execute serially. Other workspaces can execute up to the configured concurrency bound. Tool-native dependency caches can persist, but cache reuse must respect ownership and prevent concurrent unsafe mutation. For Python work, use `uv` and reuse a suitable environment. Dependencies needed inside a network-restricted tool must be prepared before delegation.
+Commands sharing a source workspace execute serially. Different workspaces execute concurrently without a global limit. Tool-native dependency caches can persist, but cache reuse must respect ownership and prevent concurrent unsafe mutation. For Python work, use `uv` and reuse a suitable environment. Dependencies needed inside a network-restricted tool must be prepared before delegation.
 
 ## Recovery and results
 

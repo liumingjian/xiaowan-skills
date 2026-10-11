@@ -186,15 +186,16 @@ sys.exit(result.returncode)
         self.assertEqual(second.wait(timeout=3), 73)
         self.assertIsNone(first.poll())
 
-    def test_same_workspace_serial_and_bounded_capacity(self):
+    def test_same_workspace_serial_and_unbounded_capacity(self):
         first = self.submit()
         second = self.submit()
-        other = self.root / "other"
-        other.mkdir()
-        third = self.server.submit("true", other, ".", 10, opaque())["job_id"]
-        a = self.server.claim(opaque())["job"]["id"]
-        b = self.server.claim(opaque())["job"]["id"]
-        self.assertEqual({a, b}, {first, third})
+        others = []
+        for index in range(4):
+            other = self.root / f"other{index}"
+            other.mkdir()
+            others.append(self.server.submit("true", other, ".", 10, opaque())["job_id"])
+        claimed = {self.server.claim(opaque())["job"]["id"] for _ in range(5)}
+        self.assertEqual(claimed, {first, *others})
         self.assertIsNone(self.server.claim(opaque())["job"])
         self.assertEqual(self.server.job(second)["state"], "QUEUED")
 

@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 
-from .common import CAPACITY, ID, MAX_LOG, MAX_RPC, MIN_FREE, RETENTION, Refusal, atomic, connect, digest, encode, event, immutable, opaque, private_dir, read_json, transaction, valid_id
+from .common import ID, MAX_LOG, MAX_RECONCILE, MAX_RPC, MIN_FREE, RETENTION, Refusal, atomic, connect, digest, encode, event, immutable, opaque, private_dir, read_json, transaction, valid_id
 from .export import Publisher
 from .snapshot import extract
 
@@ -301,7 +301,7 @@ class Local:
                         self.terminal(row["id"], "unknown", 70, "EXECUTION_UNKNOWN")
 
     def reconcile(self):
-        rows = self.db.execute("SELECT * FROM jobs WHERE acknowledged=0 OR state!='TERMINAL' ORDER BY created LIMIT 102").fetchall()
+        rows = self.db.execute("SELECT * FROM jobs WHERE acknowledged=0 OR state!='TERMINAL' ORDER BY created LIMIT ?", (MAX_RECONCILE,)).fetchall()
         if not rows:
             return
         jobs = [{"job_id": row["id"], "claim_id": row["claim"], "events": self.publisher.events([json.loads(e[0]) for e in self.db.execute("SELECT value FROM events WHERE job_id=? ORDER BY sequence", (row["id"],))])} for row in rows]
@@ -335,9 +335,7 @@ class Local:
             if row["state"] != "READY":
                 self.prepare(row["id"])
             self.launch(row["id"])
-        active = self.db.execute("SELECT COUNT(*) FROM jobs WHERE state!='TERMINAL'").fetchone()[0]
-        active += sum(json.loads((self.root / "outbox" / row[0]).read_bytes())["outcome"] == "unknown" for row in self.db.execute("SELECT id FROM jobs WHERE state='TERMINAL'"))
-        if active < CAPACITY and not self.stopping() and self.space():
+        if not self.stopping() and self.space():
             self.claim()
         self.gc()
 
