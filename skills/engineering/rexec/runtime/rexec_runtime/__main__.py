@@ -5,10 +5,11 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import sys
 import time
 
-from .common import Refusal, atomic, digest, encode, opaque, read_json, reject_legacy, root_path
+from .common import HISTORY, Refusal, atomic, digest, encode, opaque, read_json, reject_legacy, root_path
 from .export import Publisher, relative
 
 
@@ -38,6 +39,7 @@ def arguments():
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--category")
     parser.add_argument("--note")
+    parser.add_argument("--since", default="7d")
     return parser.parse_args()
 
 
@@ -84,7 +86,7 @@ def write_artifacts(bundle, destination):
     return [{key: item[key] for key in ("name", "digest", "size")} for item in bundle["artifacts"]]
 
 
-ACTIONS = {"status", "queue", "gc", "cancel", "trace", "wait", "artifacts", "feedback"}
+ACTIONS = {"status", "queue", "gc", "cancel", "trace", "wait", "artifacts", "feedback", "report"}
 
 
 def server_cli():
@@ -130,6 +132,13 @@ def dispatch(server, args):
         if len(words) > 2 or not args.category:
             raise Refusal()
         print_json(server.feedback(words[1] if len(words) == 2 else None, args.category, args.note))
+        return 0
+    if action == "report":
+        match = re.fullmatch(r"([1-9][0-9]{0,3})([hd])", args.since)
+        since = int(match[1]) * (3600 if match[2] == "h" else 86400) if match and len(words) == 1 else 0
+        if not 0 < since <= HISTORY:
+            raise Refusal()
+        print_json(server.overview(since))
         return 0
     if action == "gc":
         if len(words) != 1:

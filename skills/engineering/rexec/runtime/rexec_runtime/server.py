@@ -141,6 +141,54 @@ class Server:
             cursor = self.db.execute("INSERT INTO feedback(at,job_id,category,note) VALUES(?,?,?,?)", (time.time(), job, category, note))
         return {"feedback_id": cursor.lastrowid, "job_id": job, "category": category, "recorded": True}
 
+    def overview(self, since):
+        """Aggregate the history for iteration: what failed, where time went, how agents used the CLI."""
+        now = time.time()
+        start = now - since
+        rows = self.db.execute("SELECT * FROM summaries WHERE created>=? ORDER BY created", (start,)).fetchall()
+        outcomes = {}
+        phases = {"queued_s": [], "start_s": [], "run_s": [], "report_s": []}
+        for row in rows:
+            key = (row["outcome"] or "pending") + ":" + (row["reason"] or "PENDING")
+            outcomes[key] = outcomes.get(key, 0) + 1
+            if row["claimed"] is not None:
+                phases["queued_s"].append(row["claimed"] - row["created"])
+            for name in ("start_s", "run_s"):
+                if row[name] is not None:
+                    phases[name].append(row[name])
+            if None not in (row["claimed"], row["completed"], row["start_s"], row["run_s"]):
+                phases["report_s"].append(row["completed"] - row["claimed"] - row["start_s"] - row["run_s"])
+        failed = [row for row in rows if row["outcome"] is not None and (row["outcome"] != "completed" or row["exit_code"] != 0)]
+        failed_ids = {row["job_id"] for row in failed}
+        groups = {}
+        for row in rows:
+            group = groups.setdefault(row["fingerprint"], {"fingerprint": row["fingerprint"], "runs": 0, "failures": 0, "last_reason": None})
+            group["runs"] += 1
+            if row["job_id"] in failed_ids:
+                group["failures"] += 1
+                group["last_reason"] = row["reason"]
+        settled = [row for row in rows if row["completed"] is not None and row["completed"] < now - 86400]
+        feedback = self.db.execute("SELECT * FROM feedback WHERE at>=? ORDER BY at DESC", (start,)).fetchall()
+        categories = {}
+        for row in feedback:
+            categories[row["category"]] = categories.get(row["category"], 0) + 1
+        return {
+            "window": {"since_seconds": since, "jobs": len(rows), "failed": len(failed)},
+            "outcomes": dict(sorted(outcomes.items())),
+            "timing": {name: percentiles(values) for name, values in phases.items()},
+            "health": {row[0]: row[1] for row in self.db.execute("SELECT reason,SUM(count) FROM health WHERE at>=? GROUP BY reason ORDER BY reason", (start,))},
+            "usage": {
+                "submitted_not_ready": sum(row["channel"] not in {"READY", "UNRECORDED"} for row in rows),
+                "unread_results": sum(row["read"] is None for row in settled),
+                "unfetched_artifacts": sum(bool(row["artifacts"]) and row["fetched"] is None for row in settled),
+                "wait_timeouts": sum(row["wait_timeouts"] for row in rows),
+                "calls": {name: {"total": sum(row[column] for row in rows), "max_per_job": max((row[column] for row in rows), default=0)} for name, column in (("status", "status_calls"), ("wait", "wait_calls"), ("trace", "trace_calls"))},
+                "cli_errors": {row[0] + ":" + row[1]: row[2] for row in self.db.execute("SELECT action,reason,COUNT(*) FROM cli_errors WHERE at>=? GROUP BY action,reason ORDER BY COUNT(*) DESC, action, reason", (start,))},
+            },
+            "failing_commands": sorted((group for group in groups.values() if group["failures"]), key=lambda group: (-group["failures"], group["fingerprint"]))[:10],
+            "feedback": {"categories": dict(sorted(categories.items())), "recent": [{"age_seconds": round(now - row["at"]), "job_id": row["job_id"], "category": row["category"], "note": row["note"]} for row in feedback[:20]]},
+        }
+
     def job(self, job):
         valid_id(job)
         row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job,)).fetchone()
@@ -337,6 +385,12 @@ class Server:
         if action == "report":
             return self.report(request.get("bundle"), request.get("digest"))
         raise Refusal()
+
+
+def percentiles(values):
+    values = sorted(max(0.0, value) for value in values)
+    pick = lambda share: round(values[min(len(values) - 1, math.ceil(share * len(values)) - 1)], 3) if values else None
+    return {"count": len(values), "p50": pick(0.5), "p95": pick(0.95)}
 
 
 def freeze_empty():
