@@ -16,6 +16,8 @@ umask 077
 mkdir -p "$STATE/bin" "$STATE/runtime" "$BIN"
 chmod 700 "$STATE" "$STATE/bin" "$STATE/runtime"
 cp -R "$BASE/runtime/rexec_runtime" "$STATE/runtime/"
+# The Mac pulls this wrapper and the runtime beside it to install or update its worker.
+install -m 600 "$BASE/agent.sh" "$STATE/agent.sh"
 for NAME in rexec rexec-worker rexec-provision; do
   install -m 755 "$BASE/server/$NAME" "$STATE/bin/$NAME"
   ln -sfn "$STATE/bin/$NAME" "$BIN/$NAME"

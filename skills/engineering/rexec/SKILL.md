@@ -11,7 +11,7 @@ description: Run builds, dependency installation, test suites, services for end-
 
 1. Run `rexec status` to inspect existing work. For initial setup, authorization, or service management, read [REFERENCE.md](REFERENCE.md#setup-and-service). Report the required action without installing or changing a live service unless the user requested it.
    - `rexec` not on PATH → the VPS side is not installed: report `sudo bash install.sh` from this skill directory and stop.
-   - `channel.state` is `AUTHORIZATION_REQUIRED` → the Mac side is not set up: report `bash agent.sh setup`, `bash agent.sh service install`, `bash agent.sh service start` (needs `uv`) and stop.
+   - `channel.state` is `AUTHORIZATION_REQUIRED` → the Mac side is not set up: report this one line for the Mac (needs `uv`) and stop: `mkdir -p ~/.rexec && ssh vps-cc 'cat /var/lib/rexec/agent.sh' > ~/.rexec/agent.sh && bash ~/.rexec/agent.sh`. The same line updates the Mac worker after every VPS installation.
 2. Submit the command from the project root. The default sync captures the current directory; use `--sync DIR` for another source, `--cwd RELATIVE` for a subdirectory, or `--no-sync` for a fresh empty workspace when checking system tools. Add `--with-git` only when the command needs history. Keep the command unattended and run it bare: rexec keeps long output's head and tail, and the receipt's exit status is the command's own.
 
    ```bash
