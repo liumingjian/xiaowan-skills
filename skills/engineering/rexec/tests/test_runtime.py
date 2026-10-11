@@ -766,6 +766,27 @@ sys.exit(result.returncode)
         self.assertEqual([row[0] for row in self.server.db.execute("SELECT job_id FROM summaries")], [job])
         self.assertEqual(self.server.db.execute("SELECT COUNT(*) FROM health").fetchone()[0], 0)
 
+    def test_feedback_is_sanitized_bounded_and_kept_out_of_trace(self):
+        environment = dict(self.environment, REXEC_STATE_DIR=str(self.remote))
+        cli = lambda *words: subprocess.run([sys.executable, "-m", "rexec_runtime", "server", *words], env=environment, capture_output=True)
+        job = self.submit()
+        result = cli("feedback", job, "--category", "confusing_output", "--note", "wait said pending under /home/agent/x")
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(json.loads(result.stdout)["recorded"])
+        self.assertEqual(cli("feedback", "--category", "docs_unclear").returncode, 0)
+        self.assertEqual(json.loads(cli("feedback", "--category", "bogus", "--note", "x").stdout), {"error": "FEEDBACK_CATEGORY"})
+        self.assertEqual(json.loads(cli("feedback", "--category", "slow", "--note", "x" * 281).stdout), {"error": "FEEDBACK_TOO_LONG"})
+        self.assertEqual(cli("feedback", opaque(), "--category", "slow").returncode, 66)
+        self.assertEqual(cli("feedback", job).returncode, 2)
+        rows = [tuple(row) for row in self.server.db.execute("SELECT job_id,category,note FROM feedback ORDER BY id")]
+        self.assertEqual(rows, [(job, "confusing_output", "wait said pending under [private]"), (None, "docs_unclear", "")])
+        self.assertNotIn("pending under", json.dumps(self.server.trace(job)) + json.dumps(self.server.status(job)))
+        errors = {row[1] for row in self.server.db.execute("SELECT action,reason FROM cli_errors WHERE action='feedback'")}
+        self.assertEqual(errors, {"FEEDBACK_CATEGORY", "FEEDBACK_TOO_LONG", "JOB_NOT_FOUND", "INVALID_REQUEST"})
+        self.server.db.execute("UPDATE feedback SET at=?", (time.time() - 91 * 86400,))
+        self.server.gc(True)
+        self.assertEqual(self.server.db.execute("SELECT COUNT(*) FROM feedback").fetchone()[0], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

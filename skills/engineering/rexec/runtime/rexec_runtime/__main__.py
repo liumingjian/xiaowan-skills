@@ -36,6 +36,8 @@ def arguments():
     parser.add_argument("--after", type=int, default=0)
     parser.add_argument("--into")
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--category")
+    parser.add_argument("--note")
     return parser.parse_args()
 
 
@@ -82,7 +84,7 @@ def write_artifacts(bundle, destination):
     return [{key: item[key] for key in ("name", "digest", "size")} for item in bundle["artifacts"]]
 
 
-ACTIONS = {"status", "queue", "gc", "cancel", "trace", "wait", "artifacts"}
+ACTIONS = {"status", "queue", "gc", "cancel", "trace", "wait", "artifacts", "feedback"}
 
 
 def server_cli():
@@ -123,6 +125,11 @@ def dispatch(server, args):
         if len(words) != 1:
             raise Refusal()
         print_json({"jobs": server.queue()})
+        return 0
+    if action == "feedback":
+        if len(words) > 2 or not args.category:
+            raise Refusal()
+        print_json(server.feedback(words[1] if len(words) == 2 else None, args.category, args.note))
         return 0
     if action == "gc":
         if len(words) != 1:

@@ -47,6 +47,7 @@ rexec trace JOB [--after SEQUENCE]
 rexec cancel JOB
 rexec artifacts JOB --into DIR
 rexec gc [--apply]
+rexec feedback [JOB] --category CATEGORY [--note TEXT]
 ```
 
 Default submission durably enqueues, then waits. `--background` returns acceptance JSON immediately. Retrying a submission with the same `--request-id` is idempotent; retain that ID when recovering a lost acceptance response. Execution deadlines are finite, default 1800 seconds and range 1 to 86400. Wait timeout is separate from execution timeout.
@@ -91,4 +92,4 @@ To publish results, write only the requested regular UTF-8 text files beneath `$
 
 Low disk space pauses claims and spawn. A finished job's Mac workspace, `$TMPDIR`, artifact staging, and snapshot are deleted as soon as its result is sealed; unknown execution keeps them. Deletion renames the tree into `trash/` and a background `rm -rf` removes it, so cleanup never blocks the worker tick. GC preserves active jobs, unknown execution, and unacknowledged results. Acknowledged results and private logs have a default retention of seven days. The server applies GC hourly on worker heartbeat; `rexec gc` previews eligible cleanup and `rexec gc --apply` applies it now. Cleanup does not cancel work or scan unrelated home files.
 
-The VPS also keeps a per-job history for 90 days, independent of the seven-day cleanup: submission channel state, phase timings, outcome, reason, CLI usage counts, and a 12-character keyed command fingerprint that groups repeats of one command without storing it in an exportable form. The fingerprint key stays in `/var/lib/rexec`. Worker failure counts and CLI error codes share the same 90-day history.
+The VPS also keeps a per-job history for 90 days, independent of the seven-day cleanup: submission channel state, phase timings, outcome, reason, CLI usage counts, and a 12-character keyed command fingerprint that groups repeats of one command without storing it in an exportable form. The fingerprint key stays in `/var/lib/rexec`. Worker failure counts, CLI error codes, and agent feedback share the same 90-day history. Feedback notes are sanitized like output, refused above 280 characters (`FEEDBACK_TOO_LONG`) or with an unknown category (`FEEDBACK_CATEGORY`), and never appear in receipts or traces.
