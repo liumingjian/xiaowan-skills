@@ -24,7 +24,7 @@ Use the Codex CLI on the paired Mac mini through `rexec`. You own the handoff, f
 
 ## Recovery and privacy
 
-`rexec` connects only `vps-cc` and the paired Mac mini. Setup and user-service management belong to the [rexec skill](../../misc/rexec/SKILL.md). A closed viewer, interrupted wait, or lost conversation leaves the job running until completion, explicit cancellation, or its finite deadline. Recover with `rexec wait JOB` and `rexec artifacts JOB --into DIR`; never automatically resubmit an unknown outcome.
+`rexec` connects only `vps-cc` and the paired Mac mini. Setup and user-service management belong to the [rexec skill](../../engineering/rexec/SKILL.md). A closed viewer, interrupted wait, or lost conversation leaves the job running until completion, explicit cancellation, or its finite deadline. Recover with `rexec wait JOB` and `rexec artifacts JOB --into DIR`; never automatically resubmit an unknown outcome.
 
 Codex JSONL and stderr remain bounded private files on the Mac. Use the safe response, patch, and status as evidence. Output filtering can block export, and a patch requiring sanitization is refused intact. There is no raw-log fallback or automatic private-log inspection. Filtering covers known private data; it cannot prevent a program deliberately encoding hidden data.
 
