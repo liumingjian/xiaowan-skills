@@ -1,6 +1,7 @@
 import contextlib
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -18,8 +19,12 @@ MAX_ARTIFACTS = 16
 MAX_RPC = 96 * 1024 * 1024
 MAX_RECONCILE = 102
 RETENTION = 7 * 86400
+HISTORY = 90 * 86400
+HEALTH_WINDOW = 3600
 MIN_FREE = 256 * 1024 * 1024
 ID = re.compile(r"^[a-f0-9]{32}$")
+# Failure and error reasons are fixed identifiers, never free text.
+CODE = re.compile(r"^[A-Z][A-Z_]{0,39}$")
 STATES = {"RECEIVED", "PREPARING", "READY", "START_RESERVED", "RUNNING", "TERMINAL"}
 REASONS = {"ACCEPTED", "CLAIMED", "PREPARING", "STARTED", "COMPLETED", "CANCELLED", "DEADLINE", "EXECUTION_UNKNOWN", "SNAPSHOT_REJECTED", "OUTPUT_BLOCKED", "LOW_SPACE", "LAUNCH_FAILED", "CONNECTIVITY", "ARTIFACT_BLOCKED", "RESULT_STORED"}
 
@@ -29,6 +34,10 @@ class Refusal(Exception):
         self.reason = reason
         self.code = code
         super().__init__(reason)
+
+
+def finite(value, upper=1000000000):
+    return type(value) in {int, float} and math.isfinite(value) and 0 <= value <= upper
 
 
 def opaque():

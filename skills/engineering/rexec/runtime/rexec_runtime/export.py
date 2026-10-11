@@ -5,8 +5,9 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
+import time
 
-from .common import MAX_ARTIFACT, MAX_ARTIFACTS, MAX_OUTPUT, Refusal, digest, encode, valid_id
+from .common import MAX_ARTIFACT, MAX_ARTIFACTS, MAX_OUTPUT, Refusal, digest, encode, finite, valid_id
 
 OUTPUT_HEAD = 4096
 CONTROL = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))|[\x00-\x08\x0b-\x1f\x7f]")
@@ -158,18 +159,25 @@ class Publisher:
             raise Refusal("ARTIFACT_BLOCKED")
         return result
 
-    def bundle(self, job, claim, outcome, code, reason, stdout=b"", stderr=b"", artifacts=(), truncated=False):
+    def bundle(self, job, claim, outcome, code, reason, stdout=b"", stderr=b"", artifacts=(), truncated=False, timing=None):
         out, blocked1 = self.output(stdout)
         err, blocked2 = self.output(stderr)
         if blocked1 or blocked2:
             out = err = ""
             reason = "OUTPUT_BLOCKED"
             artifacts = []
-        return {"job_id": valid_id(job), "claim_id": valid_id(claim), "outcome": outcome, "exit_code": code, "reason": reason, "stdout": out, "stderr": err, "log_truncated": bool(truncated), "artifacts": list(artifacts)}
+        value = {"job_id": valid_id(job), "claim_id": valid_id(claim), "outcome": outcome, "exit_code": code, "reason": reason, "stdout": out, "stderr": err, "log_truncated": bool(truncated), "artifacts": list(artifacts)}
+        if timing is not None:
+            value["timing"] = timing
+        return value
 
     def validate_bundle(self, bundle):
         keys = {"job_id", "claim_id", "outcome", "exit_code", "reason", "stdout", "stderr", "log_truncated", "artifacts"}
-        if not isinstance(bundle, dict) or set(bundle) != keys:
+        # Timing is optional so bundles sealed before it existed stay readable.
+        if not isinstance(bundle, dict) or set(bundle) - {"timing"} != keys:
+            raise Refusal("OUTPUT_BLOCKED")
+        timing = bundle.get("timing", {"start_s": None, "run_s": None})
+        if not isinstance(timing, dict) or set(timing) != {"start_s", "run_s"} or any(v is not None and not finite(v) for v in timing.values()):
             raise Refusal("OUTPUT_BLOCKED")
         valid_id(bundle["job_id"])
         valid_id(bundle["claim_id"])
@@ -205,4 +213,19 @@ class Publisher:
             self.validate_bundle(bundle)
             value.update({key: bundle[key] for key in ("outcome", "exit_code", "reason", "stdout", "stderr", "log_truncated")})
             value["artifacts"] = [{key: item[key] for key in ("name", "digest", "size")} for item in bundle["artifacts"]]
+        value["timing"] = timing(row, bundle)
         return value
+
+
+def timing(row, bundle=None):
+    """Seconds per phase: queued (created to claimed), start (received to running),
+    run (running to terminal), report (terminal to stored on the server)."""
+    measured = (bundle or {}).get("timing") or {}
+    start, run = measured.get("start_s"), measured.get("run_s")
+    claimed = row["claimed"]
+    end = claimed if claimed is not None else time.time() if row["state"] == "QUEUED" else None
+    queued = None if end is None else max(0.0, end - row["created"])
+    report = None
+    if None not in (claimed, row["completed"], start, run):
+        report = max(0.0, row["completed"] - claimed - start - run)
+    return {key: None if value is None else round(value, 3) for key, value in (("queued_s", queued), ("start_s", start), ("run_s", run), ("report_s", report))}

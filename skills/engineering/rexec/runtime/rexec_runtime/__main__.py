@@ -82,12 +82,27 @@ def write_artifacts(bundle, destination):
     return [{key: item[key] for key in ("name", "digest", "size")} for item in bundle["artifacts"]]
 
 
+ACTIONS = {"status", "queue", "gc", "cancel", "trace", "wait", "artifacts"}
+
+
 def server_cli():
     from .server import Server
-    args = arguments()
+    server = Server(root_path("server"))
+    action = "invalid"
+    try:
+        args = arguments()
+        if args.items:
+            action = args.items[0] if args.items[0] in ACTIONS else "submit"
+        return dispatch(server, args)
+    except Refusal as error:
+        # Fixed error codes by subcommand show where agents misuse the CLI.
+        server.record_error(action, error.reason)
+        raise
+
+
+def dispatch(server, args):
     if args.wait_timeout is not None and (not math.isfinite(args.wait_timeout) or not 0 <= args.wait_timeout <= 86400):
         raise Refusal()
-    server = Server(root_path("server"))
     words = args.items
     if not words:
         raise Refusal()
@@ -95,7 +110,14 @@ def server_cli():
     if action == "status":
         if len(words) > 2:
             raise Refusal()
-        print_json(server.status(words[1]) if len(words) == 2 else {"channel": server.channel(), "jobs": server.queue()})
+        if len(words) == 2:
+            result = server.status(words[1])
+            server.note(words[1], "status")
+            if "outcome" in result:
+                server.note(words[1], "read")
+            print_json(result)
+        else:
+            print_json({"channel": server.channel(), "jobs": server.queue()})
         return 0
     if action == "queue":
         if len(words) != 1:
@@ -118,6 +140,7 @@ def server_cli():
             if args.after < 0:
                 raise Refusal()
             print_json({"job_id": job, "events": server.trace(job, args.after)})
+            server.note(job, "trace")
             return 0
         if action == "artifacts":
             if not args.into:
@@ -129,6 +152,7 @@ def server_cli():
             bundle = server.bundle(row)
             files = write_artifacts(bundle, args.into)
             server.ack(job, row["result_digest"], artifacts=True)
+            server.note(job, "fetched")
             print_json({"job_id": job, "artifacts": files})
             return 0
     else:
@@ -139,6 +163,9 @@ def server_cli():
         if args.background:
             print_json(result)
             return 0
+    if action == "wait":
+        server.job(job)
+        server.note(job, "wait")
     deadline = time.monotonic() + args.wait_timeout if args.wait_timeout is not None else None
     while True:
         row = server.job(job)
@@ -147,10 +174,13 @@ def server_cli():
             # Successful delivery to stdout is the consumer receipt boundary.
             print_json(result)
             server.ack(job, row["result_digest"])
+            server.note(job, "read")
             if not server.bundle(row)["artifacts"]:
                 server.ack(job, row["result_digest"], artifacts=True)
             return result["exit_code"]
         if deadline is not None and time.monotonic() >= deadline:
+            if action == "wait":
+                server.note(job, "wait_timeout")
             print_json({"job_id": job, "state": "pending", "reason": "WAIT_TIMEOUT"})
             return 75
         time.sleep(0.1)
