@@ -6,7 +6,7 @@ import secrets
 import shutil
 import time
 
-from .common import CAPACITY, RETENTION, Refusal, atomic, connect, digest, encode, event, immutable, opaque, private_dir, transaction, valid_id
+from .common import MAX_RECONCILE, RETENTION, Refusal, atomic, connect, digest, encode, event, immutable, opaque, private_dir, transaction, valid_id
 from .export import Publisher
 from .snapshot import freeze, safe_name
 
@@ -93,8 +93,8 @@ class Server:
         reserved = self.db.execute("SELECT COUNT(*) FROM jobs WHERE state='CLAIMED'").fetchone()[0]
         unknown = self.db.execute("SELECT COUNT(*) FROM jobs WHERE state='CLAIMED' AND result_digest IS NOT NULL").fetchone()[0]
         worker_state = self.db.execute("SELECT value FROM settings WHERE key='worker_state'").fetchone()
-        state = "AUTHORIZATION_REQUIRED" if not (self.root / "worker.token").exists() else "OFFLINE" if age is None or age > 180 else "LOW_SPACE" if worker_state and worker_state[0] == "LOW_SPACE" else "UNCERTAIN" if unknown else "BUSY" if reserved >= CAPACITY else "READY"
-        return {"state": state, "last_contact_age_seconds": age, "capacity": CAPACITY, "reserved": reserved}
+        state = "AUTHORIZATION_REQUIRED" if not (self.root / "worker.token").exists() else "OFFLINE" if age is None or age > 180 else "LOW_SPACE" if worker_state and worker_state[0] == "LOW_SPACE" else "UNCERTAIN" if unknown else "READY"
+        return {"state": state, "last_contact_age_seconds": age, "reserved": reserved}
 
     def queue(self):
         return [self.status(row[0]) for row in self.db.execute("SELECT id FROM jobs ORDER BY created DESC LIMIT 100")]
@@ -110,10 +110,7 @@ class Server:
             if previous:
                 row = self.job(previous[0]) if previous[0] else None
             else:
-                active = self.db.execute("SELECT COUNT(*) FROM jobs WHERE state='CLAIMED'").fetchone()[0]
-                row = None
-                if active < CAPACITY:
-                    row = self.db.execute("SELECT * FROM jobs AS candidate WHERE state='QUEUED' AND cancel=0 AND NOT EXISTS(SELECT 1 FROM jobs AS active WHERE active.workspace=candidate.workspace AND active.state='CLAIMED') ORDER BY created LIMIT 1").fetchone()
+                row = self.db.execute("SELECT * FROM jobs AS candidate WHERE state='QUEUED' AND cancel=0 AND NOT EXISTS(SELECT 1 FROM jobs AS active WHERE active.workspace=candidate.workspace AND active.state='CLAIMED') ORDER BY created LIMIT 1").fetchone()
                 if row:
                     claim = opaque()
                     self.db.execute("UPDATE jobs SET state='CLAIMED',claim=? WHERE id=?", (claim, row["id"]))
@@ -206,7 +203,7 @@ class Server:
             return self.claim(request.get("request_id"))
         if action == "reconcile":
             jobs = request.get("jobs")
-            if not isinstance(jobs, list) or len(jobs) > CAPACITY + 100:
+            if not isinstance(jobs, list) or len(jobs) > MAX_RECONCILE:
                 raise Refusal()
             response = []
             with transaction(self.db):
