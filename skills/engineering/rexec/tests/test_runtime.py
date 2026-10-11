@@ -499,6 +499,33 @@ sys.exit(result.returncode)
         self.assertEqual(receipt.returncode, 0)
         self.assertEqual(json.loads(receipt.stdout)["channel"]["state"], "AUTHORIZATION_REQUIRED")
 
+    def test_one_line_update_pulls_runtime_and_restarts_worker(self):
+        state = self.root / "install-state"
+        home = self.root / "home"
+        tools = self.root / "update-bin"
+        for path in (home, tools):
+            path.mkdir()
+        environment = dict(self.environment, REXEC_STATE_DIR=str(state), REXEC_INSTALL_BIN_DIR=str(self.root / "install-bin"))
+        self.assertEqual(subprocess.run(["bash", str(RUNTIME.parent / "install.sh")], env=environment, capture_output=True).returncode, 0)
+        (tools / "ssh").write_text('#!/bin/sh\n[ "$1" = vps-cc ] || exit 99\nexec sh -c "$2"\n')
+        (tools / "uv").write_text("#!/bin/sh\necho " + sys.executable + "\n")
+        log = self.root / "launchctl.log"
+        (tools / "launchctl").write_text('#!/bin/sh\necho "$1" >> ' + str(log) + '\nloaded=' + str(self.root / "loaded") + '\ncase "$1" in print) [ -e "$loaded" ];; bootstrap) touch "$loaded";; bootout) rm "$loaded";; esac\n')
+        for name in ("ssh", "uv", "launchctl"):
+            (tools / name).chmod(0o755)
+        environment = dict(os.environ, HOME=str(home), PATH=str(tools) + os.pathsep + os.environ["PATH"], REXEC_STATE_DIR=str(self.mac), REXEC_REMOTE_ROOT=str(state))
+        line = "mkdir -p ~/.rexec && ssh vps-cc 'cat " + str(state) + "/agent.sh' > ~/.rexec/agent.sh && bash ~/.rexec/agent.sh"
+        for _ in range(2):
+            result = subprocess.run(["bash", "-c", line], env=environment, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), {"updated": True, "running": True})
+        self.assertTrue((home / ".rexec/runtime/rexec_runtime/__main__.py").is_file())
+        self.assertFalse(list((home / ".rexec").glob(".runtime-*")))
+        installed = plistlib.loads((home / "Library/LaunchAgents/dev.xiaowan.rexec.worker.plist").read_bytes())
+        self.assertEqual(installed["EnvironmentVariables"]["PYTHONPATH"], str((home / ".rexec/runtime").resolve()))
+        self.assertEqual(log.read_text().split().count("bootstrap"), 2)
+        self.assertEqual(log.read_text().split().count("bootout"), 1)
+
     def test_service_install_plist_with_isolated_home(self):
         home = self.root / "home"
         parent = home / "Library/LaunchAgents"

@@ -12,9 +12,15 @@ A private dedicated worker credential binds the pair. Setup never prints it. Rou
 
 The repository provides deployment and user-service tooling; changing the checkout does not deploy the VPS or install the Mac service. Live setup needs the user's instruction.
 
-After the VPS installation is available, use the Mac wrapper:
+The VPS requires Python 3. Run `sudo bash install.sh` from this skill directory as the SSH account that will submit jobs. The installer preserves that initiating account as the owner of `/var/lib/rexec`, installs the three fixed endpoints under `/usr/local/bin`, places the Mac wrapper at `/var/lib/rexec/agent.sh`, and refuses an ambiguous direct-root installation. It does not provision a credential or start a service.
 
-The VPS requires Python 3. Run `sudo bash install.sh` from this skill directory as the SSH account that will submit jobs. The installer preserves that initiating account as the owner of `/var/lib/rexec`, installs the three fixed endpoints under `/usr/local/bin`, and refuses an ambiguous direct-root installation. It does not provision a credential or start a service. On the Mac, `agent.sh` uses `uv` to locate Python; install the worker from a stable copy of the skill so its executable and package paths remain available.
+After each VPS installation, install or update the Mac worker with one line (needs `uv`):
+
+```bash
+mkdir -p ~/.rexec && ssh vps-cc 'cat /var/lib/rexec/agent.sh' > ~/.rexec/agent.sh && bash ~/.rexec/agent.sh
+```
+
+With no arguments, `agent.sh` pulls the wrapper and the runtime matching the VPS into `~/.rexec`, stops the worker, swaps the runtime, provisions the credential if none exists, rewrites the LaunchAgent, and starts it. Running supervisors keep their deadlines across the restart. The individual steps remain available:
 
 ```bash
 bash agent.sh setup
