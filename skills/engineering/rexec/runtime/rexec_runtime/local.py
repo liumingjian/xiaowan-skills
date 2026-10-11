@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
 SUPERVISOR_START_GRACE = 2
+CLAIMS_PER_TICK = 8
+HEARTBEAT_INTERVAL = 30
 LOG_HEAD = MAX_LOG // 2
 LOG_TAIL = MAX_LOG - LOG_HEAD - 64
 
@@ -101,11 +103,14 @@ class Transport:
     def __init__(self, root):
         self.root = root
         self.maintenance = None
+        self.slowest = 0.0
 
     def call(self, action, **parameters):
         token = (self.root / "worker.token").read_text()
         request = encode({"token": token, "action": action, **parameters})
+        started = time.monotonic()
         response = ssh_exchange(self.root, "rexec-worker", request, self.maintenance)
+        self.slowest = max(self.slowest, time.monotonic() - started)
         try:
             value = json.loads(response)
             if not isinstance(value, dict):
@@ -123,6 +128,8 @@ class Local:
         self.db = connect(root, SCHEMA)
         self.transport = transport or Transport(self.root)
         self.stopping = lambda: False
+        self.heartbeat = (None, 0.0)
+        self.tick_seconds = 0.0
         for name in ("snapshots", "outbox", "jobs"):
             private_dir(self.root / name)
         literals = [str(Path.home()), str(self.root)]
@@ -175,6 +182,7 @@ class Local:
             self.db.execute("DELETE FROM settings WHERE key='claim_request'")
 
     def claim(self):
+        """Claim at most one job; return whether one arrived."""
         with transaction(self.db):
             row = self.db.execute("SELECT value FROM settings WHERE key='claim_request'").fetchone()
             request = row[0] if row else opaque()
@@ -182,9 +190,18 @@ class Local:
         response = self.transport.call("claim", request_id=request)
         if response.get("job"):
             self.receive(response)
-        else:
-            with transaction(self.db):
-                self.db.execute("DELETE FROM settings WHERE key='claim_request'")
+            return True
+        with transaction(self.db):
+            self.db.execute("DELETE FROM settings WHERE key='claim_request'")
+        return False
+
+    def scrub(self, job):
+        """Drop a finished job's bulky files; the sealed outbox keeps its result."""
+        folder = self.root / "jobs" / job
+        for name in ("workspace", "tmp", "artifacts"):
+            path = folder / name
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
 
     def terminal(self, job, outcome, code, reason, stdout=b"", stderr=b"", truncated=False):
         with transaction(self.db):
@@ -322,22 +339,33 @@ class Local:
                     self.db.execute("UPDATE jobs SET acknowledged=1 WHERE id=?", (row["id"],))
 
     def tick(self):
+        started = time.monotonic()
         self.recover()
         if self.stopping():
             return
-        self.transport.call("heartbeat", state="READY" if self.space() else "LOW_SPACE")
+        state = "READY" if self.space() else "LOW_SPACE"
+        # Every RPC refreshes last contact, so heartbeat only reports state changes and timing.
+        if self.heartbeat[0] != state or time.monotonic() - self.heartbeat[1] >= HEARTBEAT_INTERVAL:
+            slowest = getattr(self.transport, "slowest", 0.0)
+            self.transport.call("heartbeat", state=state, timing={"tick": round(self.tick_seconds, 3), "rpc": round(slowest, 3)})
+            self.heartbeat = (state, time.monotonic())
+            if hasattr(self.transport, "slowest"):
+                self.transport.slowest = 0.0
         if self.stopping():
             return
         self.reconcile()
+        # Claim everything available first so newly received jobs launch in this same tick.
+        for _ in range(CLAIMS_PER_TICK):
+            if self.stopping() or not self.space() or not self.claim():
+                break
         for row in self.db.execute("SELECT id,state FROM jobs WHERE state IN ('RECEIVED','PREPARING','READY') ORDER BY created").fetchall():
             if self.stopping():
                 return
             if row["state"] != "READY":
                 self.prepare(row["id"])
             self.launch(row["id"])
-        if not self.stopping() and self.space():
-            self.claim()
         self.gc()
+        self.tick_seconds = time.monotonic() - started
 
     def gc(self):
         for row in self.db.execute("SELECT * FROM jobs WHERE state='TERMINAL' AND acknowledged=1 AND completed<?", (time.time() - RETENTION,)).fetchall():
@@ -359,10 +387,16 @@ class Local:
                     path.unlink()
             elif ID.fullmatch(path.name) and path.name not in referenced_jobs:
                 path.unlink()
-        snapshots = {row[0] for row in self.db.execute("SELECT snapshot FROM jobs")}
+        snapshots = {row[0] for row in self.db.execute("SELECT snapshot FROM jobs WHERE state!='TERMINAL'")}
         for path in (self.root / "snapshots").iterdir():
             if path.name not in snapshots:
                 path.unlink()
+        # Fallback for supervisors that died before scrubbing, and for jobs that never ran.
+        for row in self.db.execute("SELECT id FROM jobs WHERE state='TERMINAL'").fetchall():
+            folder = self.root / "jobs" / row[0]
+            if any((folder / name).exists() for name in ("workspace", "tmp", "artifacts")):
+                if json.loads((self.root / "outbox" / row[0]).read_bytes())["outcome"] != "unknown":
+                    self.scrub(row[0])
 
     def view(self, job=None):
         if job:
@@ -543,6 +577,8 @@ def supervise(root, job):
         if code < 0:
             code = min(255, 128 - code)
         local.terminal(job, outcome, code, reason, (folder / "stdout").read_bytes(), (folder / "stderr").read_bytes(), truncated)
+        if outcome != "unknown":
+            local.scrub(job)
     except BaseException:
         if process is not None and process.returncode is None:
             with contextlib.suppress(ProcessLookupError):

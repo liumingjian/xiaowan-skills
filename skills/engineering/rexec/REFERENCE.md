@@ -53,7 +53,7 @@ Default submission durably enqueues, then waits. `--background` returns acceptan
 
 `--no-sync` supplies an empty snapshot, not a previous project checkout. Submission freezes the input snapshot. The worker verifies its digest before extraction; rejected sync does not execute stale files. Sync excludes fixed secret paths, dependency caches, `.codex-out/`, and `.git` by default. Explicit history transfer excludes Git hooks and local credential configuration. Snapshot validation rejects unsafe paths, links, special files, and excessive file counts or bytes. Snapshot exclusions are fixed; do not infer them from `.gitignore`. Keep handoffs outside excluded secret and dependency paths.
 
-Commands sharing a source workspace execute serially. Different workspaces execute concurrently without a global limit. Tool-native dependency caches can persist, but cache reuse must respect ownership and prevent concurrent unsafe mutation. For Python work, use `uv` and reuse a suitable environment. Dependencies needed inside a network-restricted tool must be prepared before delegation.
+Commands sharing a source workspace execute serially. Different workspaces execute concurrently without a global limit. Each worker tick claims every available job (up to eight) and launches it in the same tick. `rexec status` reports `channel.worker_timing`: the last tick and slowest SSH round trip in seconds, refreshed every 30 seconds. A slow `rpc` points at SSH connection setup; enable `ControlMaster`/`ControlPersist` for `vps-cc` in the Mac's SSH config. Tool-native dependency caches can persist, but cache reuse must respect ownership and prevent concurrent unsafe mutation. For Python work, use `uv` and reuse a suitable environment. Dependencies needed inside a network-restricted tool must be prepared before delegation.
 
 ## Recovery and results
 
@@ -89,4 +89,4 @@ To publish results, write only the requested regular UTF-8 text files beneath `$
 
 ## Retention
 
-Low disk space pauses claims and spawn. GC preserves active jobs, unknown execution, and unacknowledged results. Acknowledged results have a default retention of seven days. `rexec gc` previews eligible cleanup; `rexec gc --apply` applies it. Cleanup does not cancel work or scan unrelated home files.
+Low disk space pauses claims and spawn. A finished job's Mac workspace, `$TMPDIR`, artifact staging, and snapshot are deleted as soon as its result is sealed; unknown execution keeps them. GC preserves active jobs, unknown execution, and unacknowledged results. Acknowledged results and private logs have a default retention of seven days. The server applies GC hourly on worker heartbeat; `rexec gc` previews eligible cleanup and `rexec gc --apply` applies it now. Cleanup does not cancel work or scan unrelated home files.
