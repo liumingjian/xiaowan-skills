@@ -53,7 +53,7 @@ Default submission durably enqueues, then waits. `--background` returns acceptan
 
 `--no-sync` supplies an empty snapshot, not a previous project checkout. Submission freezes the input snapshot. The worker verifies its digest before extraction; rejected sync does not execute stale files. Sync excludes fixed secret paths, dependency caches, `.codex-out/`, and `.git` by default. Explicit history transfer excludes Git hooks and local credential configuration. Snapshot validation rejects unsafe paths, links, special files, and excessive file counts or bytes. Snapshot exclusions are fixed; do not infer them from `.gitignore`. Keep handoffs outside excluded secret and dependency paths.
 
-Commands sharing a source workspace execute serially. Different workspaces execute concurrently without a global limit. Each worker tick claims every available job (up to eight) and launches it in the same tick. `rexec status` reports `channel.worker_timing`: the last tick and slowest SSH round trip in seconds, refreshed every 30 seconds. A slow `rpc` points at SSH connection setup; enable `ControlMaster`/`ControlPersist` for `vps-cc` in the Mac's SSH config. Tool-native dependency caches can persist, but cache reuse must respect ownership and prevent concurrent unsafe mutation. For Python work, use `uv` and reuse a suitable environment. Dependencies needed inside a network-restricted tool must be prepared before delegation.
+Commands sharing a source workspace execute serially. Different workspaces execute concurrently without a global limit. Each worker tick claims every available job (up to eight) and launches it in the same tick. `rexec status` reports `channel.worker_timing`: the last tick and slowest SSH round trip in seconds, refreshed every 30 seconds. A slow `rpc` points at SSH connection setup; enable `ControlMaster`/`ControlPersist` for `vps-cc` in the Mac's SSH config. `channel.recent_failures` counts failed worker ticks from the last hour by fixed reason, and `channel.last_failure` names the latest one with its age. `RPC_TIMEOUT`, `SSH_FAILED`, and `RPC_INVALID` are transport failures; a server refusal keeps its own code; `OS_ERROR` and `INTERNAL` are local; `WORKER_CRASH` counts a restart after a crash. The latest tick traceback stays private on the Mac in `tick.failure` and a crash traceback in `worker.failure`. Tool-native dependency caches can persist, but cache reuse must respect ownership and prevent concurrent unsafe mutation. For Python work, use `uv` and reuse a suitable environment. Dependencies needed inside a network-restricted tool must be prepared before delegation.
 
 ## Recovery and results
 
@@ -73,7 +73,7 @@ The Mac seals a result before publication and retains its outbox until the VPS r
 | Wait deadline expired | 75, still pending |
 | Unknown execution | Distinct nonzero status with a fixed reason code |
 
-Use the receipt's outcome to distinguish an infrastructure state from a program that returns the same numeric code. Wait interruption and viewer closure never cancel execution.
+Use the receipt's outcome to distinguish an infrastructure state from a program that returns the same numeric code. Every receipt carries `timing` in seconds: `queued_s` from submission to claim (growing while queued), `start_s` from Mac receipt to command start, `run_s` for the command itself, and `report_s` for the rest, mostly result delivery. A phase that has not happened yet, or was not recorded, is `null`. Wait interruption and viewer closure never cancel execution.
 
 ## Output and artifacts
 
@@ -90,3 +90,5 @@ To publish results, write only the requested regular UTF-8 text files beneath `$
 ## Retention
 
 Low disk space pauses claims and spawn. A finished job's Mac workspace, `$TMPDIR`, artifact staging, and snapshot are deleted as soon as its result is sealed; unknown execution keeps them. Deletion renames the tree into `trash/` and a background `rm -rf` removes it, so cleanup never blocks the worker tick. GC preserves active jobs, unknown execution, and unacknowledged results. Acknowledged results and private logs have a default retention of seven days. The server applies GC hourly on worker heartbeat; `rexec gc` previews eligible cleanup and `rexec gc --apply` applies it now. Cleanup does not cancel work or scan unrelated home files.
+
+The VPS also keeps a per-job history for 90 days, independent of the seven-day cleanup: submission channel state, phase timings, outcome, reason, CLI usage counts, and a 12-character keyed command fingerprint that groups repeats of one command without storing it in an exportable form. The fingerprint key stays in `/var/lib/rexec`. Worker failure counts and CLI error codes share the same 90-day history.

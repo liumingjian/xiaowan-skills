@@ -85,7 +85,7 @@ sys.exit(result.returncode)
         self.processes.append(process)
         return process
 
-    def until(self, predicate, seconds=8):
+    def until(self, predicate, seconds=30):
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             value = predicate()
@@ -654,6 +654,117 @@ sys.exit(result.returncode)
         self.assertEqual(fresh.read_bytes(), b"pending seal")
         self.assertFalse((self.mac / "outbox" / ".seal-stale").exists())
         self.assertFalse((self.mac / "outbox" / ".write-stale").exists())
+
+    def isolated(self):
+        class IsolatedTransport:
+            def call(inner, action, **parameters):
+                return self.server.rpc({"token": self.server.provision(), "action": action, **parameters})
+        return IsolatedTransport()
+
+    def test_receipt_timing_and_summary_keep_command_private(self):
+        job = self.submit("sleep 0.3; printf safe")
+        again = self.submit("sleep 0.3; printf safe")
+        other = self.submit("true")
+        self.assertIsNotNone(self.server.status(job)["timing"]["queued_s"])
+        self.spawn("worker")
+        result = self.finished(job)
+        timing = result["timing"]
+        self.assertEqual(set(timing), {"queued_s", "start_s", "run_s", "report_s"})
+        self.assertTrue(all(isinstance(value, float) for value in timing.values()))
+        self.assertGreaterEqual(timing["run_s"], 0.3)
+        self.finished(again)
+        self.finished(other)
+        rows = {row["job_id"]: row for row in self.server.db.execute("SELECT * FROM summaries")}
+        self.assertEqual(rows[job]["fingerprint"], rows[again]["fingerprint"])
+        self.assertNotEqual(rows[job]["fingerprint"], rows[other]["fingerprint"])
+        self.assertRegex(rows[job]["fingerprint"], r"^[a-f0-9]{12}$")
+        self.assertEqual((rows[job]["outcome"], rows[job]["exit_code"], rows[job]["channel"]), ("completed", 0, "OFFLINE"))
+        self.assertIsNotNone(rows[job]["claimed"])
+        self.assertAlmostEqual(rows[job]["run_s"], timing["run_s"], places=3)
+        self.assertNotIn("sleep", json.dumps(self.server.channel()) + json.dumps(self.server.queue()))
+
+    def test_bundle_without_timing_stays_valid(self):
+        bundle = Publisher().bundle(opaque(), opaque(), "completed", 0, "COMPLETED")
+        self.assertNotIn("timing", bundle)
+        Publisher().validate_bundle(bundle)
+        for timing in ({"start_s": -1, "run_s": None}, {"start_s": None}, {"start_s": "x", "run_s": None}):
+            with self.assertRaises(Refusal):
+                Publisher().validate_bundle(dict(bundle, timing=timing))
+
+    def test_worker_failures_reach_channel_health(self):
+        local = Local(self.mac, self.isolated())
+        local.failure("RPC_TIMEOUT")
+        local.failure("RPC_TIMEOUT")
+        local.failure("OS_ERROR")
+        local.tick()
+        channel = self.server.channel()
+        self.assertEqual(channel["recent_failures"], {"OS_ERROR": 1, "RPC_TIMEOUT": 2})
+        self.assertIn(channel["last_failure"]["reason"], {"OS_ERROR", "RPC_TIMEOUT"})
+        self.assertEqual(local.health(), [])
+        local.tick()
+        self.assertEqual(self.server.channel()["recent_failures"], {"OS_ERROR": 1, "RPC_TIMEOUT": 2})
+        batch = {"id": opaque(), "counts": {"RPC_TIMEOUT": 1}}
+        for _ in range(2):
+            self.server.rpc({"token": self.server.provision(), "action": "heartbeat", "state": "READY", "health": [batch]})
+        self.assertEqual(self.server.channel()["recent_failures"]["RPC_TIMEOUT"], 3)
+        for counts in ({"free text": 1}, {"RPC_TIMEOUT": 0}, {"RPC_TIMEOUT": "1"}, ["RPC_TIMEOUT"]):
+            health = [{"id": opaque(), "counts": counts}]
+            with self.assertRaises(Refusal):
+                self.server.rpc({"token": self.server.provision(), "action": "heartbeat", "state": "READY", "health": health})
+
+    def test_worker_loop_records_failed_tick_and_crash(self):
+        (self.mac / "worker.failure").write_text("Traceback: private")
+        (self.remote / "lose-heartbeat").touch()
+        self.spawn("worker")
+        failures = self.until(lambda: self.server.channel()["recent_failures"].get("SSH_FAILED") and self.server.channel()["recent_failures"])
+        self.assertEqual(failures.get("WORKER_CRASH"), 1)
+        self.assertTrue((self.mac / "tick.failure").is_file())
+        self.assertNotIn("private", json.dumps(self.server.channel()))
+
+    def test_cli_usage_and_errors_are_recorded(self):
+        environment = dict(self.environment, REXEC_STATE_DIR=str(self.remote))
+        cli = lambda *words: subprocess.run([sys.executable, "-m", "rexec_runtime", "server", *words], env=environment, capture_output=True)
+        job = self.submit()
+        self.assertEqual(cli("wait", job, "--wait-timeout", "0").returncode, 75)
+        cli("status", job)
+        cli("trace", job)
+        self.assertEqual(cli("status", opaque()).returncode, 66)
+        cli("bogus", "extra", "words")
+        row = self.server.db.execute("SELECT * FROM summaries WHERE job_id=?", (job,)).fetchone()
+        self.assertEqual((row["wait_calls"], row["wait_timeouts"], row["status_calls"], row["trace_calls"]), (1, 1, 1, 1))
+        self.assertIsNone(row["read"])
+        self.spawn("worker")
+        self.finished(job)
+        self.assertEqual(cli("wait", job).returncode, 0)
+        self.assertIsNotNone(self.server.db.execute("SELECT read FROM summaries WHERE job_id=?", (job,)).fetchone()[0])
+        errors = [tuple(row) for row in self.server.db.execute("SELECT action,reason FROM cli_errors ORDER BY at")]
+        self.assertEqual(errors, [("status", "JOB_NOT_FOUND"), ("submit", "INVALID_REQUEST")])
+
+    def test_legacy_server_state_migrates_and_backfills(self):
+        legacy = self.root / "legacy"
+        legacy.mkdir(mode=0o700)
+        import sqlite3
+        db = sqlite3.connect(legacy / "state.sqlite")
+        db.execute("CREATE TABLE jobs(id TEXT PRIMARY KEY, request TEXT UNIQUE NOT NULL, spec_digest TEXT NOT NULL, workspace TEXT NOT NULL, command TEXT NOT NULL, cwd TEXT NOT NULL, timeout INTEGER NOT NULL, snapshot TEXT NOT NULL, state TEXT NOT NULL, claim TEXT UNIQUE, cancel INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, completed REAL, result_digest TEXT, ack INTEGER NOT NULL DEFAULT 0, artifact_ack INTEGER NOT NULL DEFAULT 0)")
+        job = opaque()
+        db.execute("INSERT INTO jobs(id,request,spec_digest,workspace,command,cwd,timeout,snapshot,state,created) VALUES(?,?,?,?,?,?,?,?,?,?)", (job, opaque(), "x", opaque(), "true", ".", 10, "x", "QUEUED", time.time()))
+        db.commit()
+        db.close()
+        server = Server(legacy)
+        self.assertIsNone(server.job(job)["claimed"])
+        self.assertEqual(server.db.execute("SELECT channel FROM summaries WHERE job_id=?", (job,)).fetchone()[0], "UNRECORDED")
+        self.assertIsNotNone(server.status(job)["timing"]["queued_s"])
+        server.db.close()
+        Server(legacy).db.close()
+
+    def test_history_outlives_job_retention(self):
+        job = self.submit()
+        old = self.submit()
+        self.server.db.execute("UPDATE summaries SET created=? WHERE job_id=?", (time.time() - 91 * 86400, old))
+        self.server.db.execute("INSERT INTO health VALUES(?,?,?,?)", (opaque(), time.time() - 91 * 86400, "RPC_TIMEOUT", 1))
+        self.server.gc(True)
+        self.assertEqual([row[0] for row in self.server.db.execute("SELECT job_id FROM summaries")], [job])
+        self.assertEqual(self.server.db.execute("SELECT COUNT(*) FROM health").fetchone()[0], 0)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 
-from .common import ID, MAX_LOG, MAX_RECONCILE, MAX_RPC, MIN_FREE, RETENTION, Refusal, atomic, connect, digest, encode, event, immutable, opaque, private_dir, read_json, transaction, valid_id
+from .common import CODE, ID, MAX_LOG, MAX_RECONCILE, MAX_RPC, MIN_FREE, RETENTION, Refusal, atomic, connect, digest, encode, event, immutable, opaque, private_dir, read_json, transaction, valid_id
 from .export import Publisher
 from .snapshot import extract
 
@@ -56,7 +56,7 @@ def ssh_exchange(root, endpoint, request, maintenance=None):
                 maintenance()
                 next_maintenance = time.monotonic() + 0.5
             if time.monotonic() >= deadline:
-                raise Refusal("CONNECTIVITY", 75)
+                raise Refusal("RPC_TIMEOUT", 75)
             for key, _ in selector.select(min(0.1, max(0, deadline - time.monotonic()))):
                 if key.data == "input":
                     try:
@@ -74,7 +74,7 @@ def ssh_exchange(root, endpoint, request, maintenance=None):
                     elif key.data == "output":
                         response.extend(chunk)
                         if len(response) > MAX_RPC:
-                            raise Refusal("CONNECTIVITY", 75)
+                            raise Refusal("RPC_INVALID", 75)
                     else:
                         kept = chunk[:max(0, MAX_LOG - error_size)]
                         os.write(error_fd, kept)
@@ -82,9 +82,9 @@ def ssh_exchange(root, endpoint, request, maintenance=None):
         try:
             process.wait(timeout=max(0.001, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
-            raise Refusal("CONNECTIVITY", 75)
+            raise Refusal("RPC_TIMEOUT", 75)
         if process.returncode:
-            raise Refusal("CONNECTIVITY", 75)
+            raise Refusal("SSH_FAILED", 75)
         return bytes(response)
     finally:
         if process.poll() is None:
@@ -116,9 +116,11 @@ class Transport:
             if not isinstance(value, dict):
                 raise ValueError()
         except (ValueError, UnicodeError):
-            raise Refusal("CONNECTIVITY", 75)
+            raise Refusal("RPC_INVALID", 75)
         if "error" in value:
-            raise Refusal("AUTHORIZATION_REQUIRED" if value["error"] == "AUTHORIZATION_REQUIRED" else "CONNECTIVITY", 75)
+            # Server errors are fixed codes; keep them so worker health names the refusal.
+            error = value["error"]
+            raise Refusal(error if isinstance(error, str) and CODE.fullmatch(error) else "RPC_REFUSED", 75)
         return value
 
 
@@ -226,15 +228,18 @@ class Local:
                 artifacts = self.publisher.artifacts(self.root / "jobs" / job / "artifacts")
             except Exception:
                 reason = "ARTIFACT_BLOCKED"
-            bundle = self.publisher.bundle(job, row["claim"], outcome, code, reason, stdout, stderr, artifacts, truncated)
+            now = time.time()
+            started = row["started"]
+            timing = {"start_s": round(max(0.0, started - row["created"]), 3) if started else None, "run_s": round(max(0.0, now - started), 3) if started else None}
+            bundle = self.publisher.bundle(job, row["claim"], outcome, code, reason, stdout, stderr, artifacts, truncated, timing)
             try:
                 self.publisher.validate_bundle(bundle)
             except Exception:
-                bundle = self.publisher.bundle(job, row["claim"], outcome, code, "OUTPUT_BLOCKED", truncated=truncated)
+                bundle = self.publisher.bundle(job, row["claim"], outcome, code, "OUTPUT_BLOCKED", truncated=truncated, timing=timing)
                 self.publisher.validate_bundle(bundle)
             data = encode(bundle)
             immutable(self.root / "outbox" / job, data)
-            self.db.execute("UPDATE jobs SET state='TERMINAL',result_digest=?,completed=? WHERE id=?", (digest(data), time.time(), job))
+            self.db.execute("UPDATE jobs SET state='TERMINAL',result_digest=?,completed=? WHERE id=?", (digest(data), now, job))
             event(self.db, job, "TERMINAL", bundle["reason"], outcome)
 
     def prepare(self, job):
@@ -357,10 +362,20 @@ class Local:
         if self.stopping():
             return
         state = "READY" if self.space() else "LOW_SPACE"
-        # Every RPC refreshes last contact, so heartbeat only reports state changes and timing.
-        if self.heartbeat[0] != state or time.monotonic() - self.heartbeat[1] >= HEARTBEAT_INTERVAL:
+        health = self.health()
+        # Every RPC refreshes last contact, so heartbeat only reports state changes, timing, and failures.
+        if health or self.heartbeat[0] != state or time.monotonic() - self.heartbeat[1] >= HEARTBEAT_INTERVAL:
             slowest = getattr(self.transport, "slowest", 0.0)
-            self.transport.call("heartbeat", state=state, timing={"tick": round(self.tick_seconds, 3), "rpc": round(slowest, 3)})
+            extra = {}
+            if health:
+                # Sent batches are frozen; the server ignores a batch it already stored.
+                health = [dict(batch, sent=True) for batch in health][-16:]
+                self.store_health(health)
+                extra["health"] = [{"id": batch["id"], "counts": batch["counts"]} for batch in health]
+            self.transport.call("heartbeat", state=state, timing={"tick": round(self.tick_seconds, 3), "rpc": round(slowest, 3)}, **extra)
+            if health:
+                with transaction(self.db):
+                    self.store_health([batch for batch in self.health() if batch["id"] not in {sent["id"] for sent in health}])
             self.heartbeat = (state, time.monotonic())
             if hasattr(self.transport, "slowest"):
                 self.transport.slowest = 0.0
@@ -412,6 +427,38 @@ class Local:
                     self.scrub(row[0])
         self.sweep()
 
+    def health(self):
+        row = self.db.execute("SELECT value FROM settings WHERE key='health'").fetchone()
+        return json.loads(row[0]) if row else []
+
+    def store_health(self, batches):
+        if batches:
+            self.db.execute("INSERT OR REPLACE INTO settings VALUES('health',?)", (json.dumps(batches, sort_keys=True),))
+        else:
+            self.db.execute("DELETE FROM settings WHERE key='health'")
+
+    def failure(self, reason):
+        """Count a failed tick by fixed reason until a heartbeat delivers the counts."""
+        with transaction(self.db):
+            health = self.health()
+            if not health or health[-1]["sent"]:
+                health.append({"id": opaque(), "counts": {}, "sent": False})
+            counts = health[-1]["counts"]
+            counts[reason] = min(1000000, counts.get(reason, 0) + 1)
+            self.store_health(health[-16:])
+
+    def crashed(self):
+        """Count a worker crash once; its traceback stays in the private worker.failure."""
+        path = self.root / "worker.failure"
+        if not path.exists():
+            return
+        seen = self.db.execute("SELECT value FROM settings WHERE key='crash_seen'").fetchone()
+        mtime = path.stat().st_mtime
+        if seen is None or float(seen[0]) < mtime:
+            self.failure("WORKER_CRASH")
+            with transaction(self.db):
+                self.db.execute("INSERT OR REPLACE INTO settings VALUES('crash_seen',?)", (str(mtime),))
+
     def view(self, job=None):
         if job:
             self.row(job)
@@ -446,14 +493,21 @@ def worker(root):
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     await_reserved_supervisors(local)
+    local.crashed()
     local.recover()
     delay = 0.25
     while not stopping:
         try:
             local.tick()
             delay = 0.25
-        except (Refusal, OSError, ValueError, KeyError):
+        except (Refusal, OSError, ValueError, KeyError) as error:
             delay = min(30, delay * 2)
+            reason = error.reason if isinstance(error, Refusal) and CODE.fullmatch(error.reason) else "OS_ERROR" if isinstance(error, OSError) else "INTERNAL"
+            with contextlib.suppress(Exception):
+                local.failure(reason)
+                # The latest traceback stays private on the Mac for explicit inspection.
+                import traceback
+                atomic(local.root / "tick.failure", traceback.format_exc().encode()[:MAX_LOG])
         deadline = time.monotonic() + delay
         while not stopping and time.monotonic() < deadline:
             time.sleep(min(0.1, deadline - time.monotonic()))
