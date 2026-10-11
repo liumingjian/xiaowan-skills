@@ -42,6 +42,7 @@ rexec trace JOB [--after SEQUENCE]
 rexec cancel JOB
 rexec gc
 rexec gc --apply
+rexec report [--since 7d]
 ```
 
 Inspect the cleanup preview before applying it. Explicit cancellation stops only that job. Closing a viewer or interrupting `wait` leaves execution running until completion, explicit cancellation, or its deadline.
@@ -54,7 +55,7 @@ When rexec surprises you or gets in your way (a confusing receipt, an unexplaine
 rexec feedback [JOB] --category confusing_output|unexpected_failure|slow|missing_capability|docs_unclear|other --note 'what you expected and what happened'
 ```
 
-Reserve it for surprises; a job that behaved as documented needs no note. Keep the note to 280 characters of plain description, without command text, paths, or output. The user reviews notes to improve rexec.
+Reserve it for surprises; a job that behaved as documented needs no note. Keep the note to 280 characters of plain description, without command text, paths, or output. When the user asks how rexec is doing or what to improve, run `rexec report` and summarize its failures, slow phases, health, usage, and notes into concrete fixes.
 
 ## Privacy
 

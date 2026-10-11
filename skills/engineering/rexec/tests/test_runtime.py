@@ -75,7 +75,15 @@ sys.exit(result.returncode)
         time.sleep(0.15)
         local.db.close()
         self.server.db.close()
-        self.temporary.cleanup()
+        # A worker's fake-ssh RPC runs in its own session and can outlive the worker briefly.
+        for _ in range(30):
+            try:
+                self.temporary.cleanup()
+                break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            self.temporary.cleanup()
 
     def submit(self, command="printf safe", **kw):
         return self.server.submit(command, self.source, ".", kw.get("timeout", 10), kw.get("request", opaque()), kw.get("with_git", False))["job_id"]
@@ -786,6 +794,45 @@ sys.exit(result.returncode)
         self.server.db.execute("UPDATE feedback SET at=?", (time.time() - 91 * 86400,))
         self.server.gc(True)
         self.assertEqual(self.server.db.execute("SELECT COUNT(*) FROM feedback").fetchone()[0], 0)
+
+    def test_report_aggregates_history_without_private_text(self):
+        environment = dict(self.environment, REXEC_STATE_DIR=str(self.remote))
+        cli = lambda *words: subprocess.run([sys.executable, "-m", "rexec_runtime", "server", *words], env=environment, capture_output=True)
+        ok = self.submit("printf secretword")
+        bad = self.submit("exit 3")
+        worker = self.spawn("worker")
+        self.finished(ok)
+        self.finished(bad)
+        rerun = self.submit("exit 3")
+        self.finished(rerun)
+        # Stop the worker so its in-flight RPCs finish before teardown removes the state.
+        worker.kill()
+        worker.wait()
+        time.sleep(1)
+        self.server.feedback(bad, "unexpected_failure", "exit 3 surprised me")
+        self.server.db.execute("UPDATE summaries SET completed=completed-90000,claimed=claimed-90000,created=created-90000 WHERE job_id=?", (ok,))
+        self.server.db.execute("INSERT INTO health VALUES(?,?,?,?)", (opaque(), time.time(), "RPC_TIMEOUT", 2))
+        cli("status", opaque())
+        result = cli("report")
+        self.assertEqual(result.returncode, 0)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["window"], {"since_seconds": 604800, "jobs": 3, "failed": 2})
+        self.assertEqual(report["outcomes"], {"completed:COMPLETED": 3})
+        self.assertEqual(report["timing"]["run_s"]["count"], 3)
+        self.assertLessEqual(report["timing"]["run_s"]["p50"], report["timing"]["run_s"]["p95"])
+        self.assertEqual(report["health"], {"RPC_TIMEOUT": 2})
+        self.assertEqual(report["usage"]["unread_results"], 1)
+        self.assertEqual(report["usage"]["cli_errors"], {"status:JOB_NOT_FOUND": 1})
+        self.assertEqual(len(report["failing_commands"]), 1)
+        self.assertEqual(report["failing_commands"][0]["runs"], 2)
+        self.assertEqual(report["failing_commands"][0]["failures"], 2)
+        self.assertEqual(report["feedback"]["categories"], {"unexpected_failure": 1})
+        self.assertEqual(report["feedback"]["recent"][0]["note"], "exit 3 surprised me")
+        self.assertNotIn(b"secretword", result.stdout)
+        self.assertEqual(json.loads(cli("report", "--since", "1h").stdout)["window"]["jobs"], 2)
+        for since in ("0d", "91d", "7", "-1d", "1w"):
+            self.assertEqual(cli("report", "--since", since).returncode, 2)
+        self.assertEqual(self.server.overview(3600)["timing"]["queued_s"]["count"], 2)
 
 
 if __name__ == "__main__":
