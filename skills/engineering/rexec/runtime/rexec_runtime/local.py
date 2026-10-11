@@ -130,7 +130,8 @@ class Local:
         self.stopping = lambda: False
         self.heartbeat = (None, 0.0)
         self.tick_seconds = 0.0
-        for name in ("snapshots", "outbox", "jobs"):
+        self.sweeper = None
+        for name in ("snapshots", "outbox", "jobs", "trash"):
             private_dir(self.root / name)
         literals = [str(Path.home()), str(self.root)]
         if (self.root / "worker.token").exists():
@@ -195,13 +196,25 @@ class Local:
             self.db.execute("DELETE FROM settings WHERE key='claim_request'")
         return False
 
+    def discard(self, path):
+        """Move a directory into trash; renaming is instant even for a huge tree."""
+        os.rename(path, self.root / "trash" / opaque())
+
+    def sweep(self):
+        # Deleting dependency trees can take minutes, so it never runs inside a tick.
+        if self.sweeper is not None and self.sweeper.poll() is None:
+            return
+        entries = [str(path) for path in (self.root / "trash").iterdir()]
+        if entries:
+            self.sweeper = subprocess.Popen(["rm", "-rf", "--", *entries], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+
     def scrub(self, job):
         """Drop a finished job's bulky files; the sealed outbox keeps its result."""
         folder = self.root / "jobs" / job
         for name in ("workspace", "tmp", "artifacts"):
             path = folder / name
             if path.is_dir() and not path.is_symlink():
-                shutil.rmtree(path)
+                self.discard(path)
 
     def terminal(self, job, outcome, code, reason, stdout=b"", stderr=b"", truncated=False):
         with transaction(self.db):
@@ -237,7 +250,7 @@ class Local:
         folder = private_dir(self.root / "jobs" / job)
         workspace = folder / "workspace"
         if workspace.exists():
-            shutil.rmtree(workspace)
+            self.discard(workspace)
         try:
             extract((self.root / "snapshots" / row["snapshot"]).read_bytes(), row["snapshot"], workspace)
             cwd = json.loads(row["spec"])["cwd"]
@@ -378,7 +391,7 @@ class Local:
         referenced_jobs = {row[0] for row in self.db.execute("SELECT id FROM jobs")}
         for path in (self.root / "jobs").iterdir():
             if ID.fullmatch(path.name) and path.name not in referenced_jobs and not path.is_symlink():
-                shutil.rmtree(path)
+                self.discard(path)
         for path in (self.root / "outbox").iterdir():
             if path.is_symlink():
                 continue
@@ -397,6 +410,7 @@ class Local:
             if any((folder / name).exists() for name in ("workspace", "tmp", "artifacts")):
                 if json.loads((self.root / "outbox" / row[0]).read_bytes())["outcome"] != "unknown":
                     self.scrub(row[0])
+        self.sweep()
 
     def view(self, job=None):
         if job:
@@ -579,6 +593,7 @@ def supervise(root, job):
         local.terminal(job, outcome, code, reason, (folder / "stdout").read_bytes(), (folder / "stderr").read_bytes(), truncated)
         if outcome != "unknown":
             local.scrub(job)
+            local.sweep()
     except BaseException:
         if process is not None and process.returncode is None:
             with contextlib.suppress(ProcessLookupError):

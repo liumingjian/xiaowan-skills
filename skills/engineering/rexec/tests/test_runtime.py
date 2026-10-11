@@ -594,7 +594,7 @@ sys.exit(result.returncode)
         local.prepare(job)
         local.terminal(job, "completed", 0, "COMPLETED")
         local.db.execute("UPDATE jobs SET acknowledged=1,completed=0 WHERE id=?", (job,))
-        with patch("rexec_runtime.local.shutil.rmtree", side_effect=OSError("cleanup interrupted")), self.assertRaises(OSError):
+        with patch.object(local, "discard", side_effect=OSError("cleanup interrupted")), self.assertRaises(OSError):
             local.gc()
         self.assertIsNone(local.db.execute("SELECT id FROM jobs WHERE id=?", (job,)).fetchone())
         self.assertTrue((self.mac / "jobs" / job).is_dir())
@@ -630,6 +630,8 @@ sys.exit(result.returncode)
             self.assertFalse((self.mac / "jobs" / job / name).exists())
         self.assertEqual(list((self.mac / "snapshots").iterdir()), [])
         self.assertTrue((self.mac / "outbox" / job).is_file())
+        local.sweeper.wait(timeout=10)
+        self.assertEqual(list((self.mac / "trash").iterdir()), [])
 
     def test_invalid_wait_deadline_has_no_submission_side_effect(self):
         environment = dict(self.environment, REXEC_STATE_DIR=str(self.remote))
