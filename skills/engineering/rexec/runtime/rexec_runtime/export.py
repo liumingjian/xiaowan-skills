@@ -8,6 +8,7 @@ import stat
 
 from .common import MAX_ARTIFACT, MAX_ARTIFACTS, MAX_OUTPUT, Refusal, digest, encode, valid_id
 
+OUTPUT_HEAD = 4096
 CONTROL = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))|[\x00-\x08\x0b-\x1f\x7f]")
 PATTERNS = [
     re.compile(r"(?:/Users/|/home/|/root(?:/|\b))[^\s\"'<>]*"),
@@ -63,6 +64,20 @@ def status_text(text):
     return encode(value).decode()
 
 
+def excerpt(text):
+    # Keep both ends: summaries and failures usually print last. Cuts fall on line
+    # boundaries so a slice cannot form a new redaction match.
+    if len(text) <= MAX_OUTPUT:
+        return text
+    start = text[:OUTPUT_HEAD]
+    start = start[:start.rfind("\n") + 1] or start
+    end = text[-(MAX_OUTPUT - len(start) - 48):]
+    if "\n" in end[:-1]:
+        end = end[end.find("\n") + 1:]
+    marker = ("" if start.endswith("\n") else "\n") + f"... {len(text) - len(start) - len(end)} chars omitted ...\n"
+    return start + marker + end
+
+
 class Publisher:
     def __init__(self, literals=()):
         self.literals = tuple(sorted({str(v) for v in literals if v}, key=len, reverse=True))
@@ -79,7 +94,7 @@ class Publisher:
     def output(self, raw):
         try:
             text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
-            return self.sanitize(text)[:MAX_OUTPUT], False
+            return excerpt(self.sanitize(text)), False
         except Exception:
             return "", True
 

@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
 SUPERVISOR_START_GRACE = 2
+LOG_HEAD = MAX_LOG // 2
+LOG_TAIL = MAX_LOG - LOG_HEAD - 64
 
 
 def ssh_exchange(root, endpoint, request, maintenance=None):
@@ -461,7 +463,7 @@ def supervise(root, job):
         for stream, name in ((process.stdout, "stdout"), (process.stderr, "stderr")):
             os.set_blocking(stream.fileno(), False)
             fd = os.open(folder / name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            logs[name] = [os.fdopen(fd, "wb"), 0]
+            logs[name] = [os.fdopen(fd, "wb"), 0, bytearray(), 0]
             selector.register(stream, selectors.EVENT_READ, name)
         reason = "COMPLETED"
         outcome = "completed"
@@ -515,18 +517,26 @@ def supervise(root, job):
                     selector.unregister(key.fileobj)
                     key.fileobj.close()
                     continue
-                log, size = logs[key.data]
-                kept = chunk[:max(0, MAX_LOG - size)]
-                log.write(kept)
-                logs[key.data][1] += len(kept)
+                log = logs[key.data]
+                kept = chunk[:max(0, LOG_HEAD - log[1])]
+                log[0].write(kept)
+                log[1] += len(kept)
                 if len(kept) != len(chunk):
-                    truncated = True
+                    # Past the head, keep a rolling tail: summaries and failures print last.
+                    log[2] += chunk[len(kept):]
+                    if len(log[2]) > LOG_TAIL:
+                        log[3] += len(log[2]) - LOG_TAIL
+                        del log[2][:-LOG_TAIL]
             if killing:
                 if drain_until is None:
                     drain_until = time.monotonic() + 1
                 if not any(key.data in {"stdout", "stderr"} for key in selector.get_map().values()) or time.monotonic() >= drain_until:
                     break
-        for log, _ in logs.values():
+        for log, _, tail, dropped in logs.values():
+            if dropped:
+                truncated = True
+                log.write(b"\n... %d bytes omitted ...\n" % dropped)
+            log.write(tail)
             log.flush()
             os.fsync(log.fileno())
             log.close()
