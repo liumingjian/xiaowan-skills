@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS summaries(job_id TEXT PRIMARY KEY, created REAL NOT NULL, fingerprint TEXT NOT NULL, timeout INTEGER NOT NULL, channel TEXT NOT NULL, claimed REAL, completed REAL, outcome TEXT, exit_code INTEGER, reason TEXT, log_truncated INTEGER, artifacts INTEGER, start_s REAL, run_s REAL, cancelled INTEGER NOT NULL DEFAULT 0, status_calls INTEGER NOT NULL DEFAULT 0, wait_calls INTEGER NOT NULL DEFAULT 0, trace_calls INTEGER NOT NULL DEFAULT 0, wait_timeouts INTEGER NOT NULL DEFAULT 0, read REAL, fetched REAL);
 CREATE TABLE IF NOT EXISTS health(batch TEXT NOT NULL, at REAL NOT NULL, reason TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(batch,reason));
 CREATE TABLE IF NOT EXISTS cli_errors(at REAL NOT NULL, action TEXT NOT NULL, reason TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS feedback(id INTEGER PRIMARY KEY, at REAL NOT NULL, job_id TEXT, category TEXT NOT NULL, note TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS feedback(id INTEGER PRIMARY KEY, at REAL NOT NULL, job_id TEXT, category TEXT NOT NULL, note TEXT NOT NULL, resolved REAL);
 """
 # Default `rexec status` lists active jobs, unread results from the last day, and this many recent others.
 RECENT = 5
@@ -50,11 +50,11 @@ class Server:
         self.migrate()
 
     def migrate(self):
-        for column, kind in (("claimed", "REAL"), ("label", "TEXT")):
-            if column not in {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}:
+        for table, column, kind in (("jobs", "claimed", "REAL"), ("jobs", "label", "TEXT"), ("feedback", "resolved", "REAL")):
+            if column not in {row[1] for row in self.db.execute("PRAGMA table_info(" + table + ")")}:
                 with transaction(self.db):
-                    if column not in {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}:
-                        self.db.execute("ALTER TABLE jobs ADD COLUMN " + column + " " + kind)
+                    if column not in {row[1] for row in self.db.execute("PRAGMA table_info(" + table + ")")}:
+                        self.db.execute("ALTER TABLE " + table + " ADD COLUMN " + column + " " + kind)
         if not self.db.execute("SELECT 1 FROM settings WHERE key='summaries_backfilled'").fetchone():
             # Jobs from before summaries existed keep their outcome; claim times were not recorded.
             with transaction(self.db):
@@ -170,6 +170,14 @@ class Server:
             cursor = self.db.execute("INSERT INTO feedback(at,job_id,category,note) VALUES(?,?,?,?)", (time.time(), job, category, note))
         return {"feedback_id": cursor.lastrowid, "job_id": job, "category": category, "recorded": True}
 
+    def close_feedback(self, number):
+        """Mark a note handled so the report lists only open ones; closing twice is a no-op."""
+        with transaction(self.db):
+            if not self.db.execute("SELECT 1 FROM feedback WHERE id=?", (number,)).fetchone():
+                raise Refusal("FEEDBACK_NOT_FOUND", 66)
+            self.db.execute("UPDATE feedback SET resolved=COALESCE(resolved,?) WHERE id=?", (time.time(), number))
+        return {"feedback_id": number, "closed": True}
+
     def overview(self, since):
         """Aggregate the history for iteration: what failed, where time went, how agents used the CLI."""
         now = time.time()
@@ -198,8 +206,9 @@ class Server:
                 group["last_reason"] = row["reason"]
         settled = [row for row in rows if row["completed"] is not None and row["completed"] < now - 86400]
         feedback = self.db.execute("SELECT * FROM feedback WHERE at>=? ORDER BY at DESC", (start,)).fetchall()
+        open_notes = [row for row in feedback if row["resolved"] is None]
         categories = {}
-        for row in feedback:
+        for row in open_notes:
             categories[row["category"]] = categories.get(row["category"], 0) + 1
         return {
             "window": {"since_seconds": since, "jobs": len(rows), "failed": len(failed)},
@@ -215,7 +224,7 @@ class Server:
                 "cli_errors": {row[0] + ":" + row[1]: row[2] for row in self.db.execute("SELECT action,reason,COUNT(*) FROM cli_errors WHERE at>=? GROUP BY action,reason ORDER BY COUNT(*) DESC, action, reason", (start,))},
             },
             "failing_commands": sorted((group for group in groups.values() if group["failures"]), key=lambda group: (-group["failures"], group["fingerprint"]))[:10],
-            "feedback": {"categories": dict(sorted(categories.items())), "recent": [{"age_seconds": round(now - row["at"]), "job_id": row["job_id"], "category": row["category"], "note": row["note"]} for row in feedback[:20]]},
+            "feedback": {"categories": dict(sorted(categories.items())), "closed": len(feedback) - len(open_notes), "recent": [{"id": row["id"], "age_seconds": round(now - row["at"]), "job_id": row["job_id"], "category": row["category"], "note": row["note"]} for row in open_notes[:20]]},
         }
 
     def job(self, job):

@@ -949,11 +949,13 @@ if sys.argv[1]=="bootstrap":
         (artifacts / "report.xml").write_text("<ok/>")
         (artifacts / "huge.txt").write_text("x" * (MAX_ARTIFACT + 1))
         (artifacts / "value.bin").write_text("safe")
+        (artifacts / ".hidden.txt").write_text("safe")
         accepted, refused = Publisher().collect(artifacts)
         self.assertEqual([item["name"] for item in accepted], ["report.xml"])
-        self.assertEqual(refused, ["huge.txt", None])
+        # An unsupported type is named; only an unsafe name is hidden.
+        self.assertEqual(refused, [None, "huge.txt", "value.bin"])
         bundle = Publisher().bundle(opaque(), opaque(), "completed", 0, "COMPLETED", artifacts=accepted, refused=refused)
-        self.assertEqual(Publisher().validate_bundle(bundle)["artifacts_refused"], ["huge.txt", None])
+        self.assertEqual(Publisher().validate_bundle(bundle)["artifacts_refused"], [None, "huge.txt", "value.bin"])
 
     def test_idle_claim_waits_for_work_and_hears_cancels(self):
         started = time.monotonic()
@@ -1149,6 +1151,14 @@ if sys.argv[1]=="bootstrap":
         self.assertNotIn("pending under", json.dumps(self.server.trace(job)) + json.dumps(self.server.status(job)))
         errors = {row[1] for row in self.server.db.execute("SELECT action,reason FROM cli_errors WHERE action='feedback'")}
         self.assertEqual(errors, {"FEEDBACK_CATEGORY", "FEEDBACK_TOO_LONG", "JOB_NOT_FOUND", "INVALID_REQUEST"})
+        first = json.loads(result.stdout)["feedback_id"]
+        self.assertEqual(json.loads(cli("feedback", "--close", str(first)).stdout), {"feedback_id": first, "closed": True})
+        self.assertEqual(cli("feedback", "--close", str(first)).returncode, 0)
+        self.assertEqual(cli("feedback", "--close", "999").returncode, 66)
+        self.assertEqual(cli("feedback", job, "--close", str(first)).returncode, 2)
+        report = self.server.overview(86400)["feedback"]
+        self.assertEqual((report["categories"], report["closed"]), ({"docs_unclear": 1}, 1))
+        self.assertEqual([(note["id"], note["category"]) for note in report["recent"]], [(first + 1, "docs_unclear")])
         self.server.db.execute("UPDATE feedback SET at=?", (time.time() - 91 * 86400,))
         self.server.gc(True)
         self.assertEqual(self.server.db.execute("SELECT COUNT(*) FROM feedback").fetchone()[0], 0)
