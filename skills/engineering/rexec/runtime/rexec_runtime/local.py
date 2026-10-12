@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 
-from .common import CODE, ID, MAX_LOG, MAX_RECONCILE, MAX_RPC, MIN_FREE, RETENTION, Refusal, atomic, connect, digest, encode, event, immutable, opaque, private_dir, read_json, transaction, valid_id
+from .common import CODE, ID, MAX_LOG, MAX_RECONCILE, MAX_RPC, MIN_FREE, RETENTION, Refusal, atomic, connect, digest, encode, event, immutable, opaque, private_dir, read_json, runtime_version, transaction, valid_id
 from .export import Publisher
 from .snapshot import extract
 
@@ -26,6 +26,18 @@ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 SUPERVISOR_START_GRACE = 2
 CLAIMS_PER_TICK = 8
 HEARTBEAT_INTERVAL = 30
+# An idle worker long-polls its claim this long (the server caps it) instead of asking every tick.
+CLAIM_WAIT = 20
+# Running jobs are reconciled when their events change, a cancel is waiting, or this often.
+RECONCILE_INTERVAL = 15
+# Finished results ride along with a reconcile up to this many bytes; larger ones go alone.
+INLINE_REPORTS = 8 * 1024 * 1024
+# A claimed job that fails to arrive this many times is handed back instead of retried forever.
+CLAIM_ATTEMPTS = 3
+# Server answers meaning the server no longer tracks this job or claim; retrying cannot succeed.
+ORPHANED = {"JOB_NOT_FOUND", "CLAIM_MISMATCH", "RESULT_CONFLICT"}
+# Transport failures back off the whole tick; any other refusal concerns one job only.
+TRANSPORT = {"SSH_FAILED", "RPC_TIMEOUT", "RPC_INVALID", "RPC_REFUSED", "AUTHORIZATION_REQUIRED", "INTERNAL_FAILURE"}
 LOG_HEAD = MAX_LOG // 2
 LOG_TAIL = MAX_LOG - LOG_HEAD - 64
 
@@ -83,7 +95,9 @@ def ssh_exchange(root, endpoint, request, maintenance=None):
             process.wait(timeout=max(0.001, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             raise Refusal("RPC_TIMEOUT", 75)
-        if process.returncode:
+        # A refusing server exits nonzero after printing its fixed error code; only an
+        # empty reply is a transport failure.
+        if process.returncode and not response:
             raise Refusal("SSH_FAILED", 75)
         return bytes(response)
     finally:
@@ -110,7 +124,9 @@ class Transport:
         request = encode({"token": token, "action": action, **parameters})
         started = time.monotonic()
         response = ssh_exchange(self.root, "rexec-worker", request, self.maintenance)
-        self.slowest = max(self.slowest, time.monotonic() - started)
+        if not parameters.get("wait"):
+            # A long-polled claim lasts as long as it waits; it says nothing about SSH speed.
+            self.slowest = max(self.slowest, time.monotonic() - started)
         try:
             value = json.loads(response)
             if not isinstance(value, dict):
@@ -131,6 +147,12 @@ class Local:
         self.transport = transport or Transport(self.root)
         self.stopping = lambda: False
         self.heartbeat = (None, 0.0)
+        # Only the worker loop long-polls; a single tick (tests, tools) never blocks on it.
+        self.idle_wait = 0
+        self.waiting = False
+        self.urgent = False
+        self.reconciled = (None, 0.0)
+        self.waited = 0.0
         self.tick_seconds = 0.0
         self.sweeper = None
         for name in ("snapshots", "outbox", "jobs", "trash"):
@@ -143,9 +165,9 @@ class Local:
             if not isinstance(configured, list) or any(not isinstance(item, str) or not item for item in configured):
                 raise Refusal("OUTPUT_BLOCKED")
             literals.extend(configured)
-        self.publisher = Publisher(literals)
+        self.publisher = Publisher(literals, self.root / "jobs")
         if isinstance(self.transport, Transport):
-            self.transport.maintenance = self.recover
+            self.transport.maintenance = self.maintain
 
     def row(self, job):
         valid_id(job)
@@ -182,7 +204,19 @@ class Local:
                     raise Refusal("CLAIM_MISMATCH")
             else:
                 self.db.execute("INSERT INTO jobs(id,claim,workspace,spec,snapshot,state,cancel,created) VALUES(?,?,?,?,?,'RECEIVED',?,?)", (spec["id"], spec["claim"], spec["workspace"], encode(spec).decode(), value, int(bool(spec["cancel"])), time.time()))
-            self.db.execute("DELETE FROM settings WHERE key='claim_request'")
+            self.db.execute("DELETE FROM settings WHERE key IN ('claim_request','claim_failures')")
+
+    def quiet(self):
+        """Nothing here waits on the tick: no job to prepare or launch, no result to report."""
+        return not self.db.execute("SELECT 1 FROM jobs WHERE state IN ('RECEIVED','PREPARING','READY','START_RESERVED') OR (state='TERMINAL' AND acknowledged=0) LIMIT 1").fetchone()
+
+    def maintain(self):
+        """Runs every half second while an RPC is in flight."""
+        self.recover()
+        if self.waiting and (self.stopping() or not self.quiet()):
+            # A result to report or a stop beats waiting for new work. The server keeps any job
+            # it claimed meanwhile for this claim request, so the retry gets it.
+            raise Refusal("INTERRUPTED", 75)
 
     def claim(self):
         """Claim at most one job; return whether one arrived."""
@@ -190,13 +224,50 @@ class Local:
             row = self.db.execute("SELECT value FROM settings WHERE key='claim_request'").fetchone()
             request = row[0] if row else opaque()
             self.db.execute("INSERT OR IGNORE INTO settings VALUES('claim_request',?)", (request,))
-        response = self.transport.call("claim", request_id=request)
-        if response.get("job"):
-            self.receive(response)
-            return True
+        held = [row[0] for row in self.db.execute("SELECT id FROM jobs WHERE cancel=0 AND state!='TERMINAL' LIMIT ?", (MAX_RECONCILE,))]
+        wait = self.idle_wait if self.idle_wait and self.quiet() else 0
+        response = None
+        try:
+            self.waiting = bool(wait)
+            began = time.monotonic()
+            try:
+                response = self.transport.call("claim", request_id=request, wait=wait, held=held)
+            finally:
+                self.waiting = False
+                if wait:
+                    self.waited += time.monotonic() - began
+            if response.get("cancel"):
+                self.urgent = True
+            if response.get("job"):
+                self.receive(response)
+                return True
+        except Refusal as error:
+            if error.reason == "INTERRUPTED":
+                return False
+            # Connectivity failures retry the same claim indefinitely; a job that keeps
+            # arriving unusable (oversized or rejected) is given up after a few tries.
+            if response is not None or error.reason == "RPC_INVALID":
+                self.give_up(response)
+            raise
         with transaction(self.db):
-            self.db.execute("DELETE FROM settings WHERE key='claim_request'")
+            self.db.execute("DELETE FROM settings WHERE key IN ('claim_request','claim_failures')")
         return False
+
+    def give_up(self, response):
+        with transaction(self.db):
+            row = self.db.execute("SELECT value FROM settings WHERE key='claim_failures'").fetchone()
+            failures = (int(row[0]) if row else 0) + 1
+            self.db.execute("INSERT OR REPLACE INTO settings VALUES('claim_failures',?)", (str(failures),))
+        if failures < CLAIM_ATTEMPTS:
+            return
+        spec = response.get("job") if isinstance(response, dict) else None
+        if isinstance(spec, dict) and isinstance(spec.get("id"), str) and not self.db.execute("SELECT 1 FROM jobs WHERE id=?", (spec["id"],)).fetchone():
+            # The command never started here, so the server can record a plain failure.
+            # Without that answer the server's claim lease releases the job later instead.
+            with contextlib.suppress(Exception):
+                self.transport.call("reject", job_id=spec["id"], claim_id=spec.get("claim"))
+        with transaction(self.db):
+            self.db.execute("DELETE FROM settings WHERE key IN ('claim_request','claim_failures')")
 
     def discard(self, path):
         """Move a directory into trash; renaming is instant even for a huge tree."""
@@ -218,26 +289,31 @@ class Local:
             if path.is_dir() and not path.is_symlink():
                 self.discard(path)
 
-    def terminal(self, job, outcome, code, reason, stdout=b"", stderr=b"", truncated=False):
+    def terminal(self, job, outcome, code, reason, stdout=b"", stderr=b"", truncated=False, expect=None):
+        """Seal a result. With expect, seal only if the job is still in that state."""
+        row = self.row(job)
+        if row["state"] == "TERMINAL":
+            return
+        # Filtering output and artifacts can be slow, so it runs before the write lock.
+        artifacts = refused = []
+        try:
+            artifacts, refused = self.publisher.collect(self.root / "jobs" / job / "artifacts")
+        except Exception:
+            reason = "ARTIFACT_BLOCKED"
+        now = time.time()
+        started = row["started"]
+        timing = {"start_s": round(max(0.0, started - row["created"]), 3) if started else None, "run_s": round(max(0.0, now - started), 3) if started else None}
+        bundle = self.publisher.bundle(job, row["claim"], outcome, code, reason, stdout, stderr, artifacts, truncated, timing, refused)
+        try:
+            self.publisher.validate_bundle(bundle)
+        except Exception:
+            bundle = self.publisher.bundle(job, row["claim"], outcome, code, "OUTPUT_BLOCKED", truncated=truncated, timing=timing)
+            self.publisher.validate_bundle(bundle)
+        data = encode(bundle)
         with transaction(self.db):
-            row = self.row(job)
-            if row["state"] == "TERMINAL":
+            state = self.row(job)["state"]
+            if state == "TERMINAL" or (expect is not None and state != expect):
                 return
-            artifacts = []
-            try:
-                artifacts = self.publisher.artifacts(self.root / "jobs" / job / "artifacts")
-            except Exception:
-                reason = "ARTIFACT_BLOCKED"
-            now = time.time()
-            started = row["started"]
-            timing = {"start_s": round(max(0.0, started - row["created"]), 3) if started else None, "run_s": round(max(0.0, now - started), 3) if started else None}
-            bundle = self.publisher.bundle(job, row["claim"], outcome, code, reason, stdout, stderr, artifacts, truncated, timing)
-            try:
-                self.publisher.validate_bundle(bundle)
-            except Exception:
-                bundle = self.publisher.bundle(job, row["claim"], outcome, code, "OUTPUT_BLOCKED", truncated=truncated, timing=timing)
-                self.publisher.validate_bundle(bundle)
-            data = encode(bundle)
             immutable(self.root / "outbox" / job, data)
             self.db.execute("UPDATE jobs SET state='TERMINAL',result_digest=?,completed=? WHERE id=?", (digest(data), now, job))
             event(self.db, job, "TERMINAL", bundle["reason"], outcome)
@@ -310,6 +386,19 @@ class Local:
         except (OSError, ValueError, TypeError):
             return False
 
+    def supervised(self, job):
+        """Whether a live supervisor holds this job's lock; the kernel drops it when that process dies."""
+        path = self.root / "jobs" / job / "supervisor.lock"
+        if not path.parent.is_dir():
+            return False
+        with open(path, "a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            return False
+
     def recover(self, check_execution=True):
         for row in self.db.execute("SELECT * FROM jobs WHERE state!='TERMINAL'").fetchall():
             sealed = self.root / "outbox" / row["id"]
@@ -325,39 +414,106 @@ class Local:
             elif check_execution and row["state"] in {"START_RESERVED", "RUNNING"}:
                 if row["state"] == "START_RESERVED" and row["reserved"] is not None and time.time() - row["reserved"] < SUPERVISOR_START_GRACE:
                     continue
-                key = "proof_failure:" + row["id"]
-                if self.proof(row):
-                    self.db.execute("DELETE FROM settings WHERE key=?", (key,))
+                if self.supervised(row["id"]):
+                    continue
+                if row["state"] == "START_RESERVED":
+                    # The gate runs nothing until RUNNING commits, and sealing here makes that commit
+                    # fail, so this command never ran: a plain launch failure, safe to resubmit.
+                    self.terminal(row["id"], "failed", 126, "LAUNCH_FAILED", expect="START_RESERVED")
                 else:
-                    previous = self.db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-                    if previous is None:
-                        self.db.execute("INSERT INTO settings VALUES(?,?)", (key, str(time.time())))
-                    elif time.time() - float(previous[0]) >= 1:
-                        self.terminal(row["id"], "unknown", 70, "EXECUTION_UNKNOWN")
+                    # The gate killed the command's group when its supervisor died, so nothing still
+                    # runs, but how far it got is unknown.
+                    folder = self.root / "jobs" / row["id"]
+                    logs = [(folder / name).read_bytes()[:MAX_LOG] if (folder / name).is_file() else b"" for name in ("stdout", "stderr")]
+                    self.terminal(row["id"], "unknown", 70, "SUPERVISOR_LOST", *logs, expect="RUNNING")
 
-    def reconcile(self):
+    def reconcile(self, force=True):
+        mark = self.db.execute("SELECT MAX(rowid) FROM events").fetchone()[0]
+        if not (force or self.urgent or mark != self.reconciled[0] or time.monotonic() - self.reconciled[1] >= RECONCILE_INTERVAL
+                or self.db.execute("SELECT 1 FROM jobs WHERE state='TERMINAL' AND acknowledged=0 LIMIT 1").fetchone()):
+            # Nothing changed for running jobs; skip an RPC every tick while they run.
+            return
         rows = self.db.execute("SELECT * FROM jobs WHERE acknowledged=0 OR state!='TERMINAL' ORDER BY created LIMIT ?", (MAX_RECONCILE,)).fetchall()
+        self.urgent = False
+        self.reconciled = (mark, time.monotonic())
         if not rows:
             return
-        jobs = [{"job_id": row["id"], "claim_id": row["claim"], "events": self.publisher.events([json.loads(e[0]) for e in self.db.execute("SELECT value FROM events WHERE job_id=? ORDER BY sequence", (row["id"],))])} for row in rows]
+        jobs = []
+        inline = 0
+        for row in rows:
+            item = {"job_id": row["id"], "claim_id": row["claim"], "events": self.publisher.events([json.loads(e[0]) for e in self.db.execute("SELECT value FROM events WHERE job_id=? ORDER BY sequence", (row["id"],))])}
+            if row["state"] == "TERMINAL" and not row["acknowledged"]:
+                data = (self.root / "outbox" / row["id"]).read_bytes()
+                if inline + len(data) <= INLINE_REPORTS:
+                    inline += len(data)
+                    item["report"] = {"bundle": json.loads(data), "digest": digest(data)}
+            jobs.append(item)
         response = self.transport.call("reconcile", jobs=jobs)
+        orphans = set()
+        reported = {}
         with transaction(self.db):
             for value in response.get("jobs", []):
-                self.db.execute("UPDATE jobs SET cancel=MAX(cancel,?) WHERE id=?", (int(bool(value["cancel"])), valid_id(value["job_id"])))
+                job = valid_id(value["job_id"])
+                if "error" in value:
+                    if value["error"] in ORPHANED:
+                        orphans.add(job)
+                    continue
+                self.db.execute("UPDATE jobs SET cancel=MAX(cancel,?) WHERE id=?", (int(bool(value["cancel"])), job))
+                if "ack" in value or "report_error" in value:
+                    reported[job] = value
         for row in rows:
             if self.stopping():
                 return
-            if row["state"] == "TERMINAL" and not row["acknowledged"]:
+            if row["state"] == "TERMINAL" and not row["acknowledged"] and row["id"] not in orphans:
                 data = (self.root / "outbox" / row["id"]).read_bytes()
                 value = digest(data)
-                acknowledgement = self.transport.call("report", bundle=json.loads(data), digest=value)
+                if row["id"] in reported:
+                    # The server took or refused the result inline; an older server answers
+                    # neither, and the result then goes in its own report below.
+                    answer = reported[row["id"]]
+                    if "report_error" in answer:
+                        error = answer["report_error"]
+                        if error in ORPHANED:
+                            orphans.add(row["id"])
+                        else:
+                            self.failure(error if isinstance(error, str) and CODE.fullmatch(error) else "RPC_REFUSED")
+                        continue
+                    if answer["ack"] != {"job_id": row["id"], "digest": value}:
+                        raise Refusal("ACK_MISMATCH")
+                    with transaction(self.db):
+                        self.db.execute("UPDATE jobs SET acknowledged=1 WHERE id=?", (row["id"],))
+                    continue
+                try:
+                    acknowledgement = self.transport.call("report", bundle=json.loads(data), digest=value)
+                except Refusal as error:
+                    if error.reason in TRANSPORT:
+                        raise
+                    if error.reason in ORPHANED:
+                        orphans.add(row["id"])
+                    else:
+                        self.failure(error.reason if CODE.fullmatch(error.reason) else "RPC_REFUSED")
+                    continue
                 if acknowledgement != {"job_id": row["id"], "digest": value}:
                     raise Refusal("ACK_MISMATCH")
                 with transaction(self.db):
                     self.db.execute("UPDATE jobs SET acknowledged=1 WHERE id=?", (row["id"],))
+        for job in orphans:
+            self.orphan(job)
+
+    def orphan(self, job):
+        """Stop reporting a job the server no longer tracks (reinstalled, collected, or
+        settled without us). Its local trace stays readable with `agent.sh view`."""
+        row = self.row(job)
+        if row["state"] != "TERMINAL":
+            # Still running here: keep it, it is reported again once it seals.
+            return
+        with transaction(self.db):
+            self.db.execute("UPDATE jobs SET acknowledged=1 WHERE id=?", (job,))
+        self.failure("ORPHANED_RESULT")
 
     def tick(self):
         started = time.monotonic()
+        self.waited = 0.0
         self.recover()
         if self.stopping():
             return
@@ -372,7 +528,14 @@ class Local:
                 health = [dict(batch, sent=True) for batch in health][-16:]
                 self.store_health(health)
                 extra["health"] = [{"id": batch["id"], "counts": batch["counts"]} for batch in health]
-            self.transport.call("heartbeat", state=state, timing={"tick": round(self.tick_seconds, 3), "rpc": round(slowest, 3)}, **extra)
+            active = [row[0] for row in self.db.execute("SELECT id FROM jobs WHERE acknowledged=0 OR state!='TERMINAL' LIMIT ?", (MAX_RECONCILE + 1,))]
+            if len(active) <= MAX_RECONCILE:
+                # Complete lists only: the server releases claimed jobs missing from it.
+                extra["active"] = active
+            self.transport.call("heartbeat", state=state, timing={"tick": round(self.tick_seconds, 3), "rpc": round(slowest, 3)}, runtime=runtime_version(), **extra)
+            with transaction(self.db):
+                # `agent verify` reads this to confirm a freshly started worker reached the VPS.
+                self.db.execute("INSERT OR REPLACE INTO settings VALUES('contact',?)", (str(time.time()),))
             if health:
                 with transaction(self.db):
                     self.store_health([batch for batch in self.health() if batch["id"] not in {sent["id"] for sent in health}])
@@ -381,7 +544,7 @@ class Local:
                 self.transport.slowest = 0.0
         if self.stopping():
             return
-        self.reconcile()
+        self.reconcile(force=False)
         # Claim everything available first so newly received jobs launch in this same tick.
         for _ in range(CLAIMS_PER_TICK):
             if self.stopping() or not self.space() or not self.claim():
@@ -393,13 +556,11 @@ class Local:
                 self.prepare(row["id"])
             self.launch(row["id"])
         self.gc()
-        self.tick_seconds = time.monotonic() - started
+        # Reported tick time is work only, not an idle claim's wait.
+        self.tick_seconds = time.monotonic() - started - self.waited
 
     def gc(self):
         for row in self.db.execute("SELECT * FROM jobs WHERE state='TERMINAL' AND acknowledged=1 AND completed<?", (time.time() - RETENTION,)).fetchall():
-            bundle = json.loads((self.root / "outbox" / row["id"]).read_bytes())
-            if bundle["outcome"] == "unknown":
-                continue
             with transaction(self.db):
                 self.db.execute("DELETE FROM events WHERE job_id=?", (row["id"],))
                 self.db.execute("DELETE FROM jobs WHERE id=?", (row["id"],))
@@ -423,8 +584,7 @@ class Local:
         for row in self.db.execute("SELECT id FROM jobs WHERE state='TERMINAL'").fetchall():
             folder = self.root / "jobs" / row[0]
             if any((folder / name).exists() for name in ("workspace", "tmp", "artifacts")):
-                if json.loads((self.root / "outbox" / row[0]).read_bytes())["outcome"] != "unknown":
-                    self.scrub(row[0])
+                self.scrub(row[0])
         self.sweep()
 
     def health(self):
@@ -495,12 +655,17 @@ def worker(root):
     await_reserved_supervisors(local)
     local.crashed()
     local.recover()
+    with transaction(local.db):
+        # Workspaces are extracted without fsync; after a crash, extract them again.
+        local.db.execute("UPDATE jobs SET state='RECEIVED' WHERE state IN ('PREPARING','READY')")
+    local.idle_wait = CLAIM_WAIT
     delay = 0.25
     while not stopping:
         try:
             local.tick()
             delay = 0.25
-        except (Refusal, OSError, ValueError, KeyError) as error:
+        except Exception as error:
+            # Any failure only delays the next tick; the worker itself never stops.
             delay = min(30, delay * 2)
             reason = error.reason if isinstance(error, Refusal) and CODE.fullmatch(error.reason) else "OS_ERROR" if isinstance(error, OSError) else "INTERNAL"
             with contextlib.suppress(Exception):
@@ -645,9 +810,8 @@ def supervise(root, job):
         if code < 0:
             code = min(255, 128 - code)
         local.terminal(job, outcome, code, reason, (folder / "stdout").read_bytes(), (folder / "stderr").read_bytes(), truncated)
-        if outcome != "unknown":
-            local.scrub(job)
-            local.sweep()
+        local.scrub(job)
+        local.sweep()
     except BaseException:
         if process is not None and process.returncode is None:
             with contextlib.suppress(ProcessLookupError):

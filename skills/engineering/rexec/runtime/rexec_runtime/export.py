@@ -14,7 +14,8 @@ CONTROL = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))|[\x
 PATTERNS = [
     re.compile(r"(?:/Users/|/home/|/root(?:/|\b))[^\s\"'<>]*"),
     re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
-    re.compile(r"(?<![A-Za-z0-9])(?:[a-fA-F0-9]{0,4}:){2,}[a-fA-F0-9]{0,4}(?![A-Za-z0-9])"),
+    # IPv6: eight full groups or a "::" form, so times like 12:34:56 survive.
+    re.compile(r"(?<![A-Za-z0-9:])(?:(?:[a-fA-F0-9]{1,4}:){7}[a-fA-F0-9]{1,4}|(?:[a-fA-F0-9]{1,4}:)*[a-fA-F0-9]{0,4}::(?:[a-fA-F0-9]{1,4}:)*[a-fA-F0-9]{0,4})(?![A-Za-z0-9:])"),
     re.compile(r"\bSHA256:[A-Za-z0-9+/=]+"),
     re.compile(r"\b(?:[a-fA-F0-9]{2}:){5,}[a-fA-F0-9]{2}\b"),
     re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"),
@@ -32,7 +33,7 @@ def relative(name):
     path = PurePosixPath(name)
     if path.is_absolute() or any(part in (".", "..") for part in name.split("/")):
         raise Refusal("ARTIFACT_BLOCKED")
-    if any(part.startswith(".") for part in path.parts) or path.suffix not in {".md", ".txt", ".patch", ".diff", ".json"}:
+    if any(part.startswith(".") for part in path.parts) or path.suffix not in {".md", ".txt", ".patch", ".diff", ".json", ".xml", ".csv"}:
         raise Refusal("ARTIFACT_BLOCKED")
     return name
 
@@ -80,13 +81,17 @@ def excerpt(text):
 
 
 class Publisher:
-    def __init__(self, literals=()):
+    def __init__(self, literals=(), jobs=None):
         self.literals = tuple(sorted({str(v) for v in literals if v}, key=len, reverse=True))
+        # A job's own directories read as the variables the command saw, keeping path:line.
+        self.places = re.compile(re.escape(str(jobs)) + r"/[a-f0-9]{32}/(workspace|tmp|artifacts)\b") if jobs else None
 
     def sanitize(self, text):
         if not isinstance(text, str):
             raise Refusal("OUTPUT_BLOCKED")
         text = CONTROL.sub("", text)
+        if self.places:
+            text = self.places.sub(lambda match: {"workspace": "$WS", "tmp": "$TMPDIR", "artifacts": "$REXEC_ARTIFACTS"}[match[1]], text)
         for pattern in [re.compile(re.escape(literal)) for literal in self.literals] + PATTERNS:
             text = "".join(part if part == "[private]" else pattern.sub("[private]", part)
                            for part in re.split(r"(\[private\])", text))
@@ -134,32 +139,51 @@ class Publisher:
         return safe
 
     def artifacts(self, directory):
+        """Every artifact, or ARTIFACT_BLOCKED if any one is refused."""
+        result, refused = self.collect(directory)
+        if refused:
+            raise Refusal("ARTIFACT_BLOCKED")
+        return result
+
+    def collect(self, directory):
+        """Accepted artifacts, plus the refused ones by safe name (None when the name itself is unsafe)."""
         from .common import walk_regular
         root = Path(directory)
         if root.is_symlink():
             raise Refusal("ARTIFACT_BLOCKED")
         if not root.exists():
-            return []
+            return [], []
         result = []
+        refused = []
         total = 0
         try:
             for name, raw, _ in walk_regular(root, MAX_ARTIFACT * MAX_ARTIFACTS, MAX_ARTIFACTS * 4):
-                relative(name)
-                if FORBIDDEN.search(name) or len(raw) > MAX_ARTIFACT or len(result) >= MAX_ARTIFACTS or b"\0" in raw:
-                    raise Refusal("ARTIFACT_BLOCKED")
-                safe = self.artifact_text(name, raw.decode("utf-8"))
-                data = safe.encode()
+                try:
+                    relative(name)
+                    if FORBIDDEN.search(name) or len(raw) > MAX_ARTIFACT or len(result) >= MAX_ARTIFACTS or b"\0" in raw:
+                        raise Refusal("ARTIFACT_BLOCKED")
+                    safe = self.artifact_text(name, raw.decode("utf-8"))
+                    data = safe.encode()
+                    if len(data) > MAX_ARTIFACT or total + len(data) > MAX_ARTIFACT * MAX_ARTIFACTS or self.sanitize(name) != name:
+                        raise Refusal("ARTIFACT_BLOCKED")
+                except (UnicodeError, Refusal):
+                    shown = None
+                    try:
+                        if self.sanitize(relative(name)) == name and not FORBIDDEN.search(name):
+                            shown = name
+                    except Refusal:
+                        pass
+                    if len(refused) < MAX_ARTIFACTS:
+                        refused.append(shown)
+                    continue
                 total += len(data)
-                if len(data) > MAX_ARTIFACT or total > MAX_ARTIFACT * MAX_ARTIFACTS:
-                    raise Refusal("ARTIFACT_BLOCKED")
-                if self.sanitize(name) != name:
-                    raise Refusal("ARTIFACT_BLOCKED")
                 result.append({"name": name, "digest": digest(data), "size": len(data), "data": base64.b64encode(data).decode()})
-        except (OSError, UnicodeError, Refusal):
+        except (OSError, Refusal):
+            # Links, special files, or an oversized tree refuse the whole set.
             raise Refusal("ARTIFACT_BLOCKED")
-        return result
+        return result, refused
 
-    def bundle(self, job, claim, outcome, code, reason, stdout=b"", stderr=b"", artifacts=(), truncated=False, timing=None):
+    def bundle(self, job, claim, outcome, code, reason, stdout=b"", stderr=b"", artifacts=(), truncated=False, timing=None, refused=()):
         out, blocked1 = self.output(stdout)
         err, blocked2 = self.output(stderr)
         if blocked1 or blocked2:
@@ -169,13 +193,21 @@ class Publisher:
         value = {"job_id": valid_id(job), "claim_id": valid_id(claim), "outcome": outcome, "exit_code": code, "reason": reason, "stdout": out, "stderr": err, "log_truncated": bool(truncated), "artifacts": list(artifacts)}
         if timing is not None:
             value["timing"] = timing
+        if refused:
+            value["artifacts_refused"] = list(refused)
         return value
 
     def validate_bundle(self, bundle):
         keys = {"job_id", "claim_id", "outcome", "exit_code", "reason", "stdout", "stderr", "log_truncated", "artifacts"}
         # Timing is optional so bundles sealed before it existed stay readable.
-        if not isinstance(bundle, dict) or set(bundle) - {"timing"} != keys:
+        if not isinstance(bundle, dict) or set(bundle) - {"timing", "artifacts_refused"} != keys:
             raise Refusal("OUTPUT_BLOCKED")
+        refused = bundle.get("artifacts_refused", [])
+        if not isinstance(refused, list) or len(refused) > MAX_ARTIFACTS:
+            raise Refusal("ARTIFACT_BLOCKED")
+        for name in refused:
+            if name is not None and (relative(name) != name or FORBIDDEN.search(name) or self.sanitize(name) != name):
+                raise Refusal("ARTIFACT_BLOCKED")
         timing = bundle.get("timing", {"start_s": None, "run_s": None})
         if not isinstance(timing, dict) or set(timing) != {"start_s", "run_s"} or any(v is not None and not finite(v) for v in timing.values()):
             raise Refusal("OUTPUT_BLOCKED")
@@ -209,10 +241,14 @@ class Publisher:
 
     def receipt(self, row, bundle=None):
         value = {"job_id": valid_id(row["id"]), "state": row["state"], "cancel_requested": bool(row["cancel"])}
+        if "label" in row.keys() and row["label"]:
+            value["label"] = row["label"]
         if bundle is not None:
             self.validate_bundle(bundle)
             value.update({key: bundle[key] for key in ("outcome", "exit_code", "reason", "stdout", "stderr", "log_truncated")})
             value["artifacts"] = [{key: item[key] for key in ("name", "digest", "size")} for item in bundle["artifacts"]]
+            if bundle.get("artifacts_refused"):
+                value["artifacts_refused"] = bundle["artifacts_refused"]
         value["timing"] = timing(row, bundle)
         return value
 

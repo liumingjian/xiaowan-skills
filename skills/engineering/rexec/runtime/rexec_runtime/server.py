@@ -9,14 +9,21 @@ import secrets
 import shutil
 import time
 
-from .common import CATEGORIES, CODE, HEALTH_WINDOW, HISTORY, MAX_NOTE, MAX_RECONCILE, RETENTION, Refusal, atomic, connect, digest, encode, event, immutable, opaque, private_dir, transaction, valid_id
+from .common import CATEGORIES, CODE, HEALTH_WINDOW, HISTORY, MAX_NOTE, MAX_RECONCILE, RETENTION, VERSION, Refusal, atomic, connect, digest, encode, event, immutable, opaque, private_dir, runtime_version, transaction, valid_id
 from .export import Publisher
 from .snapshot import freeze, safe_name
 
 GC_INTERVAL = 3600
+# A claimed job the worker has stopped reporting is released after this long.
+LEASE = 600
+# An idle worker's claim waits up to this long for a job instead of asking again every tick.
+CLAIM_WAIT = 25
+CLAIM_POLL = 0.5
+# Contact is recorded at most this often; the channel goes OFFLINE only after minutes of silence.
+CONTACT_EVERY = 5
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, request TEXT UNIQUE NOT NULL, spec_digest TEXT NOT NULL, workspace TEXT NOT NULL, command TEXT NOT NULL, cwd TEXT NOT NULL, timeout INTEGER NOT NULL, snapshot TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('QUEUED','CLAIMED','RESULT_STORED')), claim TEXT UNIQUE, cancel INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, completed REAL, result_digest TEXT, ack INTEGER NOT NULL DEFAULT 0, artifact_ack INTEGER NOT NULL DEFAULT 0, claimed REAL);
+CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, request TEXT UNIQUE NOT NULL, spec_digest TEXT NOT NULL, workspace TEXT NOT NULL, command TEXT NOT NULL, cwd TEXT NOT NULL, timeout INTEGER NOT NULL, snapshot TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('QUEUED','CLAIMED','RESULT_STORED')), claim TEXT UNIQUE, cancel INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, completed REAL, result_digest TEXT, ack INTEGER NOT NULL DEFAULT 0, artifact_ack INTEGER NOT NULL DEFAULT 0, claimed REAL, label TEXT);
 CREATE TABLE IF NOT EXISTS claims(request TEXT PRIMARY KEY, job_id TEXT REFERENCES jobs(id));
 CREATE TABLE IF NOT EXISTS workspaces(source TEXT PRIMARY KEY, id TEXT UNIQUE NOT NULL);
 CREATE TABLE IF NOT EXISTS events(job_id TEXT REFERENCES jobs(id) ON DELETE CASCADE, sequence INTEGER, value TEXT NOT NULL, PRIMARY KEY(job_id,sequence));
@@ -26,6 +33,10 @@ CREATE TABLE IF NOT EXISTS health(batch TEXT NOT NULL, at REAL NOT NULL, reason 
 CREATE TABLE IF NOT EXISTS cli_errors(at REAL NOT NULL, action TEXT NOT NULL, reason TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS feedback(id INTEGER PRIMARY KEY, at REAL NOT NULL, job_id TEXT, category TEXT NOT NULL, note TEXT NOT NULL);
 """
+# Default `rexec status` lists active jobs, unread results from the last day, and this many recent others.
+RECENT = 5
+UNREAD_WINDOW = 86400
+LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/ -]{0,63}")
 # Per-job usage counters that a CLI call can bump; read and fetched record the first time.
 USAGE = {"status": "status_calls", "wait": "wait_calls", "trace": "trace_calls", "wait_timeout": "wait_timeouts"}
 
@@ -39,10 +50,11 @@ class Server:
         self.migrate()
 
     def migrate(self):
-        if "claimed" not in {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}:
-            with transaction(self.db):
-                if "claimed" not in {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}:
-                    self.db.execute("ALTER TABLE jobs ADD COLUMN claimed REAL")
+        for column, kind in (("claimed", "REAL"), ("label", "TEXT")):
+            if column not in {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}:
+                with transaction(self.db):
+                    if column not in {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}:
+                        self.db.execute("ALTER TABLE jobs ADD COLUMN " + column + " " + kind)
         if not self.db.execute("SELECT 1 FROM settings WHERE key='summaries_backfilled'").fetchone():
             # Jobs from before summaries existed keep their outcome; claim times were not recorded.
             with transaction(self.db):
@@ -52,6 +64,10 @@ class Server:
                         with contextlib.suppress(Exception):
                             self.summarize_result(row["id"], self.bundle(row), row["completed"])
                 self.db.execute("INSERT OR REPLACE INTO settings VALUES('summaries_backfilled','1')")
+        if self.db.execute("SELECT 1 FROM jobs WHERE state='CLAIMED' AND result_digest IS NOT NULL LIMIT 1").fetchone():
+            # Earlier versions kept unknown outcomes CLAIMED, which blocked their workspace forever.
+            with transaction(self.db):
+                self.db.execute("UPDATE jobs SET state='RESULT_STORED' WHERE state='CLAIMED' AND result_digest IS NOT NULL")
 
     def fingerprint(self, command):
         """Group repeats of one command without exporting it; the key never leaves the server."""
@@ -95,20 +111,30 @@ class Server:
         if not isinstance(token, str) or not path.exists() or not hmac.compare_digest(token, path.read_text()):
             raise Refusal("AUTHORIZATION_REQUIRED", 77)
 
-    def submit(self, command, source, cwd, timeout, request, with_git=False):
+    def submit(self, command, source, cwd, timeout, request, with_git=False, label=None, ignored=False):
         valid_id(request)
         if not isinstance(command, str) or not command or len(command.encode()) > 65536 or not 1 <= timeout <= 86400:
             raise Refusal()
+        if label is not None and (not isinstance(label, str) or not LABEL.fullmatch(label) or self.publisher.sanitize(label) != label):
+            raise Refusal("LABEL_INVALID")
         if cwd != ".":
-            safe_name(cwd)
+            try:
+                safe_name(cwd)
+            except Refusal:
+                raise Refusal("CWD_INVALID")
+            # Checked here so a typo fails now instead of after the transfer to the Mac.
+            if source is None or not (Path(source) / cwd).is_dir():
+                raise Refusal("CWD_NOT_FOUND")
         workspace_source = str(Path(source).resolve()) if source is not None else "no-sync"
-        spec = digest(encode([command, workspace_source, cwd, timeout, bool(with_git)]))
+        # Older specs omit the flag, so retries of their requests keep matching.
+        spec = digest(encode([command, workspace_source, cwd, timeout, bool(with_git)] + ([True] if ignored else [])))
         old = self.db.execute("SELECT * FROM jobs WHERE request=?", (request,)).fetchone()
         if old:
             if old["spec_digest"] != spec:
                 raise Refusal("REQUEST_CONFLICT")
             return self.status(old["id"])
-        blob = freeze(source, with_git) if source is not None else freeze_empty()
+        report = {}
+        blob = freeze(source, with_git, ignored, report, cwd) if source is not None else freeze_empty()
         snapshot = digest(blob)
         channel = self.channel()["state"]
         with transaction(self.db):
@@ -123,10 +149,13 @@ class Server:
                 workspace = (opaque(),)
                 self.db.execute("INSERT INTO workspaces VALUES(?,?)", (workspace_source, workspace[0]))
             job = opaque()
-            self.db.execute("INSERT INTO jobs(id,request,spec_digest,workspace,command,cwd,timeout,snapshot,state,created) VALUES(?,?,?,?,?,?,?,?,?,?)", (job, request, spec, workspace[0], command, cwd, timeout, snapshot, "QUEUED", time.time()))
+            self.db.execute("INSERT INTO jobs(id,request,spec_digest,workspace,command,cwd,timeout,snapshot,state,created,label) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (job, request, spec, workspace[0], command, cwd, timeout, snapshot, "QUEUED", time.time(), label))
             event(self.db, job, "QUEUED", "ACCEPTED")
             self.summarize(self.job(job), channel)
-        return self.status(job)
+        result = self.status(job)
+        if report:
+            result["snapshot"] = report
+        return result
 
     def feedback(self, job, category, note):
         """Store an agent's note; it is reported in aggregate and never joins the trace."""
@@ -214,41 +243,101 @@ class Server:
         since = time.time() - HEALTH_WINDOW
         failures = {row[0]: row[1] for row in self.db.execute("SELECT reason,SUM(count) FROM health WHERE at>=? GROUP BY reason ORDER BY reason", (since,))}
         last = self.db.execute("SELECT reason,at FROM health ORDER BY at DESC LIMIT 1").fetchone()
-        unknown = self.db.execute("SELECT COUNT(*) FROM jobs WHERE state='CLAIMED' AND result_digest IS NOT NULL").fetchone()[0]
         worker_state = self.db.execute("SELECT value FROM settings WHERE key='worker_state'").fetchone()
         timing = self.db.execute("SELECT value FROM settings WHERE key='worker_timing'").fetchone()
-        state = "AUTHORIZATION_REQUIRED" if not (self.root / "worker.token").exists() else "OFFLINE" if age is None or age > 180 else "LOW_SPACE" if worker_state and worker_state[0] == "LOW_SPACE" else "UNCERTAIN" if unknown else "READY"
-        return {"state": state, "last_contact_age_seconds": age, "reserved": reserved, "worker_timing": json.loads(timing[0]) if timing else None,
-                "recent_failures": failures, "last_failure": {"reason": last[0], "age_seconds": round(max(0, time.time() - last[1]), 3)} if last else None}
+        state = "AUTHORIZATION_REQUIRED" if not (self.root / "worker.token").exists() else "OFFLINE" if age is None or age > 180 else "LOW_SPACE" if worker_state and worker_state[0] == "LOW_SPACE" else "READY"
+        result = {"state": state, "last_contact_age_seconds": age, "reserved": reserved, "worker_timing": json.loads(timing[0]) if timing else None,
+                  "recent_failures": failures, "last_failure": {"reason": last[0], "age_seconds": round(max(0, time.time() - last[1]), 3)} if last else None}
+        worker = self.db.execute("SELECT value FROM settings WHERE key='worker_runtime'").fetchone()
+        if worker and worker[0] != runtime_version():
+            # The Mac runs a different release than this server; rerun the Mac update line.
+            result["runtime_skew"] = {"server": runtime_version(), "worker": worker[0]}
+        return result
 
-    def queue(self):
-        return [self.status(row[0]) for row in self.db.execute("SELECT id FROM jobs ORDER BY created DESC LIMIT 100")]
+    def find(self, request):
+        row = self.db.execute("SELECT id FROM jobs WHERE request=?", (request,)).fetchone()
+        return row[0] if row else None
+
+    def queue(self, everything=False):
+        """One line per job, newest first. Full output stays behind `status JOB`.
+
+        By default only jobs that need attention are listed: queued or running jobs,
+        results nobody has read, and the few most recent others."""
+        now = time.time()
+        rows = self.db.execute("SELECT jobs.id,jobs.label,jobs.state,jobs.created,jobs.ack,jobs.cancel,summaries.outcome,summaries.exit_code,summaries.reason FROM jobs LEFT JOIN summaries ON summaries.job_id=jobs.id ORDER BY jobs.created DESC LIMIT 100").fetchall()
+        listed = []
+        recent = 0
+        for row in rows:
+            pending = row["state"] != "RESULT_STORED"
+            unread = not pending and not row["ack"]
+            if not (everything or pending or (unread and now - row["created"] < UNREAD_WINDOW)):
+                recent += 1
+                if recent > RECENT:
+                    continue
+            item = {"job_id": row["id"], "state": row["state"], "age_s": round(max(0.0, now - row["created"]), 1)}
+            if row["label"]:
+                item["label"] = row["label"]
+            if row["cancel"]:
+                item["cancel_requested"] = True
+            if not pending:
+                item.update({"outcome": row["outcome"], "exit_code": row["exit_code"], "reason": row["reason"], "unread": unread})
+            listed.append(item)
+        return {"jobs": listed, "hidden": len(rows) - len(listed)}
 
     def trace(self, job, after=0):
         self.job(job)
         return self.publisher.events([json.loads(row[0]) for row in self.db.execute("SELECT value FROM events WHERE job_id=? AND sequence>? ORDER BY sequence LIMIT 1000", (job, after))])
 
-    def claim(self, request):
+    def claim(self, request, wait=0, held=()):
+        """Claim the oldest runnable job. An idle worker may wait up to `wait` seconds for one.
+
+        `cancel` tells the worker that a job in `held` (its jobs not yet told to cancel) was
+        cancelled, so it reconciles at once; that also ends a wait."""
         valid_id(request)
+        deadline = time.monotonic() + wait
+        checked = False
+        while True:
+            final = time.monotonic() >= deadline
+            # Polling stays read-only until there is something to take.
+            if not checked or final or self.db.execute("SELECT 1 FROM jobs WHERE state='QUEUED' AND cancel=0 LIMIT 1").fetchone():
+                row, decided = self.take(request, final)
+                if decided:
+                    break
+            checked = True
+            if self.unheard(held):
+                row = None
+                break
+            time.sleep(max(0, min(CLAIM_POLL, deadline - time.monotonic())))
+        cancel = self.unheard(held)
+        if not row:
+            return {"job": None, "cancel": cancel}
+        data = (self.root / "blobs" / row["snapshot"]).read_bytes()
+        return {"job": {key: row[key] for key in ("id", "workspace", "command", "cwd", "timeout", "claim", "cancel")}, "snapshot": base64.b64encode(data).decode(), "snapshot_digest": row["snapshot"], "cancel": cancel}
+
+    def take(self, request, final):
+        """Return (job row or None, whether this request is settled)."""
         with transaction(self.db):
             previous = self.db.execute("SELECT job_id FROM claims WHERE request=?", (request,)).fetchone()
             if previous:
-                row = self.job(previous[0]) if previous[0] else None
-            else:
-                row = self.db.execute("SELECT * FROM jobs AS candidate WHERE state='QUEUED' AND cancel=0 AND NOT EXISTS(SELECT 1 FROM jobs AS active WHERE active.workspace=candidate.workspace AND active.state='CLAIMED') ORDER BY created LIMIT 1").fetchone()
-                if row:
-                    claim = opaque()
-                    now = time.time()
-                    self.db.execute("UPDATE jobs SET state='CLAIMED',claim=?,claimed=? WHERE id=?", (claim, now, row["id"]))
-                    self.db.execute("UPDATE summaries SET claimed=? WHERE job_id=?", (now, row["id"]))
-                    event(self.db, row["id"], "CLAIMED", "CLAIMED")
-                    row = self.job(row["id"])
-                self.db.execute("DELETE FROM claims WHERE job_id IS NULL")
-                self.db.execute("INSERT INTO claims VALUES(?,?)", (request, row["id"] if row else None))
-        if not row:
-            return {"job": None}
-        data = (self.root / "blobs" / row["snapshot"]).read_bytes()
-        return {"job": {key: row[key] for key in ("id", "workspace", "command", "cwd", "timeout", "claim", "cancel")}, "snapshot": base64.b64encode(data).decode(), "snapshot_digest": row["snapshot"]}
+                # A retried claim gets its job back only while that claim still holds it.
+                row = self.db.execute("SELECT * FROM jobs WHERE id=? AND state='CLAIMED' AND result_digest IS NULL", (previous[0],)).fetchone() if previous[0] else None
+                return row, True
+            row = self.db.execute("SELECT * FROM jobs AS candidate WHERE state='QUEUED' AND cancel=0 AND NOT EXISTS(SELECT 1 FROM jobs AS active WHERE active.workspace=candidate.workspace AND active.state='CLAIMED') ORDER BY created LIMIT 1").fetchone()
+            if row:
+                claim = opaque()
+                now = time.time()
+                self.db.execute("UPDATE jobs SET state='CLAIMED',claim=?,claimed=? WHERE id=?", (claim, now, row["id"]))
+                self.db.execute("UPDATE summaries SET claimed=? WHERE job_id=?", (now, row["id"]))
+                event(self.db, row["id"], "CLAIMED", "CLAIMED")
+                row = self.job(row["id"])
+            elif not final:
+                return None, False
+            self.db.execute("DELETE FROM claims WHERE job_id IS NULL")
+            self.db.execute("INSERT INTO claims VALUES(?,?)", (request, row["id"] if row else None))
+            return row, True
+
+    def unheard(self, held):
+        return any(row[0] in held for row in self.db.execute("SELECT id FROM jobs WHERE state='CLAIMED' AND cancel=1"))
 
     def cancel(self, job):
         with transaction(self.db):
@@ -280,12 +369,13 @@ class Server:
         if row["state"] not in {"CLAIMED", "QUEUED"}:
             raise Refusal("RESULT_CONFLICT")
         immutable(self.root / "blobs" / value, data)
-        # Unknown outcomes retain the workspace reservation until explicitly resolved.
-        state = "CLAIMED" if bundle["outcome"] == "unknown" else "RESULT_STORED"
+        # An unknown outcome is terminal too. Its process group is gone (the gate kills it when
+        # its supervisor dies) and every job extracts into its own directory, so holding the
+        # workspace would protect nothing; the command is still never replayed.
         completed = time.time()
-        self.db.execute("UPDATE jobs SET state=?,result_digest=?,completed=? WHERE id=?", (state, value, completed, row["id"]))
+        self.db.execute("UPDATE jobs SET state='RESULT_STORED',result_digest=?,completed=? WHERE id=?", (value, completed, row["id"]))
         self.summarize_result(row["id"], bundle, completed)
-        event(self.db, row["id"], "RESULT_STORED", "EXECUTION_UNKNOWN" if state == "CLAIMED" else "RESULT_STORED", bundle["outcome"])
+        event(self.db, row["id"], "RESULT_STORED", bundle["reason"] if bundle["outcome"] == "unknown" else "RESULT_STORED", bundle["outcome"])
         return {"job_id": row["id"], "digest": value}
 
     def report(self, bundle, expected):
@@ -293,6 +383,60 @@ class Server:
             raise Refusal("RESULT_INVALID")
         with transaction(self.db):
             return self._store(bundle)
+
+    def settle(self, job, outcome, code, reason):
+        """Store a server-decided result for a claimed job the worker cannot finish."""
+        row = self.job(job)
+        if row["state"] != "CLAIMED" or row["result_digest"]:
+            return
+        self._store(self.publisher.bundle(job, row["claim"], outcome, code, reason))
+
+    def expire(self, active):
+        """Release claims missing from the worker's complete list of its own jobs.
+
+        A job claimed in the last LEASE seconds may still be in flight to the worker.
+        Anything older that the worker no longer holds (state lost, claim never
+        delivered) would otherwise block its workspace forever."""
+        rows = self.db.execute("SELECT id FROM jobs WHERE state='CLAIMED' AND result_digest IS NULL AND claimed<?", (time.time() - LEASE,)).fetchall()
+        for row in rows:
+            if row[0] not in active:
+                self.settle(row[0], "unknown", 70, "CLAIM_LOST")
+
+    def reconcile_one(self, item):
+        row = self.job(item["job_id"])
+        if row["claim"] != valid_id(item.get("claim_id")):
+            raise Refusal("CLAIM_MISMATCH")
+        for value in self.publisher.events(item.get("events", [])):
+            if value["job_id"] != row["id"]:
+                raise Refusal()
+            # Mac events have a separate origin sequence to deduplicate retries.
+            key = "event:" + row["id"] + ":" + str(value["sequence"])
+            prior = self.db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            if not prior:
+                rebased = event(self.db, row["id"], value["phase"], value["reason"], value["outcome"], value["attempt"])
+                rebased["duration"] = value["duration"]
+                self.db.execute("UPDATE events SET value=? WHERE job_id=? AND sequence=?", (encode(rebased).decode(), row["id"], rebased["sequence"]))
+                self.db.execute("INSERT INTO settings VALUES(?,?)", (key, digest(encode(value))))
+            elif prior[0] != digest(encode(value)):
+                raise Refusal("EVENT_CONFLICT")
+        result = {"job_id": row["id"], "cancel": bool(row["cancel"])}
+        report = item.get("report")
+        if report is not None:
+            # A finished job's result rides along, saving the worker a second round trip. Its
+            # failure is separate, so the events above still land.
+            if not isinstance(report, dict) or set(report) != {"bundle", "digest"}:
+                raise Refusal()
+            self.db.execute("SAVEPOINT report")
+            try:
+                if digest(encode(report["bundle"])) != report["digest"]:
+                    raise Refusal("RESULT_INVALID")
+                result["ack"] = self._store(report["bundle"])
+                self.db.execute("RELEASE report")
+            except Refusal as error:
+                self.db.execute("ROLLBACK TO report")
+                self.db.execute("RELEASE report")
+                result["report_error"] = error.reason
+        return result
 
     def ack(self, job, value, artifacts=False):
         with transaction(self.db):
@@ -322,8 +466,10 @@ class Server:
 
     def rpc(self, request):
         self.authenticate(request.get("token"))
-        with transaction(self.db):
-            self.db.execute("INSERT OR REPLACE INTO settings VALUES('last_contact',?)", (str(time.time()),))
+        contact = self.db.execute("SELECT value FROM settings WHERE key='last_contact'").fetchone()
+        if not contact or time.time() - float(contact[0]) >= CONTACT_EVERY:
+            with transaction(self.db):
+                self.db.execute("INSERT OR REPLACE INTO settings VALUES('last_contact',?)", (str(time.time()),))
         action = request.get("action")
         if action == "heartbeat":
             state = request.get("state")
@@ -335,6 +481,15 @@ class Server:
             health = request.get("health") or []
             if not isinstance(health, list) or len(health) > 16:
                 raise Refusal()
+            runtime = request.get("runtime")
+            if runtime is not None and (not isinstance(runtime, str) or not VERSION.fullmatch(runtime)):
+                raise Refusal()
+            # Workers send their full job list only when it fits; without it nothing expires.
+            active = request.get("active")
+            if active is not None:
+                if not isinstance(active, list) or len(active) > MAX_RECONCILE:
+                    raise Refusal()
+                active = {valid_id(item) for item in active}
             for batch in health:
                 if not isinstance(batch, dict) or set(batch) != {"id", "counts"} or not isinstance(batch["counts"], dict) or len(batch["counts"]) > 32:
                     raise Refusal()
@@ -348,6 +503,10 @@ class Server:
                 self.db.execute("INSERT OR REPLACE INTO settings VALUES('worker_state',?)", (state,))
                 if timing is not None:
                     self.db.execute("INSERT OR REPLACE INTO settings VALUES('worker_timing',?)", (json.dumps(timing),))
+                if runtime is not None:
+                    self.db.execute("INSERT OR REPLACE INTO settings VALUES('worker_runtime',?)", (runtime,))
+                if active is not None:
+                    self.expire(active)
                 last_gc = self.db.execute("SELECT value FROM settings WHERE key='last_gc'").fetchone()
                 due = not last_gc or time.time() - float(last_gc[0]) >= GC_INTERVAL
                 if due:
@@ -356,32 +515,40 @@ class Server:
                 self.gc(True)
             return {"connected": True}
         if action == "claim":
-            return self.claim(request.get("request_id"))
+            wait = request.get("wait", 0)
+            held = request.get("held", [])
+            if type(wait) not in {int, float} or not 0 <= wait <= CLAIM_WAIT or not isinstance(held, list) or len(held) > MAX_RECONCILE:
+                raise Refusal()
+            return self.claim(request.get("request_id"), wait, {valid_id(item) for item in held})
         if action == "reconcile":
             jobs = request.get("jobs")
             if not isinstance(jobs, list) or len(jobs) > MAX_RECONCILE:
                 raise Refusal()
+            for item in jobs:
+                if not isinstance(item, dict):
+                    raise Refusal()
+                valid_id(item.get("job_id"))
             response = []
             with transaction(self.db):
+                # Each job settles on its own, so one bad job cannot stall the rest of the batch.
                 for item in jobs:
-                    row = self.job(item["job_id"])
-                    if row["claim"] != valid_id(item["claim_id"]):
-                        raise Refusal("CLAIM_MISMATCH")
-                    for value in self.publisher.events(item.get("events", [])):
-                        if value["job_id"] != row["id"]:
-                            raise Refusal()
-                        # Mac events have a separate origin sequence to deduplicate retries.
-                        key = "event:" + row["id"] + ":" + str(value["sequence"])
-                        prior = self.db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-                        if not prior:
-                            rebased = event(self.db, row["id"], value["phase"], value["reason"], value["outcome"], value["attempt"])
-                            rebased["duration"] = value["duration"]
-                            self.db.execute("UPDATE events SET value=? WHERE job_id=? AND sequence=?", (encode(rebased).decode(), row["id"], rebased["sequence"]))
-                            self.db.execute("INSERT INTO settings VALUES(?,?)", (key, digest(encode(value))))
-                        elif prior[0] != digest(encode(value)):
-                            raise Refusal("EVENT_CONFLICT")
-                    response.append({"job_id": row["id"], "cancel": bool(row["cancel"])})
+                    self.db.execute("SAVEPOINT item")
+                    try:
+                        response.append(self.reconcile_one(item))
+                        self.db.execute("RELEASE item")
+                    except Refusal as error:
+                        self.db.execute("ROLLBACK TO item")
+                        self.db.execute("RELEASE item")
+                        response.append({"job_id": item["job_id"], "error": error.reason})
             return {"jobs": response}
+        if action == "reject":
+            # The worker could not take a claimed job it never started; record that it failed.
+            row = self.job(request.get("job_id"))
+            if row["claim"] != valid_id(request.get("claim_id")):
+                raise Refusal("CLAIM_MISMATCH")
+            with transaction(self.db):
+                self.settle(row["id"], "failed", 126, "CLAIM_REJECTED")
+            return self.status(row["id"])
         if action == "report":
             return self.report(request.get("bundle"), request.get("digest"))
         raise Refusal()

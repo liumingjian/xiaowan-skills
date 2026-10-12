@@ -28,13 +28,15 @@ ID = re.compile(r"^[a-f0-9]{32}$")
 # Failure and error reasons are fixed identifiers, never free text.
 CODE = re.compile(r"^[A-Z][A-Z_]{0,39}$")
 STATES = {"RECEIVED", "PREPARING", "READY", "START_RESERVED", "RUNNING", "TERMINAL"}
-REASONS = {"ACCEPTED", "CLAIMED", "PREPARING", "STARTED", "COMPLETED", "CANCELLED", "DEADLINE", "EXECUTION_UNKNOWN", "SNAPSHOT_REJECTED", "OUTPUT_BLOCKED", "LOW_SPACE", "LAUNCH_FAILED", "CONNECTIVITY", "ARTIFACT_BLOCKED", "RESULT_STORED"}
+REASONS = {"ACCEPTED", "CLAIMED", "PREPARING", "STARTED", "COMPLETED", "CANCELLED", "DEADLINE", "EXECUTION_UNKNOWN", "SNAPSHOT_REJECTED", "OUTPUT_BLOCKED", "LOW_SPACE", "LAUNCH_FAILED", "CONNECTIVITY", "ARTIFACT_BLOCKED", "RESULT_STORED", "SUPERVISOR_LOST", "CLAIM_LOST", "CLAIM_REJECTED"}
 
 
 class Refusal(Exception):
-    def __init__(self, reason="INVALID_REQUEST", code=2):
+    def __init__(self, reason="INVALID_REQUEST", code=2, detail=None):
         self.reason = reason
         self.code = code
+        # Shown only by the VPS CLI to its own caller, never sent across the channel.
+        self.detail = detail or {}
         super().__init__(reason)
 
 
@@ -58,6 +60,22 @@ def encode(value):
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
+
+
+VERSION = re.compile(r"^[a-f0-9]{12}$")
+_version = None
+
+
+def runtime_version():
+    """Short digest of this runtime's sources, taken once per process so it names the loaded
+    code. Both ends report the same value when they run the same release."""
+    global _version
+    if _version is None:
+        hasher = hashlib.sha256()
+        for path in sorted(Path(__file__).resolve().parent.glob("*.py")):
+            hasher.update(path.name.encode() + b"\0" + path.read_bytes() + b"\0")
+        _version = hasher.hexdigest()[:12]
+    return _version
 
 
 def private_dir(path):
@@ -167,28 +185,30 @@ def reject_legacy():
         raise Refusal("REMOVED_CONTROL")
 
 
-def walk_regular(root, byte_limit, count_limit, prune=None, include_directories=False):
-    """Walk descriptor-relative entries so directory swaps cannot follow links."""
+def walk_regular(root, byte_limit, count_limit, prune=None, include_directories=False, other=None):
+    """Walk descriptor-relative entries so directory swaps cannot follow links.
+
+    Links and special files are refused, or passed to `other` when given."""
     import stat
     root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     count = total = 0
     def visit(parent_fd, prefix, depth):
         nonlocal count, total
         if depth > 32:
-            raise Refusal("TREE_LIMIT")
+            raise Refusal("TREE_LIMIT", detail={"at": prefix})
         names = []
         with os.scandir(parent_fd) as iterator:
             for entry in iterator:
                 names.append(entry.name)
                 if len(names) > count_limit:
-                    raise Refusal("TREE_LIMIT")
+                    raise Refusal("TREE_LIMIT", detail={"at": prefix or "."})
         for name in sorted(names):
             relative = prefix + name
             if prune and prune(relative):
                 continue
             count += 1
             if count > count_limit:
-                raise Refusal("TREE_LIMIT")
+                raise Refusal("TREE_LIMIT", detail={"at": relative})
             mode = os.stat(name, dir_fd=parent_fd, follow_symlinks=False).st_mode
             flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
             if stat.S_ISDIR(mode):
@@ -204,15 +224,17 @@ def walk_regular(root, byte_limit, count_limit, prune=None, include_directories=
                 try:
                     info = os.fstat(child)
                     if not stat.S_ISREG(info.st_mode) or info.st_size > byte_limit - total:
-                        raise Refusal("TREE_LIMIT")
+                        raise Refusal("TREE_BYTES", detail={"at": relative})
                     with os.fdopen(child, "rb", closefd=False) as stream:
                         data = stream.read(byte_limit - total + 1)
                     total += len(data)
                     if total > byte_limit:
-                        raise Refusal("TREE_LIMIT")
+                        raise Refusal("TREE_BYTES", detail={"at": relative})
                     yield relative, data, info.st_mode
                 finally:
                     os.close(child)
+            elif other is not None:
+                other(relative)
             else:
                 raise Refusal("UNSAFE_FILE")
     try:

@@ -17,13 +17,13 @@ from unittest.mock import patch
 
 RUNTIME = Path(__file__).resolve().parents[1] / "runtime"
 sys.path.insert(0, str(RUNTIME))
-from rexec_runtime.common import MAX_LOG, Refusal, atomic, digest, encode, immutable, opaque
+from rexec_runtime.common import MAX_ARTIFACT, MAX_LOG, Refusal, atomic, digest, encode, event, immutable, opaque, runtime_version, transaction
 from rexec_runtime.export import Publisher
 from rexec_runtime.local import Local, Transport
 from rexec_runtime.server import Server
 from rexec_runtime.snapshot import extract, freeze
 from rexec_runtime.__main__ import write_artifacts
-from rexec_runtime.service import plist, service
+from rexec_runtime.service import plist, service, verify
 
 
 class RuntimeTests(unittest.TestCase):
@@ -227,23 +227,95 @@ sys.exit(result.returncode)
         else:
             self.assertEqual(self.server.status(job)["exit_code"], 125)
 
-    def test_unknown_never_replays_and_keeps_workspace_reserved(self):
+    def test_unknown_never_replays_and_releases_workspace(self):
+        marker = self.root / "effect"
+        job = self.submit("printf x >> " + str(marker))
+        local = Local(self.mac)
+        local.receive(self.server.claim(opaque()))
+        local.prepare(job)
+        local.db.execute("UPDATE jobs SET state='RUNNING',started=?,nonce=?,socket=? WHERE id=?", (time.time(), opaque(), str(self.root / "missing"), job))
+        # A held supervisor lock means the supervisor lives, however slow its socket is.
+        with open(self.mac / "jobs" / job / "supervisor.lock", "a") as lock:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            local.recover()
+            self.assertEqual(local.row(job)["state"], "RUNNING")
+        local.recover()
+        bundle = json.loads((self.mac / "outbox" / job).read_bytes())
+        self.assertEqual((bundle["outcome"], bundle["exit_code"], bundle["reason"]), ("unknown", 70, "SUPERVISOR_LOST"))
+        self.server.report(bundle, digest(encode(bundle)))
+        self.assertEqual(self.server.job(job)["state"], "RESULT_STORED")
+        self.assertEqual(self.server.status(job)["reason"], "SUPERVISOR_LOST")
+        second = self.submit()
+        self.assertEqual(self.server.claim(opaque())["job"]["id"], second)
+        self.assertFalse(marker.exists())
+
+    def test_launch_without_supervisor_is_plain_failure(self):
         job = self.submit("printf forbidden")
         local = Local(self.mac)
         local.receive(self.server.claim(opaque()))
         local.prepare(job)
         local.db.execute("UPDATE jobs SET state='START_RESERVED',nonce=?,socket=? WHERE id=?", (opaque(), str(self.root / "missing"), job))
         local.recover()
-        time.sleep(1.05)
-        local.recover()
-        local.reconcile = lambda: None
-        self.assertEqual(json.loads((self.mac / "outbox" / job).read_bytes())["outcome"], "unknown")
         bundle = json.loads((self.mac / "outbox" / job).read_bytes())
+        self.assertEqual((bundle["outcome"], bundle["exit_code"], bundle["reason"]), ("failed", 126, "LAUNCH_FAILED"))
+
+    def test_legacy_unknown_reservation_is_released_on_upgrade(self):
+        job = self.submit()
+        claimed = self.server.claim(opaque())["job"]
+        bundle = Publisher().bundle(job, claimed["claim"], "unknown", 70, "EXECUTION_UNKNOWN")
         self.server.report(bundle, digest(encode(bundle)))
-        self.assertEqual(self.server.job(job)["state"], "CLAIMED")
-        second = self.submit()
-        self.assertIsNone(self.server.claim(opaque())["job"])
-        self.assertEqual(self.server.job(second)["state"], "QUEUED")
+        self.server.db.execute("UPDATE jobs SET state='CLAIMED' WHERE id=?", (job,))
+        Server(self.remote).db.close()
+        self.assertEqual(self.server.job(job)["state"], "RESULT_STORED")
+
+    def test_claim_lease_releases_jobs_the_worker_does_not_hold(self):
+        held, lost = self.submit(), self.server.submit("true", self.root, ".", 10, opaque())["job_id"]
+        request = opaque()
+        self.assertEqual(self.server.claim(request)["job"]["id"], held)
+        self.server.claim(opaque())
+        self.server.db.execute("UPDATE jobs SET claimed=0")
+        heartbeat = {"token": self.server.provision(), "action": "heartbeat", "state": "READY"}
+        self.server.rpc(heartbeat)
+        self.assertEqual(self.server.job(lost)["state"], "CLAIMED")
+        self.server.rpc(dict(heartbeat, active=[held]))
+        self.assertEqual(self.server.job(held)["state"], "CLAIMED")
+        self.assertEqual((self.server.status(lost)["outcome"], self.server.status(lost)["reason"]), ("unknown", "CLAIM_LOST"))
+        self.server.rpc(dict(heartbeat, active=[]))
+        self.assertEqual(self.server.job(held)["state"], "RESULT_STORED")
+        # A retried claim no longer hands back a job that was settled without the worker.
+        self.assertIsNone(self.server.claim(request)["job"])
+
+    def test_one_missing_job_does_not_stall_reconcile_or_reports(self):
+        first, second = self.submit("printf one"), self.server.submit("printf two", self.root, ".", 10, opaque())["job_id"]
+        local = Local(self.mac, self.isolated())
+        local.tick()
+        self.until(lambda: all(Local(self.mac).row(job)["state"] == "TERMINAL" for job in (first, second)))
+        with transaction(self.server.db):
+            self.server.db.execute("DELETE FROM claims WHERE job_id=?", (first,))
+            self.server.db.execute("DELETE FROM jobs WHERE id=?", (first,))
+        local.reconcile()
+        self.assertEqual(self.server.status(second)["stdout"], "two")
+        self.assertTrue(local.row(first)["acknowledged"])
+        self.assertTrue(local.row(second)["acknowledged"])
+        self.assertIn("ORPHANED_RESULT", json.dumps(local.health()))
+
+    def test_claim_that_never_arrives_is_rejected_after_retries(self):
+        job = self.submit()
+        server = self.server
+        class Corrupting:
+            def call(inner, action, **parameters):
+                response = server.rpc({"token": server.provision(), "action": action, **parameters})
+                if action == "claim" and response.get("job"):
+                    response["snapshot_digest"] = "0" * 64
+                return response
+        local = Local(self.mac, Corrupting())
+        for _ in range(3):
+            with self.assertRaises(Refusal):
+                local.claim()
+        self.assertEqual((self.server.status(job)["outcome"], self.server.status(job)["exit_code"], self.server.status(job)["reason"]), ("failed", 126, "CLAIM_REJECTED"))
+        self.assertIsNone(local.db.execute("SELECT 1 FROM settings WHERE key='claim_request'").fetchone())
+        self.assertFalse(local.claim())
 
     def test_report_write_failure_has_no_false_ack(self):
         job = self.submit()
@@ -373,8 +445,11 @@ sys.exit(result.returncode)
 
     def test_snapshot_rejects_links_traversal_and_wrong_digest(self):
         (self.source / "link").symlink_to("outside")
-        with self.assertRaises(Refusal):
-            freeze(self.source)
+        (self.source / "kept.txt").write_text("safe")
+        report = {}
+        with tarfile.open(fileobj=io.BytesIO(freeze(self.source, report=report))) as archive:
+            self.assertEqual(archive.getnames(), ["kept.txt"])
+        self.assertEqual((report["skipped"], report["skipped_count"], report["files"]), (["link"], 1, 1))
         (self.source / "link").unlink()
         link = self.root / "source-link"
         link.symlink_to(self.source)
@@ -413,8 +488,21 @@ sys.exit(result.returncode)
         decoded = plistlib.loads(plistlib.dumps(value))
         self.assertEqual(decoded["ProgramArguments"][0], sys.executable)
         self.assertTrue(Path(decoded["EnvironmentVariables"]["PYTHONPATH"]).is_absolute())
-        with patch("rexec_runtime.service.subprocess.run", return_value=subprocess.CompletedProcess([], 0, b"private", b"private")) as run:
+        loaded = {"value": True, "refusals": 1}
+        def launchctl(args, **kw):
+            # bootout unloads asynchronously and the first bootstrap after it is refused, as on macOS.
+            if args[1] == "bootout":
+                loaded["value"] = False
+            if args[1] == "bootstrap":
+                if loaded["refusals"]:
+                    loaded["refusals"] -= 1
+                    return subprocess.CompletedProcess(args, 5, b"private", b"private")
+                loaded["value"] = True
+            return subprocess.CompletedProcess(args, 0 if args[1] != "print" or loaded["value"] else 113, b"private", b"private")
+        with patch("rexec_runtime.service.subprocess.run", side_effect=launchctl) as run, patch("rexec_runtime.service.time.sleep"):
             self.assertTrue(service(self.mac, "status")["running"])
+            self.assertEqual(service(self.mac, "stop"), {"running": False})
+            self.assertEqual(service(self.mac, "start"), {"running": True})
             self.assertNotIn("private", encode(service(self.mac, "stop")).decode())
             self.assertEqual(run.call_args.args[0][0], "launchctl")
 
@@ -510,7 +598,21 @@ sys.exit(result.returncode)
         (tools / "ssh").write_text('#!/bin/sh\n[ "$1" = vps-cc ] || exit 99\nexec sh -c "$2"\n')
         (tools / "uv").write_text("#!/bin/sh\necho " + sys.executable + "\n")
         log = self.root / "launchctl.log"
-        (tools / "launchctl").write_text('#!/bin/sh\necho "$1" >> ' + str(log) + '\nloaded=' + str(self.root / "loaded") + '\ncase "$1" in print) [ -e "$loaded" ];; bootstrap) touch "$loaded";; bootout) rm "$loaded";; esac\n')
+        loaded = self.root / "loaded"
+        # A bootstrapped "worker" heartbeats at once unless the test makes it fail to connect.
+        (tools / "launchctl").write_text("#!" + sys.executable + "\n" + f'''import os,pathlib,sqlite3,sys,time
+with open({str(log)!r},"a") as log: log.write(sys.argv[1]+"\\n")
+loaded=pathlib.Path({str(loaded)!r})
+if sys.argv[1]=="print": sys.exit(0 if loaded.exists() else 113)
+if sys.argv[1]=="bootout": loaded.unlink()
+if sys.argv[1]=="bootstrap":
+    loaded.touch()
+    if not os.environ.get("FAKE_NO_CONTACT"):
+        db=sqlite3.connect(os.path.join(os.environ["REXEC_STATE_DIR"],"state.sqlite"))
+        db.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        db.execute("INSERT OR REPLACE INTO settings VALUES('contact',?)",(str(time.time()),))
+        db.commit()
+''')
         for name in ("ssh", "uv", "launchctl"):
             (tools / name).chmod(0o755)
         environment = dict(os.environ, HOME=str(home), PATH=str(tools) + os.pathsep + os.environ["PATH"], REXEC_STATE_DIR=str(self.mac), REXEC_REMOTE_ROOT=str(state))
@@ -518,13 +620,21 @@ sys.exit(result.returncode)
         for _ in range(2):
             result = subprocess.run(["bash", "-c", line], env=environment, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(result.stdout), {"updated": True, "running": True})
+            self.assertEqual(json.loads(result.stdout), {"updated": True, "running": True, "connected": True, "runtime": runtime_version()})
         self.assertTrue((home / ".rexec/runtime/rexec_runtime/__main__.py").is_file())
         self.assertFalse(list((home / ".rexec").glob(".runtime-*")))
         installed = plistlib.loads((home / "Library/LaunchAgents/dev.xiaowan.rexec.worker.plist").read_bytes())
         self.assertEqual(installed["EnvironmentVariables"]["PYTHONPATH"], str((home / ".rexec/runtime").resolve()))
         self.assertEqual(log.read_text().split().count("bootstrap"), 2)
         self.assertEqual(log.read_text().split().count("bootout"), 1)
+        # A worker that never reaches the VPS is not reported as updated; the previous runtime returns.
+        (home / ".rexec/runtime/previous").write_text("kept")
+        result = subprocess.run(["bash", "-c", line], env=dict(environment, FAKE_NO_CONTACT="1", REXEC_VERIFY_SECONDS="1"), capture_output=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        outcome = json.loads(result.stdout)
+        self.assertEqual((outcome["updated"], outcome["rolled_back"], outcome["running"], outcome["cause"]["error"]), (False, True, True, "WORKER_NOT_CONNECTED"))
+        self.assertTrue((home / ".rexec/runtime/previous").is_file())
+        self.assertTrue((home / ".rexec/runtime.failed/rexec_runtime/__main__.py").is_file())
 
     def test_service_install_plist_with_isolated_home(self):
         home = self.root / "home"
@@ -755,6 +865,227 @@ sys.exit(result.returncode)
         self.assertEqual(failures.get("WORKER_CRASH"), 1)
         self.assertTrue((self.mac / "tick.failure").is_file())
         self.assertNotIn("private", json.dumps(self.server.channel()))
+
+    def test_server_refusal_keeps_its_code_over_ssh(self):
+        atomic(self.mac / "worker.token", b"wrong")
+        with patch.dict(os.environ, {key: self.environment[key] for key in ("PATH", "PYTHONPATH", "REXEC_TEST_REMOTE")}):
+            with self.assertRaises(Refusal) as caught:
+                Transport(self.mac).call("heartbeat", state="READY")
+        self.assertEqual(caught.exception.reason, "AUTHORIZATION_REQUIRED")
+
+    def test_foreground_submit_reports_job_first_and_refuses_offline_mac(self):
+        environment = dict(self.environment, REXEC_STATE_DIR=str(self.remote))
+        cli = lambda *words: subprocess.run([sys.executable, "-m", "rexec_runtime", "server", *words], env=environment, capture_output=True, cwd=self.source)
+        offline = cli("printf hi")
+        self.assertEqual((offline.returncode, json.loads(offline.stdout)), (75, {"error": "CHANNEL_OFFLINE"}))
+        self.assertEqual(self.server.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0)
+        self.server.rpc({"token": self.server.provision(), "action": "heartbeat", "state": "READY"})
+        pending = cli("--label", "unit tests", "--wait-timeout", "0", "printf hi")
+        self.assertEqual(pending.returncode, 75)
+        job = json.loads(pending.stderr)["job_id"]
+        waited = json.loads(pending.stdout)
+        self.assertEqual((waited["job_id"], waited["job_state"], waited["channel"]), (job, "QUEUED", "READY"))
+        self.spawn("worker")
+        self.finished(job)
+        item = json.loads(cli("status").stdout)["jobs"][0]
+        self.assertEqual((item["job_id"], item["label"], item["exit_code"], item["unread"]), (job, "unit tests", 0, True))
+        self.assertNotIn("stdout", item)
+        self.assertEqual(json.loads(cli("status", job).stdout)["stdout"], "hi")
+        self.assertFalse(json.loads(cli("status").stdout)["jobs"][0]["unread"])
+        self.assertEqual(json.loads(cli("--background", "--label", "/home/agent/private", "true").stdout), {"error": "LABEL_INVALID"})
+
+    def test_status_lists_only_jobs_needing_attention(self):
+        settled = []
+        for index in range(8):
+            source = self.root / f"settled{index}"
+            source.mkdir()
+            job = self.server.submit("true", source, ".", 10, opaque())["job_id"]
+            self.server.cancel(job)
+            self.server.ack(job, self.server.job(job)["result_digest"])
+            settled.append(job)
+        unread = self.submit()
+        self.server.cancel(unread)
+        queued = self.server.submit("true", self.root, ".", 10, opaque())["job_id"]
+        listing = self.server.queue()
+        self.assertEqual({item["job_id"] for item in listing["jobs"]}, {queued, unread, *settled[-5:]})
+        self.assertEqual(listing["hidden"], 3)
+        self.assertEqual(len(self.server.queue(True)["jobs"]), 10)
+
+    def test_snapshot_follows_gitignore_and_names_its_failures(self):
+        git = lambda *words: subprocess.run(["git", "-C", str(self.source), *words], check=True, capture_output=True)
+        git("init", "-q")
+        for name in ("src/app.py", "build/out.txt", "secret_store.py", "secrets.yaml", "notes.txt"):
+            (self.source / name).parent.mkdir(exist_ok=True)
+            (self.source / name).write_text("safe")
+        (self.source / ".gitignore").write_text("build/\n")
+        git("add", "src/app.py")
+        report = {}
+        with tarfile.open(fileobj=io.BytesIO(freeze(self.source, report=report))) as archive:
+            names = {entry.name for entry in archive if entry.isfile()}
+        self.assertEqual(names, {".gitignore", "src/app.py", "secret_store.py", "notes.txt"})
+        self.assertTrue(report["gitignore"])
+        with tarfile.open(fileobj=io.BytesIO(freeze(self.source, ignored=True))) as archive:
+            self.assertIn("build/out.txt", archive.getnames())
+        with patch("rexec_runtime.snapshot.MAX_FILES", 2):
+            with self.assertRaises(Refusal) as caught:
+                freeze(self.source)
+        self.assertEqual(caught.exception.reason, "SNAPSHOT_TOO_MANY_FILES")
+        self.assertIn("at", caught.exception.detail)
+        with self.assertRaises(Refusal) as caught:
+            self.server.submit("true", self.source, "missing", 10, opaque())
+        self.assertEqual(caught.exception.reason, "CWD_NOT_FOUND")
+        self.assertEqual(self.server.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0)
+
+    def test_output_keeps_workspace_paths_and_times(self):
+        local = Local(self.mac)
+        workspace = self.mac / "jobs" / opaque() / "workspace"
+        text = local.publisher.sanitize(f'File "{workspace}/src/app.py", line 12 at 12:34:56 from fe80::1 and 2001:db8:0:0:0:0:0:1')
+        self.assertEqual(text, 'File "$WS/src/app.py", line 12 at 12:34:56 from [private] and [private]')
+        self.assertEqual(Publisher().sanitize(text), text)
+
+    def test_one_refused_artifact_keeps_the_others(self):
+        artifacts = self.root / "artifact-source"
+        artifacts.mkdir()
+        (artifacts / "report.xml").write_text("<ok/>")
+        (artifacts / "huge.txt").write_text("x" * (MAX_ARTIFACT + 1))
+        (artifacts / "value.bin").write_text("safe")
+        accepted, refused = Publisher().collect(artifacts)
+        self.assertEqual([item["name"] for item in accepted], ["report.xml"])
+        self.assertEqual(refused, ["huge.txt", None])
+        bundle = Publisher().bundle(opaque(), opaque(), "completed", 0, "COMPLETED", artifacts=accepted, refused=refused)
+        self.assertEqual(Publisher().validate_bundle(bundle)["artifacts_refused"], ["huge.txt", None])
+
+    def test_idle_claim_waits_for_work_and_hears_cancels(self):
+        started = time.monotonic()
+        self.assertEqual(self.server.claim(opaque(), 0.6), {"job": None, "cancel": False})
+        self.assertGreaterEqual(time.monotonic() - started, 0.5)
+        # SQLite connections stay in their thread, so the late submit opens its own.
+        timer = threading.Timer(0.3, lambda: Server(self.remote).submit("printf safe", self.source, ".", 10, opaque()))
+        timer.start()
+        try:
+            self.assertIsNotNone(self.server.claim(opaque(), 10)["job"])
+        finally:
+            timer.join()
+        self.assertLess(time.monotonic() - started, 5)
+        # The job above still holds the source workspace, so this one runs in its own.
+        job = self.server.submit("printf safe", None, ".", 10, opaque())["job_id"]
+        claimed = self.server.claim(opaque())["job"]["id"]
+        self.assertEqual(claimed, job)
+        self.server.cancel(job)
+        # A cancel the worker has not heard of ends the wait at once; one it already has does not.
+        started = time.monotonic()
+        self.assertTrue(self.server.claim(opaque(), 10, {job})["cancel"])
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertFalse(self.server.claim(opaque(), 0, set())["cancel"])
+
+    def test_interrupted_wait_keeps_its_claim_for_the_retry(self):
+        job = self.submit()
+        server = self.server
+        class Interrupted:
+            def call(inner, action, **parameters):
+                if action == "claim":
+                    # The server takes the job, then the worker drops the wait to report a result.
+                    server.rpc({"token": server.provision(), "action": action, **parameters})
+                    raise Refusal("INTERRUPTED", 75)
+                return server.rpc({"token": server.provision(), "action": action, **parameters})
+        local = Local(self.mac, Interrupted())
+        local.idle_wait = 1
+        self.assertFalse(local.claim())
+        self.assertEqual(local.health(), [])
+        local.transport = self.isolated()
+        self.assertTrue(local.claim())
+        self.assertEqual(local.row(job)["state"], "RECEIVED")
+
+    def test_waiting_claim_yields_to_local_work(self):
+        local = Local(self.mac, self.isolated())
+        local.waiting = True
+        local.maintain()
+        self.submit()
+        local.receive(self.server.claim(opaque()))
+        with self.assertRaises(Refusal) as raised:
+            local.maintain()
+        self.assertEqual(raised.exception.reason, "INTERRUPTED")
+        local.waiting = False
+        local.maintain()
+
+    def test_running_jobs_reconcile_on_change_not_every_tick(self):
+        calls = []
+        isolated = self.isolated()
+        class Counting:
+            def call(inner, action, **parameters):
+                calls.append(action)
+                return isolated.call(action, **parameters)
+        local = Local(self.mac, Counting())
+        job = self.submit()
+        local.receive(self.server.claim(opaque()))
+        local.reconcile(force=False)
+        local.reconcile(force=False)
+        self.assertEqual(calls.count("reconcile"), 1)
+        local.urgent = True
+        local.reconcile(force=False)
+        self.assertEqual(calls.count("reconcile"), 2)
+        with transaction(local.db):
+            event(local.db, job, "PREPARING", "PREPARING")
+        local.reconcile(force=False)
+        self.assertEqual(calls.count("reconcile"), 3)
+
+    def test_finished_result_rides_with_reconcile(self):
+        calls = []
+        isolated = self.isolated()
+        class Counting:
+            def call(inner, action, **parameters):
+                calls.append(action)
+                return isolated.call(action, **parameters)
+        local = Local(self.mac, Counting())
+        first, second = self.submit("printf one"), self.server.submit("printf two", None, ".", 10, opaque())["job_id"]
+        for job in (first, second):
+            local.receive(self.server.claim(opaque()))
+            local.terminal(job, "completed", 0, "COMPLETED", job.encode())
+        # Only one result fits inline here; the other goes in its own report as before.
+        size = len((self.mac / "outbox" / first).read_bytes())
+        with patch("rexec_runtime.local.INLINE_REPORTS", size):
+            local.reconcile()
+        self.assertEqual(calls, ["reconcile", "report"])
+        for job in (first, second):
+            self.assertEqual(self.server.status(job)["stdout"], job)
+            self.assertTrue(local.row(job)["acknowledged"])
+
+    def test_runtime_skew_is_reported_until_both_ends_match(self):
+        token = self.server.provision()
+        self.server.rpc({"token": token, "action": "heartbeat", "state": "READY", "runtime": "0" * 12})
+        self.assertEqual(self.server.channel()["runtime_skew"], {"server": runtime_version(), "worker": "0" * 12})
+        self.server.rpc({"token": token, "action": "heartbeat", "state": "READY", "runtime": runtime_version()})
+        self.assertNotIn("runtime_skew", self.server.channel())
+        with self.assertRaises(Refusal):
+            self.server.rpc({"token": token, "action": "heartbeat", "state": "READY", "runtime": "../x"})
+        Local(self.mac, self.isolated()).tick()
+        self.assertNotIn("runtime_skew", self.server.channel())
+
+    def test_verify_waits_for_a_fresh_heartbeat(self):
+        local = Local(self.mac, self.isolated())
+        since = int(time.time())
+        local.tick()
+        self.assertEqual(verify(self.mac, since), {"running": True, "connected": True, "runtime": runtime_version()})
+        with patch.dict(os.environ, {"REXEC_VERIFY_SECONDS": "0"}), patch("rexec_runtime.service.subprocess.run", return_value=subprocess.CompletedProcess([], 113, b"", b"")):
+            with self.assertRaises(Refusal) as raised:
+                verify(self.mac, since + 3600)
+        self.assertEqual((raised.exception.reason, raised.exception.detail["launchd_loaded"]), ("WORKER_NOT_CONNECTED", False))
+
+    def test_old_unread_results_leave_the_default_status(self):
+        old, recent = self.submit(), self.submit()
+        for job in (old, recent):
+            self.server.cancel(job)
+        with transaction(self.server.db):
+            self.server.db.execute("UPDATE jobs SET created=created-90000 WHERE id=?", (old,))
+        # Six newer read results fill the "recent others" slots.
+        for _ in range(6):
+            job = self.submit()
+            self.server.cancel(job)
+            self.server.ack(job, self.server.job(job)["result_digest"])
+        listed = [item["job_id"] for item in self.server.queue()["jobs"]]
+        self.assertIn(recent, listed)
+        self.assertNotIn(old, listed)
+        self.assertIn(old, [item["job_id"] for item in self.server.queue(True)["jobs"]])
 
     def test_cli_usage_and_errors_are_recorded(self):
         environment = dict(self.environment, REXEC_STATE_DIR=str(self.remote))
