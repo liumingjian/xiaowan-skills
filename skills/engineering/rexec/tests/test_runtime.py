@@ -1029,6 +1029,27 @@ if sys.argv[1]=="bootstrap":
         local.reconcile(force=False)
         self.assertEqual(calls.count("reconcile"), 3)
 
+    def test_finished_result_rides_with_reconcile(self):
+        calls = []
+        isolated = self.isolated()
+        class Counting:
+            def call(inner, action, **parameters):
+                calls.append(action)
+                return isolated.call(action, **parameters)
+        local = Local(self.mac, Counting())
+        first, second = self.submit("printf one"), self.server.submit("printf two", None, ".", 10, opaque())["job_id"]
+        for job in (first, second):
+            local.receive(self.server.claim(opaque()))
+            local.terminal(job, "completed", 0, "COMPLETED", job.encode())
+        # Only one result fits inline here; the other goes in its own report as before.
+        size = len((self.mac / "outbox" / first).read_bytes())
+        with patch("rexec_runtime.local.INLINE_REPORTS", size):
+            local.reconcile()
+        self.assertEqual(calls, ["reconcile", "report"])
+        for job in (first, second):
+            self.assertEqual(self.server.status(job)["stdout"], job)
+            self.assertTrue(local.row(job)["acknowledged"])
+
     def test_runtime_skew_is_reported_until_both_ends_match(self):
         token = self.server.provision()
         self.server.rpc({"token": token, "action": "heartbeat", "state": "READY", "runtime": "0" * 12})

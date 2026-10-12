@@ -30,6 +30,8 @@ HEARTBEAT_INTERVAL = 30
 CLAIM_WAIT = 20
 # Running jobs are reconciled when their events change, a cancel is waiting, or this often.
 RECONCILE_INTERVAL = 15
+# Finished results ride along with a reconcile up to this many bytes; larger ones go alone.
+INLINE_REPORTS = 8 * 1024 * 1024
 # A claimed job that fails to arrive this many times is handed back instead of retried forever.
 CLAIM_ATTEMPTS = 3
 # Server answers meaning the server no longer tracks this job or claim; retrying cannot succeed.
@@ -436,9 +438,19 @@ class Local:
         self.reconciled = (mark, time.monotonic())
         if not rows:
             return
-        jobs = [{"job_id": row["id"], "claim_id": row["claim"], "events": self.publisher.events([json.loads(e[0]) for e in self.db.execute("SELECT value FROM events WHERE job_id=? ORDER BY sequence", (row["id"],))])} for row in rows]
+        jobs = []
+        inline = 0
+        for row in rows:
+            item = {"job_id": row["id"], "claim_id": row["claim"], "events": self.publisher.events([json.loads(e[0]) for e in self.db.execute("SELECT value FROM events WHERE job_id=? ORDER BY sequence", (row["id"],))])}
+            if row["state"] == "TERMINAL" and not row["acknowledged"]:
+                data = (self.root / "outbox" / row["id"]).read_bytes()
+                if inline + len(data) <= INLINE_REPORTS:
+                    inline += len(data)
+                    item["report"] = {"bundle": json.loads(data), "digest": digest(data)}
+            jobs.append(item)
         response = self.transport.call("reconcile", jobs=jobs)
         orphans = set()
+        reported = {}
         with transaction(self.db):
             for value in response.get("jobs", []):
                 job = valid_id(value["job_id"])
@@ -447,12 +459,30 @@ class Local:
                         orphans.add(job)
                     continue
                 self.db.execute("UPDATE jobs SET cancel=MAX(cancel,?) WHERE id=?", (int(bool(value["cancel"])), job))
+                if "ack" in value or "report_error" in value:
+                    reported[job] = value
         for row in rows:
             if self.stopping():
                 return
-            if row["state"] == "TERMINAL" and not row["acknowledged"]:
+            if row["state"] == "TERMINAL" and not row["acknowledged"] and row["id"] not in orphans:
                 data = (self.root / "outbox" / row["id"]).read_bytes()
                 value = digest(data)
+                if row["id"] in reported:
+                    # The server took or refused the result inline; an older server answers
+                    # neither, and the result then goes in its own report below.
+                    answer = reported[row["id"]]
+                    if "report_error" in answer:
+                        error = answer["report_error"]
+                        if error in ORPHANED:
+                            orphans.add(row["id"])
+                        else:
+                            self.failure(error if isinstance(error, str) and CODE.fullmatch(error) else "RPC_REFUSED")
+                        continue
+                    if answer["ack"] != {"job_id": row["id"], "digest": value}:
+                        raise Refusal("ACK_MISMATCH")
+                    with transaction(self.db):
+                        self.db.execute("UPDATE jobs SET acknowledged=1 WHERE id=?", (row["id"],))
+                    continue
                 try:
                     acknowledgement = self.transport.call("report", bundle=json.loads(data), digest=value)
                 except Refusal as error:

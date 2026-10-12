@@ -419,7 +419,24 @@ class Server:
                 self.db.execute("INSERT INTO settings VALUES(?,?)", (key, digest(encode(value))))
             elif prior[0] != digest(encode(value)):
                 raise Refusal("EVENT_CONFLICT")
-        return {"job_id": row["id"], "cancel": bool(row["cancel"])}
+        result = {"job_id": row["id"], "cancel": bool(row["cancel"])}
+        report = item.get("report")
+        if report is not None:
+            # A finished job's result rides along, saving the worker a second round trip. Its
+            # failure is separate, so the events above still land.
+            if not isinstance(report, dict) or set(report) != {"bundle", "digest"}:
+                raise Refusal()
+            self.db.execute("SAVEPOINT report")
+            try:
+                if digest(encode(report["bundle"])) != report["digest"]:
+                    raise Refusal("RESULT_INVALID")
+                result["ack"] = self._store(report["bundle"])
+                self.db.execute("RELEASE report")
+            except Refusal as error:
+                self.db.execute("ROLLBACK TO report")
+                self.db.execute("RELEASE report")
+                result["report_error"] = error.reason
+        return result
 
     def ack(self, job, value, artifacts=False):
         with transaction(self.db):
