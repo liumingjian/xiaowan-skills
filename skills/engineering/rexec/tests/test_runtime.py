@@ -967,7 +967,8 @@ if sys.argv[1]=="bootstrap":
         finally:
             timer.join()
         self.assertLess(time.monotonic() - started, 5)
-        job = self.submit()
+        # The job above still holds the source workspace, so this one runs in its own.
+        job = self.server.submit("printf safe", None, ".", 10, opaque())["job_id"]
         claimed = self.server.claim(opaque())["job"]["id"]
         self.assertEqual(claimed, job)
         self.server.cancel(job)
