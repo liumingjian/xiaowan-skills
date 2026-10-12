@@ -49,6 +49,7 @@ def arguments():
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--category")
     parser.add_argument("--note")
+    parser.add_argument("--close", type=int)
     parser.add_argument("--since", default="7d")
     return parser.parse_args()
 
@@ -140,6 +141,11 @@ def dispatch(server, args):
         print_json(server.queue(True))
         return 0
     if action == "feedback":
+        if args.close is not None:
+            if len(words) != 1 or args.category or args.note is not None:
+                raise Refusal()
+            print_json(server.close_feedback(args.close))
+            return 0
         if len(words) > 2 or not args.category:
             raise Refusal()
         print_json(server.feedback(words[1] if len(words) == 2 else None, args.category, args.note))

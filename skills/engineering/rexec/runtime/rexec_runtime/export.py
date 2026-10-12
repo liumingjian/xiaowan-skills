@@ -28,12 +28,16 @@ FORBIDDEN = re.compile(r"(?i)(?:^|[/.])(?:\.env(?:\.|$)|\.git|\.ssh|credentials?
 
 
 def relative(name):
+    if PurePosixPath(plain(name)).suffix not in {".md", ".txt", ".patch", ".diff", ".json", ".xml", ".csv"}:
+        raise Refusal("ARTIFACT_BLOCKED")
+    return name
+
+
+def plain(name):
+    """A name safe to show whatever its suffix: a refused .xlsx is still named."""
     if not isinstance(name, str) or not name or len(name) > 240 or "\\" in name or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", name):
         raise Refusal("ARTIFACT_BLOCKED")
-    path = PurePosixPath(name)
-    if path.is_absolute() or any(part in (".", "..") for part in name.split("/")):
-        raise Refusal("ARTIFACT_BLOCKED")
-    if any(part.startswith(".") for part in path.parts) or path.suffix not in {".md", ".txt", ".patch", ".diff", ".json", ".xml", ".csv"}:
+    if any(part in (".", "..") or part.startswith(".") for part in name.split("/")):
         raise Refusal("ARTIFACT_BLOCKED")
     return name
 
@@ -169,7 +173,7 @@ class Publisher:
                 except (UnicodeError, Refusal):
                     shown = None
                     try:
-                        if self.sanitize(relative(name)) == name and not FORBIDDEN.search(name):
+                        if self.sanitize(plain(name)) == name and not FORBIDDEN.search(name):
                             shown = name
                     except Refusal:
                         pass
@@ -206,7 +210,7 @@ class Publisher:
         if not isinstance(refused, list) or len(refused) > MAX_ARTIFACTS:
             raise Refusal("ARTIFACT_BLOCKED")
         for name in refused:
-            if name is not None and (relative(name) != name or FORBIDDEN.search(name) or self.sanitize(name) != name):
+            if name is not None and (plain(name) != name or FORBIDDEN.search(name) or self.sanitize(name) != name):
                 raise Refusal("ARTIFACT_BLOCKED")
         timing = bundle.get("timing", {"start_s": None, "run_s": None})
         if not isinstance(timing, dict) or set(timing) != {"start_s", "run_s"} or any(v is not None and not finite(v) for v in timing.values()):

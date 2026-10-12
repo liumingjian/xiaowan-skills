@@ -58,7 +58,7 @@ When rexec surprises you or gets in your way (a confusing receipt, an unexplaine
 rexec feedback [JOB] --category confusing_output|unexpected_failure|slow|missing_capability|docs_unclear|other --note 'what you expected and what happened'
 ```
 
-Reserve it for surprises; a job that behaved as documented needs no note. Keep the note to 280 characters of plain description, without command text, paths, or output. When the user asks how rexec is doing or what to improve, run `rexec report` and summarize its failures, slow phases, health, usage, and notes into concrete fixes.
+Reserve it for surprises; a job that behaved as documented needs no note. Keep the note to 280 characters of plain description, without command text, paths, or output. When the user asks how rexec is doing or what to improve, run `rexec report` and summarize its failures, slow phases, health, usage, and notes into concrete fixes. The report lists only open notes, each with an `id`; once a note's fix ships or the note needs no action, run `rexec feedback --close ID`.
 
 ## Privacy
 

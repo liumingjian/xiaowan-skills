@@ -55,6 +55,7 @@ rexec cancel JOB
 rexec artifacts JOB --into DIR
 rexec gc [--apply]
 rexec feedback [JOB] --category CATEGORY [--note TEXT]
+rexec feedback --close ID
 rexec report [--since 7d]
 ```
 
@@ -103,7 +104,7 @@ Command output is capped to its head and tail around an explicit `... N chars om
 
 Raw logs stay owner-only on the Mac and keep their head and a rolling tail while pipes continue draining. Truncation is explicit. Diagnose from safe receipts and trace first; inspect local private logs only when the user explicitly requests it. The runtime does not enumerate unrelated home files.
 
-To publish results, write only the requested regular UTF-8 text files beneath `$REXEC_ARTIFACTS`, using safe relative names. Artifacts have file/count/byte bounds. Allowed suffixes are `.md`, `.txt`, `.patch`, `.diff`, `.json`, `.xml`, and `.csv`. Traversal, binary content, secrets, configuration files, raw logs, and files over 2 MiB are refused one by one: the other artifacts are still published, and the receipt lists each refused file in `artifacts_refused` by name, or as `null` when the name itself is unsafe. A link or special file under `$REXEC_ARTIFACTS` refuses the whole set with `ARTIFACT_BLOCKED`. Prose is sanitized before hashing. A patch that needs sanitization is refused rather than modified, because rewriting a patch can corrupt it. Artifact refusal has no raw fallback.
+To publish results, write only the requested regular UTF-8 text files beneath `$REXEC_ARTIFACTS`, using safe relative names. Artifacts have file/count/byte bounds. Allowed suffixes are `.md`, `.txt`, `.patch`, `.diff`, `.json`, `.xml`, and `.csv`. Traversal, binary content, secrets, configuration files, raw logs, and files over 2 MiB are refused one by one: the other artifacts are still published, and the receipt lists each refused file in `artifacts_refused` by name (an unsupported suffix is named too), or as `null` when the name itself is unsafe. A link or special file under `$REXEC_ARTIFACTS` refuses the whole set with `ARTIFACT_BLOCKED`. Prose is sanitized before hashing. A patch that needs sanitization is refused rather than modified, because rewriting a patch can corrupt it. Artifact refusal has no raw fallback.
 
 `rexec artifacts JOB --into DIR` validates paths and hashes before atomic destination writes and acknowledgment. Artifact bytes never travel as base64 stdout. `delegate-to-codex` publishes only `response.md`, `changes.patch`, and `status.json`; its Codex JSONL and stderr stay on the Mac.
 
@@ -111,7 +112,7 @@ To publish results, write only the requested regular UTF-8 text files beneath `$
 
 Low disk space pauses claims and spawn. A finished job's Mac workspace, `$TMPDIR`, artifact staging, and snapshot are deleted as soon as its result is sealed, including unknown execution. Deletion renames the tree into `trash/` and a background `rm -rf` removes it, so cleanup never blocks the worker tick. GC preserves active jobs and unacknowledged results. Acknowledged results and private logs have a default retention of seven days. The server applies GC hourly on worker heartbeat; `rexec gc` previews eligible cleanup and `rexec gc --apply` applies it now. Cleanup does not cancel work or scan unrelated home files.
 
-The VPS also keeps a per-job history for 90 days, independent of the seven-day cleanup: submission channel state, phase timings, outcome, reason, CLI usage counts, and a 12-character keyed command fingerprint that groups repeats of one command without storing it in an exportable form. The fingerprint key stays in `/var/lib/rexec`. Worker failure counts, CLI error codes, and agent feedback share the same 90-day history. Feedback notes are sanitized like output, refused above 280 characters (`FEEDBACK_TOO_LONG`) or with an unknown category (`FEEDBACK_CATEGORY`), and never appear in receipts or traces.
+The VPS also keeps a per-job history for 90 days, independent of the seven-day cleanup: submission channel state, phase timings, outcome, reason, CLI usage counts, and a 12-character keyed command fingerprint that groups repeats of one command without storing it in an exportable form. The fingerprint key stays in `/var/lib/rexec`. Worker failure counts, CLI error codes, and agent feedback share the same 90-day history. Feedback notes are sanitized like output, refused above 280 characters (`FEEDBACK_TOO_LONG`) or with an unknown category (`FEEDBACK_CATEGORY`), and never appear in receipts or traces. `rexec feedback --close ID` marks a note handled; closing twice is a no-op and an unknown ID exits 66 with `FEEDBACK_NOT_FOUND`.
 
 `rexec report [--since Nh|Nd]` (default `7d`, at most `90d`) aggregates jobs submitted in the window into one JSON object:
 
@@ -121,4 +122,4 @@ The VPS also keeps a per-job history for 90 days, independent of the seven-day c
 - `health`: worker failure counts by reason.
 - `usage`: jobs submitted while the channel was not `READY`, results unread and artifacts unfetched a day after completion, wait timeouts, status/wait/trace call totals and per-job maximum, and CLI errors by `subcommand:reason`.
 - `failing_commands`: the ten command fingerprints with the most failures, with run counts and last reason.
-- `feedback`: counts by category and the 20 most recent notes.
+- `feedback`: open notes counted by category, the number closed, and the 20 most recent open notes with their `id`.
