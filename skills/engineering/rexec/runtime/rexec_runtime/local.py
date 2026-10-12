@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 
-from .common import CODE, ID, MAX_LOG, MAX_RECONCILE, MAX_RPC, MIN_FREE, RETENTION, Refusal, atomic, connect, digest, encode, event, immutable, opaque, private_dir, read_json, transaction, valid_id
+from .common import CODE, ID, MAX_LOG, MAX_RECONCILE, MAX_RPC, MIN_FREE, RETENTION, Refusal, atomic, connect, digest, encode, event, immutable, opaque, private_dir, read_json, runtime_version, transaction, valid_id
 from .export import Publisher
 from .snapshot import extract
 
@@ -26,6 +26,10 @@ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 SUPERVISOR_START_GRACE = 2
 CLAIMS_PER_TICK = 8
 HEARTBEAT_INTERVAL = 30
+# An idle worker long-polls its claim this long (the server caps it) instead of asking every tick.
+CLAIM_WAIT = 20
+# Running jobs are reconciled when their events change, a cancel is waiting, or this often.
+RECONCILE_INTERVAL = 15
 # A claimed job that fails to arrive this many times is handed back instead of retried forever.
 CLAIM_ATTEMPTS = 3
 # Server answers meaning the server no longer tracks this job or claim; retrying cannot succeed.
@@ -118,7 +122,9 @@ class Transport:
         request = encode({"token": token, "action": action, **parameters})
         started = time.monotonic()
         response = ssh_exchange(self.root, "rexec-worker", request, self.maintenance)
-        self.slowest = max(self.slowest, time.monotonic() - started)
+        if not parameters.get("wait"):
+            # A long-polled claim lasts as long as it waits; it says nothing about SSH speed.
+            self.slowest = max(self.slowest, time.monotonic() - started)
         try:
             value = json.loads(response)
             if not isinstance(value, dict):
@@ -139,6 +145,12 @@ class Local:
         self.transport = transport or Transport(self.root)
         self.stopping = lambda: False
         self.heartbeat = (None, 0.0)
+        # Only the worker loop long-polls; a single tick (tests, tools) never blocks on it.
+        self.idle_wait = 0
+        self.waiting = False
+        self.urgent = False
+        self.reconciled = (None, 0.0)
+        self.waited = 0.0
         self.tick_seconds = 0.0
         self.sweeper = None
         for name in ("snapshots", "outbox", "jobs", "trash"):
@@ -153,7 +165,7 @@ class Local:
             literals.extend(configured)
         self.publisher = Publisher(literals, self.root / "jobs")
         if isinstance(self.transport, Transport):
-            self.transport.maintenance = self.recover
+            self.transport.maintenance = self.maintain
 
     def row(self, job):
         valid_id(job)
@@ -192,19 +204,44 @@ class Local:
                 self.db.execute("INSERT INTO jobs(id,claim,workspace,spec,snapshot,state,cancel,created) VALUES(?,?,?,?,?,'RECEIVED',?,?)", (spec["id"], spec["claim"], spec["workspace"], encode(spec).decode(), value, int(bool(spec["cancel"])), time.time()))
             self.db.execute("DELETE FROM settings WHERE key IN ('claim_request','claim_failures')")
 
+    def quiet(self):
+        """Nothing here waits on the tick: no job to prepare or launch, no result to report."""
+        return not self.db.execute("SELECT 1 FROM jobs WHERE state IN ('RECEIVED','PREPARING','READY','START_RESERVED') OR (state='TERMINAL' AND acknowledged=0) LIMIT 1").fetchone()
+
+    def maintain(self):
+        """Runs every half second while an RPC is in flight."""
+        self.recover()
+        if self.waiting and (self.stopping() or not self.quiet()):
+            # A result to report or a stop beats waiting for new work. The server keeps any job
+            # it claimed meanwhile for this claim request, so the retry gets it.
+            raise Refusal("INTERRUPTED", 75)
+
     def claim(self):
         """Claim at most one job; return whether one arrived."""
         with transaction(self.db):
             row = self.db.execute("SELECT value FROM settings WHERE key='claim_request'").fetchone()
             request = row[0] if row else opaque()
             self.db.execute("INSERT OR IGNORE INTO settings VALUES('claim_request',?)", (request,))
+        held = [row[0] for row in self.db.execute("SELECT id FROM jobs WHERE cancel=0 AND state!='TERMINAL' LIMIT ?", (MAX_RECONCILE,))]
+        wait = self.idle_wait if self.idle_wait and self.quiet() else 0
         response = None
         try:
-            response = self.transport.call("claim", request_id=request)
+            self.waiting = bool(wait)
+            began = time.monotonic()
+            try:
+                response = self.transport.call("claim", request_id=request, wait=wait, held=held)
+            finally:
+                self.waiting = False
+                if wait:
+                    self.waited += time.monotonic() - began
+            if response.get("cancel"):
+                self.urgent = True
             if response.get("job"):
                 self.receive(response)
                 return True
         except Refusal as error:
+            if error.reason == "INTERRUPTED":
+                return False
             # Connectivity failures retry the same claim indefinitely; a job that keeps
             # arriving unusable (oversized or rejected) is given up after a few tries.
             if response is not None or error.reason == "RPC_INVALID":
@@ -388,8 +425,15 @@ class Local:
                     logs = [(folder / name).read_bytes()[:MAX_LOG] if (folder / name).is_file() else b"" for name in ("stdout", "stderr")]
                     self.terminal(row["id"], "unknown", 70, "SUPERVISOR_LOST", *logs, expect="RUNNING")
 
-    def reconcile(self):
+    def reconcile(self, force=True):
+        mark = self.db.execute("SELECT MAX(rowid) FROM events").fetchone()[0]
+        if not (force or self.urgent or mark != self.reconciled[0] or time.monotonic() - self.reconciled[1] >= RECONCILE_INTERVAL
+                or self.db.execute("SELECT 1 FROM jobs WHERE state='TERMINAL' AND acknowledged=0 LIMIT 1").fetchone()):
+            # Nothing changed for running jobs; skip an RPC every tick while they run.
+            return
         rows = self.db.execute("SELECT * FROM jobs WHERE acknowledged=0 OR state!='TERMINAL' ORDER BY created LIMIT ?", (MAX_RECONCILE,)).fetchall()
+        self.urgent = False
+        self.reconciled = (mark, time.monotonic())
         if not rows:
             return
         jobs = [{"job_id": row["id"], "claim_id": row["claim"], "events": self.publisher.events([json.loads(e[0]) for e in self.db.execute("SELECT value FROM events WHERE job_id=? ORDER BY sequence", (row["id"],))])} for row in rows]
@@ -439,6 +483,7 @@ class Local:
 
     def tick(self):
         started = time.monotonic()
+        self.waited = 0.0
         self.recover()
         if self.stopping():
             return
@@ -457,7 +502,10 @@ class Local:
             if len(active) <= MAX_RECONCILE:
                 # Complete lists only: the server releases claimed jobs missing from it.
                 extra["active"] = active
-            self.transport.call("heartbeat", state=state, timing={"tick": round(self.tick_seconds, 3), "rpc": round(slowest, 3)}, **extra)
+            self.transport.call("heartbeat", state=state, timing={"tick": round(self.tick_seconds, 3), "rpc": round(slowest, 3)}, runtime=runtime_version(), **extra)
+            with transaction(self.db):
+                # `agent verify` reads this to confirm a freshly started worker reached the VPS.
+                self.db.execute("INSERT OR REPLACE INTO settings VALUES('contact',?)", (str(time.time()),))
             if health:
                 with transaction(self.db):
                     self.store_health([batch for batch in self.health() if batch["id"] not in {sent["id"] for sent in health}])
@@ -466,7 +514,7 @@ class Local:
                 self.transport.slowest = 0.0
         if self.stopping():
             return
-        self.reconcile()
+        self.reconcile(force=False)
         # Claim everything available first so newly received jobs launch in this same tick.
         for _ in range(CLAIMS_PER_TICK):
             if self.stopping() or not self.space() or not self.claim():
@@ -478,7 +526,8 @@ class Local:
                 self.prepare(row["id"])
             self.launch(row["id"])
         self.gc()
-        self.tick_seconds = time.monotonic() - started
+        # Reported tick time is work only, not an idle claim's wait.
+        self.tick_seconds = time.monotonic() - started - self.waited
 
     def gc(self):
         for row in self.db.execute("SELECT * FROM jobs WHERE state='TERMINAL' AND acknowledged=1 AND completed<?", (time.time() - RETENTION,)).fetchall():
@@ -576,6 +625,10 @@ def worker(root):
     await_reserved_supervisors(local)
     local.crashed()
     local.recover()
+    with transaction(local.db):
+        # Workspaces are extracted without fsync; after a crash, extract them again.
+        local.db.execute("UPDATE jobs SET state='RECEIVED' WHERE state IN ('PREPARING','READY')")
+    local.idle_wait = CLAIM_WAIT
     delay = 0.25
     while not stopping:
         try:

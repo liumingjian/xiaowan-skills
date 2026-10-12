@@ -5,7 +5,7 @@ import stat
 import subprocess
 import tarfile
 
-from .common import MAX_FILES, MAX_SNAPSHOT, Refusal, atomic, digest, private_dir
+from .common import MAX_FILES, MAX_SNAPSHOT, Refusal, digest, private_dir
 
 EXCLUDED = {".netrc", ".npmrc", ".pypirc", ".git-credentials", "auth.json", ".codex-out", "node_modules", ".venv", "venv", "__pycache__", ".cache", ".ssh", ".aws", ".npm", ".pnpm-store", ".DS_Store", ".rexec", "codex.jsonl", "codex.stderr"}
 SECRET_SUFFIXES = (".pem", ".key", ".p12", ".pfx")
@@ -128,10 +128,19 @@ def extract(data, expected, destination):
                 raise Refusal("SNAPSHOT_REJECTED")
     except (tarfile.TarError, OSError, ValueError):
         raise Refusal("SNAPSHOT_REJECTED")
+    # A workspace is rebuilt from its snapshot whenever in doubt (the worker re-extracts
+    # unlaunched jobs at start), so files skip the per-file fsync that dominated large trees.
+    made = {root}
     for name, blob, mode in entries:
         target = root / name
         if blob is None:
             private_dir(target)
+            made.add(target)
             continue
-        atomic(target, blob)
+        if target.parent not in made:
+            private_dir(target.parent)
+            made.add(target.parent)
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700 if mode & 0o111 else 0o600)
+        with os.fdopen(fd, "wb") as out:
+            out.write(blob)
         os.chmod(target, 0o700 if mode & 0o111 else 0o600)

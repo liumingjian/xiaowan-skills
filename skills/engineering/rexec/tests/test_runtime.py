@@ -17,13 +17,13 @@ from unittest.mock import patch
 
 RUNTIME = Path(__file__).resolve().parents[1] / "runtime"
 sys.path.insert(0, str(RUNTIME))
-from rexec_runtime.common import MAX_ARTIFACT, MAX_LOG, Refusal, atomic, digest, encode, immutable, opaque, transaction
+from rexec_runtime.common import MAX_ARTIFACT, MAX_LOG, Refusal, atomic, digest, encode, event, immutable, opaque, runtime_version, transaction
 from rexec_runtime.export import Publisher
 from rexec_runtime.local import Local, Transport
 from rexec_runtime.server import Server
 from rexec_runtime.snapshot import extract, freeze
 from rexec_runtime.__main__ import write_artifacts
-from rexec_runtime.service import plist, service
+from rexec_runtime.service import plist, service, verify
 
 
 class RuntimeTests(unittest.TestCase):
@@ -488,8 +488,21 @@ sys.exit(result.returncode)
         decoded = plistlib.loads(plistlib.dumps(value))
         self.assertEqual(decoded["ProgramArguments"][0], sys.executable)
         self.assertTrue(Path(decoded["EnvironmentVariables"]["PYTHONPATH"]).is_absolute())
-        with patch("rexec_runtime.service.subprocess.run", return_value=subprocess.CompletedProcess([], 0, b"private", b"private")) as run:
+        loaded = {"value": True, "refusals": 1}
+        def launchctl(args, **kw):
+            # bootout unloads asynchronously and the first bootstrap after it is refused, as on macOS.
+            if args[1] == "bootout":
+                loaded["value"] = False
+            if args[1] == "bootstrap":
+                if loaded["refusals"]:
+                    loaded["refusals"] -= 1
+                    return subprocess.CompletedProcess(args, 5, b"private", b"private")
+                loaded["value"] = True
+            return subprocess.CompletedProcess(args, 0 if args[1] != "print" or loaded["value"] else 113, b"private", b"private")
+        with patch("rexec_runtime.service.subprocess.run", side_effect=launchctl) as run, patch("rexec_runtime.service.time.sleep"):
             self.assertTrue(service(self.mac, "status")["running"])
+            self.assertEqual(service(self.mac, "stop"), {"running": False})
+            self.assertEqual(service(self.mac, "start"), {"running": True})
             self.assertNotIn("private", encode(service(self.mac, "stop")).decode())
             self.assertEqual(run.call_args.args[0][0], "launchctl")
 
@@ -585,7 +598,21 @@ sys.exit(result.returncode)
         (tools / "ssh").write_text('#!/bin/sh\n[ "$1" = vps-cc ] || exit 99\nexec sh -c "$2"\n')
         (tools / "uv").write_text("#!/bin/sh\necho " + sys.executable + "\n")
         log = self.root / "launchctl.log"
-        (tools / "launchctl").write_text('#!/bin/sh\necho "$1" >> ' + str(log) + '\nloaded=' + str(self.root / "loaded") + '\ncase "$1" in print) [ -e "$loaded" ];; bootstrap) touch "$loaded";; bootout) rm "$loaded";; esac\n')
+        loaded = self.root / "loaded"
+        # A bootstrapped "worker" heartbeats at once unless the test makes it fail to connect.
+        (tools / "launchctl").write_text("#!" + sys.executable + "\n" + f'''import os,pathlib,sqlite3,sys,time
+with open({str(log)!r},"a") as log: log.write(sys.argv[1]+"\\n")
+loaded=pathlib.Path({str(loaded)!r})
+if sys.argv[1]=="print": sys.exit(0 if loaded.exists() else 113)
+if sys.argv[1]=="bootout": loaded.unlink()
+if sys.argv[1]=="bootstrap":
+    loaded.touch()
+    if not os.environ.get("FAKE_NO_CONTACT"):
+        db=sqlite3.connect(os.path.join(os.environ["REXEC_STATE_DIR"],"state.sqlite"))
+        db.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        db.execute("INSERT OR REPLACE INTO settings VALUES('contact',?)",(str(time.time()),))
+        db.commit()
+''')
         for name in ("ssh", "uv", "launchctl"):
             (tools / name).chmod(0o755)
         environment = dict(os.environ, HOME=str(home), PATH=str(tools) + os.pathsep + os.environ["PATH"], REXEC_STATE_DIR=str(self.mac), REXEC_REMOTE_ROOT=str(state))
@@ -593,13 +620,21 @@ sys.exit(result.returncode)
         for _ in range(2):
             result = subprocess.run(["bash", "-c", line], env=environment, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(result.stdout), {"updated": True, "running": True})
+            self.assertEqual(json.loads(result.stdout), {"updated": True, "running": True, "connected": True, "runtime": runtime_version()})
         self.assertTrue((home / ".rexec/runtime/rexec_runtime/__main__.py").is_file())
         self.assertFalse(list((home / ".rexec").glob(".runtime-*")))
         installed = plistlib.loads((home / "Library/LaunchAgents/dev.xiaowan.rexec.worker.plist").read_bytes())
         self.assertEqual(installed["EnvironmentVariables"]["PYTHONPATH"], str((home / ".rexec/runtime").resolve()))
         self.assertEqual(log.read_text().split().count("bootstrap"), 2)
         self.assertEqual(log.read_text().split().count("bootout"), 1)
+        # A worker that never reaches the VPS is not reported as updated; the previous runtime returns.
+        (home / ".rexec/runtime/previous").write_text("kept")
+        result = subprocess.run(["bash", "-c", line], env=dict(environment, FAKE_NO_CONTACT="1", REXEC_VERIFY_SECONDS="1"), capture_output=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        outcome = json.loads(result.stdout)
+        self.assertEqual((outcome["updated"], outcome["rolled_back"], outcome["running"], outcome["cause"]["error"]), (False, True, True, "WORKER_NOT_CONNECTED"))
+        self.assertTrue((home / ".rexec/runtime/previous").is_file())
+        self.assertTrue((home / ".rexec/runtime.failed/rexec_runtime/__main__.py").is_file())
 
     def test_service_install_plist_with_isolated_home(self):
         home = self.root / "home"
@@ -919,6 +954,116 @@ sys.exit(result.returncode)
         self.assertEqual(refused, ["huge.txt", None])
         bundle = Publisher().bundle(opaque(), opaque(), "completed", 0, "COMPLETED", artifacts=accepted, refused=refused)
         self.assertEqual(Publisher().validate_bundle(bundle)["artifacts_refused"], ["huge.txt", None])
+
+    def test_idle_claim_waits_for_work_and_hears_cancels(self):
+        started = time.monotonic()
+        self.assertEqual(self.server.claim(opaque(), 0.6), {"job": None, "cancel": False})
+        self.assertGreaterEqual(time.monotonic() - started, 0.5)
+        # SQLite connections stay in their thread, so the late submit opens its own.
+        timer = threading.Timer(0.3, lambda: Server(self.remote).submit("printf safe", self.source, ".", 10, opaque()))
+        timer.start()
+        try:
+            self.assertIsNotNone(self.server.claim(opaque(), 10)["job"])
+        finally:
+            timer.join()
+        self.assertLess(time.monotonic() - started, 5)
+        job = self.submit()
+        claimed = self.server.claim(opaque())["job"]["id"]
+        self.assertEqual(claimed, job)
+        self.server.cancel(job)
+        # A cancel the worker has not heard of ends the wait at once; one it already has does not.
+        started = time.monotonic()
+        self.assertTrue(self.server.claim(opaque(), 10, {job})["cancel"])
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertFalse(self.server.claim(opaque(), 0, set())["cancel"])
+
+    def test_interrupted_wait_keeps_its_claim_for_the_retry(self):
+        job = self.submit()
+        server = self.server
+        class Interrupted:
+            def call(inner, action, **parameters):
+                if action == "claim":
+                    # The server takes the job, then the worker drops the wait to report a result.
+                    server.rpc({"token": server.provision(), "action": action, **parameters})
+                    raise Refusal("INTERRUPTED", 75)
+                return server.rpc({"token": server.provision(), "action": action, **parameters})
+        local = Local(self.mac, Interrupted())
+        local.idle_wait = 1
+        self.assertFalse(local.claim())
+        self.assertEqual(local.health(), [])
+        local.transport = self.isolated()
+        self.assertTrue(local.claim())
+        self.assertEqual(local.row(job)["state"], "RECEIVED")
+
+    def test_waiting_claim_yields_to_local_work(self):
+        local = Local(self.mac, self.isolated())
+        local.waiting = True
+        local.maintain()
+        self.submit()
+        local.receive(self.server.claim(opaque()))
+        with self.assertRaises(Refusal) as raised:
+            local.maintain()
+        self.assertEqual(raised.exception.reason, "INTERRUPTED")
+        local.waiting = False
+        local.maintain()
+
+    def test_running_jobs_reconcile_on_change_not_every_tick(self):
+        calls = []
+        isolated = self.isolated()
+        class Counting:
+            def call(inner, action, **parameters):
+                calls.append(action)
+                return isolated.call(action, **parameters)
+        local = Local(self.mac, Counting())
+        job = self.submit()
+        local.receive(self.server.claim(opaque()))
+        local.reconcile(force=False)
+        local.reconcile(force=False)
+        self.assertEqual(calls.count("reconcile"), 1)
+        local.urgent = True
+        local.reconcile(force=False)
+        self.assertEqual(calls.count("reconcile"), 2)
+        with transaction(local.db):
+            event(local.db, job, "PREPARING", "PREPARING")
+        local.reconcile(force=False)
+        self.assertEqual(calls.count("reconcile"), 3)
+
+    def test_runtime_skew_is_reported_until_both_ends_match(self):
+        token = self.server.provision()
+        self.server.rpc({"token": token, "action": "heartbeat", "state": "READY", "runtime": "0" * 12})
+        self.assertEqual(self.server.channel()["runtime_skew"], {"server": runtime_version(), "worker": "0" * 12})
+        self.server.rpc({"token": token, "action": "heartbeat", "state": "READY", "runtime": runtime_version()})
+        self.assertNotIn("runtime_skew", self.server.channel())
+        with self.assertRaises(Refusal):
+            self.server.rpc({"token": token, "action": "heartbeat", "state": "READY", "runtime": "../x"})
+        Local(self.mac, self.isolated()).tick()
+        self.assertNotIn("runtime_skew", self.server.channel())
+
+    def test_verify_waits_for_a_fresh_heartbeat(self):
+        local = Local(self.mac, self.isolated())
+        since = int(time.time())
+        local.tick()
+        self.assertEqual(verify(self.mac, since), {"running": True, "connected": True, "runtime": runtime_version()})
+        with patch.dict(os.environ, {"REXEC_VERIFY_SECONDS": "0"}), patch("rexec_runtime.service.subprocess.run", return_value=subprocess.CompletedProcess([], 113, b"", b"")):
+            with self.assertRaises(Refusal) as raised:
+                verify(self.mac, since + 3600)
+        self.assertEqual((raised.exception.reason, raised.exception.detail["launchd_loaded"]), ("WORKER_NOT_CONNECTED", False))
+
+    def test_old_unread_results_leave_the_default_status(self):
+        old, recent = self.submit(), self.submit()
+        for job in (old, recent):
+            self.server.cancel(job)
+        with transaction(self.server.db):
+            self.server.db.execute("UPDATE jobs SET created=created-90000 WHERE id=?", (old,))
+        # Six newer read results fill the "recent others" slots.
+        for _ in range(6):
+            job = self.submit()
+            self.server.cancel(job)
+            self.server.ack(job, self.server.job(job)["result_digest"])
+        listed = [item["job_id"] for item in self.server.queue()["jobs"]]
+        self.assertIn(recent, listed)
+        self.assertNotIn(old, listed)
+        self.assertIn(old, [item["job_id"] for item in self.server.queue(True)["jobs"]])
 
     def test_cli_usage_and_errors_are_recorded(self):
         environment = dict(self.environment, REXEC_STATE_DIR=str(self.remote))

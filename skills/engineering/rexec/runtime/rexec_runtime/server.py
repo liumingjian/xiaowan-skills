@@ -9,13 +9,18 @@ import secrets
 import shutil
 import time
 
-from .common import CATEGORIES, CODE, HEALTH_WINDOW, HISTORY, MAX_NOTE, MAX_RECONCILE, RETENTION, Refusal, atomic, connect, digest, encode, event, immutable, opaque, private_dir, transaction, valid_id
+from .common import CATEGORIES, CODE, HEALTH_WINDOW, HISTORY, MAX_NOTE, MAX_RECONCILE, RETENTION, VERSION, Refusal, atomic, connect, digest, encode, event, immutable, opaque, private_dir, runtime_version, transaction, valid_id
 from .export import Publisher
 from .snapshot import freeze, safe_name
 
 GC_INTERVAL = 3600
 # A claimed job the worker has stopped reporting is released after this long.
 LEASE = 600
+# An idle worker's claim waits up to this long for a job instead of asking again every tick.
+CLAIM_WAIT = 25
+CLAIM_POLL = 0.5
+# Contact is recorded at most this often; the channel goes OFFLINE only after minutes of silence.
+CONTACT_EVERY = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, request TEXT UNIQUE NOT NULL, spec_digest TEXT NOT NULL, workspace TEXT NOT NULL, command TEXT NOT NULL, cwd TEXT NOT NULL, timeout INTEGER NOT NULL, snapshot TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('QUEUED','CLAIMED','RESULT_STORED')), claim TEXT UNIQUE, cancel INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, completed REAL, result_digest TEXT, ack INTEGER NOT NULL DEFAULT 0, artifact_ack INTEGER NOT NULL DEFAULT 0, claimed REAL, label TEXT);
@@ -28,8 +33,9 @@ CREATE TABLE IF NOT EXISTS health(batch TEXT NOT NULL, at REAL NOT NULL, reason 
 CREATE TABLE IF NOT EXISTS cli_errors(at REAL NOT NULL, action TEXT NOT NULL, reason TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS feedback(id INTEGER PRIMARY KEY, at REAL NOT NULL, job_id TEXT, category TEXT NOT NULL, note TEXT NOT NULL);
 """
-# Default `rexec status` lists active and unread jobs plus this many recent others.
+# Default `rexec status` lists active jobs, unread results from the last day, and this many recent others.
 RECENT = 5
+UNREAD_WINDOW = 86400
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/ -]{0,63}")
 # Per-job usage counters that a CLI call can bump; read and fetched record the first time.
 USAGE = {"status": "status_calls", "wait": "wait_calls", "trace": "trace_calls", "wait_timeout": "wait_timeouts"}
@@ -240,8 +246,13 @@ class Server:
         worker_state = self.db.execute("SELECT value FROM settings WHERE key='worker_state'").fetchone()
         timing = self.db.execute("SELECT value FROM settings WHERE key='worker_timing'").fetchone()
         state = "AUTHORIZATION_REQUIRED" if not (self.root / "worker.token").exists() else "OFFLINE" if age is None or age > 180 else "LOW_SPACE" if worker_state and worker_state[0] == "LOW_SPACE" else "READY"
-        return {"state": state, "last_contact_age_seconds": age, "reserved": reserved, "worker_timing": json.loads(timing[0]) if timing else None,
-                "recent_failures": failures, "last_failure": {"reason": last[0], "age_seconds": round(max(0, time.time() - last[1]), 3)} if last else None}
+        result = {"state": state, "last_contact_age_seconds": age, "reserved": reserved, "worker_timing": json.loads(timing[0]) if timing else None,
+                  "recent_failures": failures, "last_failure": {"reason": last[0], "age_seconds": round(max(0, time.time() - last[1]), 3)} if last else None}
+        worker = self.db.execute("SELECT value FROM settings WHERE key='worker_runtime'").fetchone()
+        if worker and worker[0] != runtime_version():
+            # The Mac runs a different release than this server; rerun the Mac update line.
+            result["runtime_skew"] = {"server": runtime_version(), "worker": worker[0]}
+        return result
 
     def find(self, request):
         row = self.db.execute("SELECT id FROM jobs WHERE request=?", (request,)).fetchone()
@@ -259,7 +270,7 @@ class Server:
         for row in rows:
             pending = row["state"] != "RESULT_STORED"
             unread = not pending and not row["ack"]
-            if not (everything or pending or unread):
+            if not (everything or pending or (unread and now - row["created"] < UNREAD_WINDOW)):
                 recent += 1
                 if recent > RECENT:
                     continue
@@ -277,28 +288,56 @@ class Server:
         self.job(job)
         return self.publisher.events([json.loads(row[0]) for row in self.db.execute("SELECT value FROM events WHERE job_id=? AND sequence>? ORDER BY sequence LIMIT 1000", (job, after))])
 
-    def claim(self, request):
+    def claim(self, request, wait=0, held=()):
+        """Claim the oldest runnable job. An idle worker may wait up to `wait` seconds for one.
+
+        `cancel` tells the worker that a job in `held` (its jobs not yet told to cancel) was
+        cancelled, so it reconciles at once; that also ends a wait."""
         valid_id(request)
+        deadline = time.monotonic() + wait
+        checked = False
+        while True:
+            final = time.monotonic() >= deadline
+            # Polling stays read-only until there is something to take.
+            if not checked or final or self.db.execute("SELECT 1 FROM jobs WHERE state='QUEUED' AND cancel=0 LIMIT 1").fetchone():
+                row, decided = self.take(request, final)
+                if decided:
+                    break
+            checked = True
+            if self.unheard(held):
+                row = None
+                break
+            time.sleep(max(0, min(CLAIM_POLL, deadline - time.monotonic())))
+        cancel = self.unheard(held)
+        if not row:
+            return {"job": None, "cancel": cancel}
+        data = (self.root / "blobs" / row["snapshot"]).read_bytes()
+        return {"job": {key: row[key] for key in ("id", "workspace", "command", "cwd", "timeout", "claim", "cancel")}, "snapshot": base64.b64encode(data).decode(), "snapshot_digest": row["snapshot"], "cancel": cancel}
+
+    def take(self, request, final):
+        """Return (job row or None, whether this request is settled)."""
         with transaction(self.db):
             previous = self.db.execute("SELECT job_id FROM claims WHERE request=?", (request,)).fetchone()
             if previous:
                 # A retried claim gets its job back only while that claim still holds it.
                 row = self.db.execute("SELECT * FROM jobs WHERE id=? AND state='CLAIMED' AND result_digest IS NULL", (previous[0],)).fetchone() if previous[0] else None
-            else:
-                row = self.db.execute("SELECT * FROM jobs AS candidate WHERE state='QUEUED' AND cancel=0 AND NOT EXISTS(SELECT 1 FROM jobs AS active WHERE active.workspace=candidate.workspace AND active.state='CLAIMED') ORDER BY created LIMIT 1").fetchone()
-                if row:
-                    claim = opaque()
-                    now = time.time()
-                    self.db.execute("UPDATE jobs SET state='CLAIMED',claim=?,claimed=? WHERE id=?", (claim, now, row["id"]))
-                    self.db.execute("UPDATE summaries SET claimed=? WHERE job_id=?", (now, row["id"]))
-                    event(self.db, row["id"], "CLAIMED", "CLAIMED")
-                    row = self.job(row["id"])
-                self.db.execute("DELETE FROM claims WHERE job_id IS NULL")
-                self.db.execute("INSERT INTO claims VALUES(?,?)", (request, row["id"] if row else None))
-        if not row:
-            return {"job": None}
-        data = (self.root / "blobs" / row["snapshot"]).read_bytes()
-        return {"job": {key: row[key] for key in ("id", "workspace", "command", "cwd", "timeout", "claim", "cancel")}, "snapshot": base64.b64encode(data).decode(), "snapshot_digest": row["snapshot"]}
+                return row, True
+            row = self.db.execute("SELECT * FROM jobs AS candidate WHERE state='QUEUED' AND cancel=0 AND NOT EXISTS(SELECT 1 FROM jobs AS active WHERE active.workspace=candidate.workspace AND active.state='CLAIMED') ORDER BY created LIMIT 1").fetchone()
+            if row:
+                claim = opaque()
+                now = time.time()
+                self.db.execute("UPDATE jobs SET state='CLAIMED',claim=?,claimed=? WHERE id=?", (claim, now, row["id"]))
+                self.db.execute("UPDATE summaries SET claimed=? WHERE job_id=?", (now, row["id"]))
+                event(self.db, row["id"], "CLAIMED", "CLAIMED")
+                row = self.job(row["id"])
+            elif not final:
+                return None, False
+            self.db.execute("DELETE FROM claims WHERE job_id IS NULL")
+            self.db.execute("INSERT INTO claims VALUES(?,?)", (request, row["id"] if row else None))
+            return row, True
+
+    def unheard(self, held):
+        return any(row[0] in held for row in self.db.execute("SELECT id FROM jobs WHERE state='CLAIMED' AND cancel=1"))
 
     def cancel(self, job):
         with transaction(self.db):
@@ -410,8 +449,10 @@ class Server:
 
     def rpc(self, request):
         self.authenticate(request.get("token"))
-        with transaction(self.db):
-            self.db.execute("INSERT OR REPLACE INTO settings VALUES('last_contact',?)", (str(time.time()),))
+        contact = self.db.execute("SELECT value FROM settings WHERE key='last_contact'").fetchone()
+        if not contact or time.time() - float(contact[0]) >= CONTACT_EVERY:
+            with transaction(self.db):
+                self.db.execute("INSERT OR REPLACE INTO settings VALUES('last_contact',?)", (str(time.time()),))
         action = request.get("action")
         if action == "heartbeat":
             state = request.get("state")
@@ -422,6 +463,9 @@ class Server:
                 raise Refusal()
             health = request.get("health") or []
             if not isinstance(health, list) or len(health) > 16:
+                raise Refusal()
+            runtime = request.get("runtime")
+            if runtime is not None and (not isinstance(runtime, str) or not VERSION.fullmatch(runtime)):
                 raise Refusal()
             # Workers send their full job list only when it fits; without it nothing expires.
             active = request.get("active")
@@ -442,6 +486,8 @@ class Server:
                 self.db.execute("INSERT OR REPLACE INTO settings VALUES('worker_state',?)", (state,))
                 if timing is not None:
                     self.db.execute("INSERT OR REPLACE INTO settings VALUES('worker_timing',?)", (json.dumps(timing),))
+                if runtime is not None:
+                    self.db.execute("INSERT OR REPLACE INTO settings VALUES('worker_runtime',?)", (runtime,))
                 if active is not None:
                     self.expire(active)
                 last_gc = self.db.execute("SELECT value FROM settings WHERE key='last_gc'").fetchone()
@@ -452,7 +498,11 @@ class Server:
                 self.gc(True)
             return {"connected": True}
         if action == "claim":
-            return self.claim(request.get("request_id"))
+            wait = request.get("wait", 0)
+            held = request.get("held", [])
+            if type(wait) not in {int, float} or not 0 <= wait <= CLAIM_WAIT or not isinstance(held, list) or len(held) > MAX_RECONCILE:
+                raise Refusal()
+            return self.claim(request.get("request_id"), wait, {valid_id(item) for item in held})
         if action == "reconcile":
             jobs = request.get("jobs")
             if not isinstance(jobs, list) or len(jobs) > MAX_RECONCILE:

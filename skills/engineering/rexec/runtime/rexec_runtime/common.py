@@ -62,6 +62,22 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+VERSION = re.compile(r"^[a-f0-9]{12}$")
+_version = None
+
+
+def runtime_version():
+    """Short digest of this runtime's sources, taken once per process so it names the loaded
+    code. Both ends report the same value when they run the same release."""
+    global _version
+    if _version is None:
+        hasher = hashlib.sha256()
+        for path in sorted(Path(__file__).resolve().parent.glob("*.py")):
+            hasher.update(path.name.encode() + b"\0" + path.read_bytes() + b"\0")
+        _version = hasher.hexdigest()[:12]
+    return _version
+
+
 def private_dir(path):
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True, mode=0o700)

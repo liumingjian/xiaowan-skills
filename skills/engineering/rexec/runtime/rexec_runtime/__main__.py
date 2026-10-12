@@ -250,10 +250,12 @@ def main():
     elif role == "gate" and len(sys.argv) == 6:
         gate(int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5])
     elif role == "agent":
-        from .service import service, setup
+        from .service import service, setup, verify
         words = sys.argv[2:]
         if words == ["setup"]:
             print_json(setup(root))
+        elif len(words) == 2 and words[0] == "verify" and words[1].isdigit():
+            print_json(verify(root, int(words[1])))
         elif len(words) == 2 and words[0] == "service":
             print_json(service(root, words[1]))
         elif len(words) in {1, 2} and words[0] == "view":
