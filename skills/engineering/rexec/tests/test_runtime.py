@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 RUNTIME = Path(__file__).resolve().parents[1] / "runtime"
 sys.path.insert(0, str(RUNTIME))
-from rexec_runtime.common import MAX_LOG, Refusal, atomic, digest, encode, immutable, opaque
+from rexec_runtime.common import MAX_LOG, Refusal, atomic, digest, encode, immutable, opaque, transaction
 from rexec_runtime.export import Publisher
 from rexec_runtime.local import Local, Transport
 from rexec_runtime.server import Server
@@ -227,23 +227,95 @@ sys.exit(result.returncode)
         else:
             self.assertEqual(self.server.status(job)["exit_code"], 125)
 
-    def test_unknown_never_replays_and_keeps_workspace_reserved(self):
+    def test_unknown_never_replays_and_releases_workspace(self):
+        marker = self.root / "effect"
+        job = self.submit("printf x >> " + str(marker))
+        local = Local(self.mac)
+        local.receive(self.server.claim(opaque()))
+        local.prepare(job)
+        local.db.execute("UPDATE jobs SET state='RUNNING',started=?,nonce=?,socket=? WHERE id=?", (time.time(), opaque(), str(self.root / "missing"), job))
+        # A held supervisor lock means the supervisor lives, however slow its socket is.
+        with open(self.mac / "jobs" / job / "supervisor.lock", "a") as lock:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            local.recover()
+            self.assertEqual(local.row(job)["state"], "RUNNING")
+        local.recover()
+        bundle = json.loads((self.mac / "outbox" / job).read_bytes())
+        self.assertEqual((bundle["outcome"], bundle["exit_code"], bundle["reason"]), ("unknown", 70, "SUPERVISOR_LOST"))
+        self.server.report(bundle, digest(encode(bundle)))
+        self.assertEqual(self.server.job(job)["state"], "RESULT_STORED")
+        self.assertEqual(self.server.status(job)["reason"], "SUPERVISOR_LOST")
+        second = self.submit()
+        self.assertEqual(self.server.claim(opaque())["job"]["id"], second)
+        self.assertFalse(marker.exists())
+
+    def test_launch_without_supervisor_is_plain_failure(self):
         job = self.submit("printf forbidden")
         local = Local(self.mac)
         local.receive(self.server.claim(opaque()))
         local.prepare(job)
         local.db.execute("UPDATE jobs SET state='START_RESERVED',nonce=?,socket=? WHERE id=?", (opaque(), str(self.root / "missing"), job))
         local.recover()
-        time.sleep(1.05)
-        local.recover()
-        local.reconcile = lambda: None
-        self.assertEqual(json.loads((self.mac / "outbox" / job).read_bytes())["outcome"], "unknown")
         bundle = json.loads((self.mac / "outbox" / job).read_bytes())
+        self.assertEqual((bundle["outcome"], bundle["exit_code"], bundle["reason"]), ("failed", 126, "LAUNCH_FAILED"))
+
+    def test_legacy_unknown_reservation_is_released_on_upgrade(self):
+        job = self.submit()
+        claimed = self.server.claim(opaque())["job"]
+        bundle = Publisher().bundle(job, claimed["claim"], "unknown", 70, "EXECUTION_UNKNOWN")
         self.server.report(bundle, digest(encode(bundle)))
-        self.assertEqual(self.server.job(job)["state"], "CLAIMED")
-        second = self.submit()
-        self.assertIsNone(self.server.claim(opaque())["job"])
-        self.assertEqual(self.server.job(second)["state"], "QUEUED")
+        self.server.db.execute("UPDATE jobs SET state='CLAIMED' WHERE id=?", (job,))
+        Server(self.remote).db.close()
+        self.assertEqual(self.server.job(job)["state"], "RESULT_STORED")
+
+    def test_claim_lease_releases_jobs_the_worker_does_not_hold(self):
+        held, lost = self.submit(), self.server.submit("true", self.root, ".", 10, opaque())["job_id"]
+        request = opaque()
+        self.assertEqual(self.server.claim(request)["job"]["id"], held)
+        self.server.claim(opaque())
+        self.server.db.execute("UPDATE jobs SET claimed=0")
+        heartbeat = {"token": self.server.provision(), "action": "heartbeat", "state": "READY"}
+        self.server.rpc(heartbeat)
+        self.assertEqual(self.server.job(lost)["state"], "CLAIMED")
+        self.server.rpc(dict(heartbeat, active=[held]))
+        self.assertEqual(self.server.job(held)["state"], "CLAIMED")
+        self.assertEqual((self.server.status(lost)["outcome"], self.server.status(lost)["reason"]), ("unknown", "CLAIM_LOST"))
+        self.server.rpc(dict(heartbeat, active=[]))
+        self.assertEqual(self.server.job(held)["state"], "RESULT_STORED")
+        # A retried claim no longer hands back a job that was settled without the worker.
+        self.assertIsNone(self.server.claim(request)["job"])
+
+    def test_one_missing_job_does_not_stall_reconcile_or_reports(self):
+        first, second = self.submit("printf one"), self.server.submit("printf two", self.root, ".", 10, opaque())["job_id"]
+        local = Local(self.mac, self.isolated())
+        local.tick()
+        self.until(lambda: all(Local(self.mac).row(job)["state"] == "TERMINAL" for job in (first, second)))
+        with transaction(self.server.db):
+            self.server.db.execute("DELETE FROM claims WHERE job_id=?", (first,))
+            self.server.db.execute("DELETE FROM jobs WHERE id=?", (first,))
+        local.reconcile()
+        self.assertEqual(self.server.status(second)["stdout"], "two")
+        self.assertTrue(local.row(first)["acknowledged"])
+        self.assertTrue(local.row(second)["acknowledged"])
+        self.assertIn("ORPHANED_RESULT", json.dumps(local.health()))
+
+    def test_claim_that_never_arrives_is_rejected_after_retries(self):
+        job = self.submit()
+        server = self.server
+        class Corrupting:
+            def call(inner, action, **parameters):
+                response = server.rpc({"token": server.provision(), "action": action, **parameters})
+                if action == "claim" and response.get("job"):
+                    response["snapshot_digest"] = "0" * 64
+                return response
+        local = Local(self.mac, Corrupting())
+        for _ in range(3):
+            with self.assertRaises(Refusal):
+                local.claim()
+        self.assertEqual((self.server.status(job)["outcome"], self.server.status(job)["exit_code"], self.server.status(job)["reason"]), ("failed", 126, "CLAIM_REJECTED"))
+        self.assertIsNone(local.db.execute("SELECT 1 FROM settings WHERE key='claim_request'").fetchone())
+        self.assertFalse(local.claim())
 
     def test_report_write_failure_has_no_false_ack(self):
         job = self.submit()
@@ -755,6 +827,13 @@ sys.exit(result.returncode)
         self.assertEqual(failures.get("WORKER_CRASH"), 1)
         self.assertTrue((self.mac / "tick.failure").is_file())
         self.assertNotIn("private", json.dumps(self.server.channel()))
+
+    def test_server_refusal_keeps_its_code_over_ssh(self):
+        atomic(self.mac / "worker.token", b"wrong")
+        with patch.dict(os.environ, {key: self.environment[key] for key in ("PATH", "PYTHONPATH", "REXEC_TEST_REMOTE")}):
+            with self.assertRaises(Refusal) as caught:
+                Transport(self.mac).call("heartbeat", state="READY")
+        self.assertEqual(caught.exception.reason, "AUTHORIZATION_REQUIRED")
 
     def test_cli_usage_and_errors_are_recorded(self):
         environment = dict(self.environment, REXEC_STATE_DIR=str(self.remote))

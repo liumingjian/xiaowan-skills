@@ -28,7 +28,7 @@ description: Run builds, dependency installation, test suites, services for end-
    rexec trace JOB --after 0
    ```
 
-4. Read the terminal receipt and exit status. Successful completion returns 0; command failures pass through their exit codes. Timeout returns 124, cancellation 125, and an expired wait returns pending with 75. Connectivity loss or unknown execution is not evidence that the command failed. Inspect `rexec status JOB` and `rexec trace JOB`; reconcile before deciding whether another submission is safe. See [REFERENCE.md](REFERENCE.md#recovery-and-results) for recovery and acknowledgment behavior.
+4. Read the terminal receipt and exit status. Successful completion returns 0; command failures pass through their exit codes. Timeout returns 124, cancellation 125, and an expired wait returns pending with 75. Exit 126 with outcome `failed` means the command never started; fix the reported reason and resubmit. Outcome `unknown` (exit 70) means the command may have partly run: check its side effects before resubmitting, never assume it failed. See [REFERENCE.md](REFERENCE.md#recovery-and-results) for recovery and acknowledgment behavior.
 5. Fetch requested text artifacts with `rexec artifacts JOB --into DIR`. Commands publish them as bounded regular UTF-8 files beneath `$REXEC_ARTIFACTS`. Use `$TMPDIR` for private scratch files. Verify the collected result before claiming the work passed. See [REFERENCE.md](REFERENCE.md#output-and-artifacts) for export limits.
 
 ## Management
