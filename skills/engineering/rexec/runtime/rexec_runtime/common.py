@@ -179,13 +179,13 @@ def walk_regular(root, byte_limit, count_limit, prune=None, include_directories=
     def visit(parent_fd, prefix, depth):
         nonlocal count, total
         if depth > 32:
-            raise Refusal("TREE_LIMIT")
+            raise Refusal("TREE_LIMIT", detail={"at": prefix})
         names = []
         with os.scandir(parent_fd) as iterator:
             for entry in iterator:
                 names.append(entry.name)
                 if len(names) > count_limit:
-                    raise Refusal("TREE_LIMIT")
+                    raise Refusal("TREE_LIMIT", detail={"at": prefix or "."})
         for name in sorted(names):
             relative = prefix + name
             if prune and prune(relative):
