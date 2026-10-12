@@ -1,11 +1,14 @@
 import base64
+import io
 import json
 import math
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import re
 import stat
+import tarfile
 import time
+import zipfile
 
 from .common import MAX_ARTIFACT, MAX_ARTIFACTS, MAX_OUTPUT, Refusal, digest, encode, finite, valid_id
 
@@ -24,13 +27,64 @@ PATTERNS = [
     re.compile(r"(?im)\b(?:token|password|secret|api[_-]?key|authorization)\s*[:=]\s*[^\s,;]+"),
     re.compile(r"-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?(?:-----END [^-]*PRIVATE KEY-----|$)"),
 ]
+TEXT = (".md", ".txt", ".patch", ".diff", ".json", ".xml", ".csv")
+# Build outputs return as packages: bytes cannot be sanitized, so each member is checked instead.
+PACKAGES = (".zip", ".vsix", ".whl", ".jar", ".tgz", ".tar.gz")
+PACKAGE_MEMBERS = 4096
+PACKAGE_EXPANDED = 64 * 1024 * 1024
+PRIVATE_MEMBERS = {".git", ".ssh", ".aws", ".rexec", ".netrc", ".npmrc", ".pypirc", ".git-credentials", "auth.json"}
 FORBIDDEN = re.compile(r"(?i)(?:^|[/.])(?:\.env(?:\.|$)|\.git|\.ssh|credentials?|secrets?|config(?:\.|$)|.*\.(?:jsonl|stderr|log|pem|key)$)")
 
 
 def relative(name):
-    if PurePosixPath(plain(name)).suffix not in {".md", ".txt", ".patch", ".diff", ".json", ".xml", ".csv"}:
+    if not plain(name).endswith(TEXT + PACKAGES):
         raise Refusal("ARTIFACT_BLOCKED")
     return name
+
+
+def package_members(name, data):
+    """Yield (member, bytes) for every regular member, refusing links, traversal, secrets, and bombs."""
+    from .snapshot import SECRET_STEMS, SECRET_SUFFIXES, safe_name
+    expanded = 0
+    try:
+        if name.endswith((".tgz", ".tar.gz")):
+            archive = tarfile.open(fileobj=io.BytesIO(data), mode="r:gz")
+            entries = []
+            # Count while reading headers: a small archive can hold millions of them.
+            for item in archive:
+                entries.append((item, item.name, item.size, item.isdir(), item.isfile()))
+                if len(entries) > PACKAGE_MEMBERS:
+                    raise Refusal("ARTIFACT_BLOCKED")
+            read = lambda item: archive.extractfile(item).read()
+        else:
+            archive = zipfile.ZipFile(io.BytesIO(data))
+            # A zip link is an entry whose Unix mode says link; refuse it like a tar link.
+            entries = [(item, item.filename, item.file_size, item.is_dir(), stat.S_IFMT(item.external_attr >> 16) in (0, stat.S_IFREG)) for item in archive.infolist()]
+            read = archive.read
+        with archive:
+            if len(entries) > PACKAGE_MEMBERS:
+                raise Refusal("ARTIFACT_BLOCKED")
+            for item, member, size, directory, regular in entries:
+                path = member.rstrip("/")
+                while path.startswith("./"):
+                    path = path[2:]
+                if directory and path in ("", "."):
+                    continue
+                parts = safe_name(path).split("/")
+                leaf = parts[-1].lower()
+                if any(part in PRIVATE_MEMBERS or part.startswith(".env") for part in parts) or leaf.endswith(SECRET_SUFFIXES) or leaf.split(".")[0] in SECRET_STEMS:
+                    raise Refusal("ARTIFACT_BLOCKED")
+                if directory:
+                    continue
+                expanded += size
+                if not regular or expanded > PACKAGE_EXPANDED:
+                    raise Refusal("ARTIFACT_BLOCKED")
+                content = read(item)
+                if len(content) != size:
+                    raise Refusal("ARTIFACT_BLOCKED")
+                yield member, content
+    except (OSError, EOFError, ValueError, KeyError, tarfile.TarError, zipfile.BadZipFile, RuntimeError, Refusal):
+        raise Refusal("ARTIFACT_BLOCKED")
 
 
 def plain(name):
@@ -142,6 +196,14 @@ class Publisher:
                                 raise Refusal("ARTIFACT_BLOCKED")
         return safe
 
+    def package(self, name, data):
+        """The package bytes unchanged, or ARTIFACT_BLOCKED if a member carries known private data."""
+        literals = [literal.encode() for literal in self.literals]
+        for _, content in package_members(name, data):
+            if any(literal in content for literal in literals) or b"PRIVATE KEY-----" in content:
+                raise Refusal("ARTIFACT_BLOCKED")
+        return data
+
     def artifacts(self, directory):
         """Every artifact, or ARTIFACT_BLOCKED if any one is refused."""
         result, refused = self.collect(directory)
@@ -164,10 +226,14 @@ class Publisher:
             for name, raw, _ in walk_regular(root, MAX_ARTIFACT * MAX_ARTIFACTS, MAX_ARTIFACTS * 4):
                 try:
                     relative(name)
-                    if FORBIDDEN.search(name) or len(raw) > MAX_ARTIFACT or len(result) >= MAX_ARTIFACTS or b"\0" in raw:
+                    if FORBIDDEN.search(name) or len(raw) > MAX_ARTIFACT or len(result) >= MAX_ARTIFACTS:
                         raise Refusal("ARTIFACT_BLOCKED")
-                    safe = self.artifact_text(name, raw.decode("utf-8"))
-                    data = safe.encode()
+                    if name.endswith(PACKAGES):
+                        data = self.package(name, raw)
+                    elif b"\0" in raw:
+                        raise Refusal("ARTIFACT_BLOCKED")
+                    else:
+                        data = self.artifact_text(name, raw.decode("utf-8")).encode()
                     if len(data) > MAX_ARTIFACT or total + len(data) > MAX_ARTIFACT * MAX_ARTIFACTS or self.sanitize(name) != name:
                         raise Refusal("ARTIFACT_BLOCKED")
                 except (UnicodeError, Refusal):
@@ -236,10 +302,14 @@ class Publisher:
             names.add(name)
             try:
                 data = base64.b64decode(item["data"], validate=True)
-                text = data.decode("utf-8")
+                text = None if name.endswith(PACKAGES) else data.decode("utf-8")
             except (ValueError, UnicodeError, TypeError):
                 raise Refusal("ARTIFACT_BLOCKED")
-            if len(data) > MAX_ARTIFACT or len(data) != item["size"] or digest(data) != item["digest"] or self.artifact_text(name, text) != text or b"\0" in data:
+            if len(data) > MAX_ARTIFACT or len(data) != item["size"] or digest(data) != item["digest"]:
+                raise Refusal("ARTIFACT_BLOCKED")
+            if text is None:
+                self.package(name, data)
+            elif self.artifact_text(name, text) != text or b"\0" in data:
                 raise Refusal("ARTIFACT_BLOCKED")
         return bundle
 
