@@ -14,6 +14,7 @@ import threading
 import time
 import unittest
 from unittest.mock import patch
+import zipfile
 
 RUNTIME = Path(__file__).resolve().parents[1] / "runtime"
 sys.path.insert(0, str(RUNTIME))
@@ -956,6 +957,64 @@ if sys.argv[1]=="bootstrap":
         self.assertEqual(refused, [None, "huge.txt", "value.bin"])
         bundle = Publisher().bundle(opaque(), opaque(), "completed", 0, "COMPLETED", artifacts=accepted, refused=refused)
         self.assertEqual(Publisher().validate_bundle(bundle)["artifacts_refused"], [None, "huge.txt", "value.bin"])
+
+    def test_package_artifacts_return_unchanged_and_refuse_private_members(self):
+        def zipped(members, link=None):
+            stream = io.BytesIO()
+            with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as archive:
+                for name, content in members.items():
+                    archive.writestr(name, content)
+                if link:
+                    info = zipfile.ZipInfo(link)
+                    info.external_attr = 0o120777 << 16
+                    archive.writestr(info, "/etc/passwd")
+            return stream.getvalue()
+        def tarred(members, link=None):
+            stream = io.BytesIO()
+            with tarfile.open(fileobj=stream, mode="w:gz") as archive:
+                # `tar czf x.tgz .` starts with a "./" entry, which is not a traversal.
+                root = tarfile.TarInfo("./")
+                root.type = tarfile.DIRTYPE
+                archive.addfile(root)
+                for name, content in members.items():
+                    info = tarfile.TarInfo(name)
+                    info.size = len(content)
+                    archive.addfile(info, io.BytesIO(content))
+                if link:
+                    info = tarfile.TarInfo(link)
+                    info.type, info.linkname = tarfile.SYMTYPE, "/etc/passwd"
+                    archive.addfile(info)
+            return stream.getvalue()
+        artifacts = self.root / "artifact-source"
+        artifacts.mkdir()
+        vsix = zipped({"extension/package.json": b'{"name":"demo"}', "extension/out/main.js": bytes(range(256))})
+        (artifacts / "demo.vsix").write_bytes(vsix)
+        (artifacts / "demo.tgz").write_bytes(tarred({"package/index.js": b"module.exports = 1\n"}))
+        accepted, refused = Publisher(["fixture-private"]).collect(artifacts)
+        self.assertEqual(([item["name"] for item in accepted], refused), (["demo.tgz", "demo.vsix"], []))
+        bundle = Publisher().bundle(opaque(), opaque(), "completed", 0, "COMPLETED", artifacts=accepted)
+        target = self.root / "output"
+        write_artifacts(bundle, target)
+        self.assertEqual((target / "demo.vsix").read_bytes(), vsix)
+        for name in list(artifacts.iterdir()):
+            name.unlink()
+        cases = {
+            "literal.vsix": zipped({"extension/out/main.js": b"//# sourceMappingURL=fixture-private/main.js.map"}),
+            "dotenv.zip": zipped({"app/.env": b"safe"}),
+            "escape.whl": zipped({"../escape.py": b"safe"}),
+            "key.jar": zipped({"META-INF/signing.pem": b"safe"}),
+            "link.zip": zipped({}, link="extension/passwd"),
+            "link.tar.gz": tarred({}, link="package/passwd"),
+            "absolute.tgz": tarred({"/package/index.js": b"safe"}),
+            "corrupt.zip": b"safe",
+        }
+        for name, data in cases.items():
+            (artifacts / name).write_bytes(data)
+        accepted, refused = Publisher(["fixture-private"]).collect(artifacts)
+        self.assertEqual((accepted, sorted(refused)), ([], sorted(cases)))
+        forged = dict(bundle, artifacts=[{"name": "link.zip", "data": base64.b64encode(cases["link.zip"]).decode(), "digest": digest(cases["link.zip"]), "size": len(cases["link.zip"])}])
+        with self.assertRaises(Refusal):
+            Publisher().validate_bundle(forged)
 
     def test_idle_claim_waits_for_work_and_hears_cancels(self):
         started = time.monotonic()
