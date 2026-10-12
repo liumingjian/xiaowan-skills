@@ -208,7 +208,9 @@ class Publisher:
         return bundle
 
     def receipt(self, row, bundle=None):
-        value = {"job_id": valid_id(row["id"]), "state": row["state"], "cancel_requested": bool(row["cancel"])}
+        value = {"job_id": valid_id(row["id"]), "state": row["state"], "cancel_requested": bool(row["cancel"]), "age_s": round(max(0.0, time.time() - row["created"]), 1)}
+        if "label" in row.keys() and row["label"]:
+            value["label"] = row["label"]
         if bundle is not None:
             self.validate_bundle(bundle)
             value.update({key: bundle[key] for key in ("outcome", "exit_code", "reason", "stdout", "stderr", "log_truncated")})

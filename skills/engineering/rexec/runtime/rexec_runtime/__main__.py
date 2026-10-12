@@ -13,9 +13,15 @@ from .common import HISTORY, Refusal, atomic, digest, encode, opaque, read_json,
 from .export import Publisher, relative
 
 
-def print_json(value):
-    sys.stdout.buffer.write(encode(value) + b"\n")
-    sys.stdout.buffer.flush()
+# Waits stop short of the usual ten-minute agent tool timeout, so the caller always
+# gets the job_id back and can resume with `rexec wait JOB`.
+DEFAULT_WAIT = 540
+
+
+def print_json(value, stream=None):
+    stream = stream or sys.stdout
+    stream.buffer.write(encode(value) + b"\n")
+    stream.buffer.flush()
 
 
 def arguments():
@@ -32,6 +38,8 @@ def arguments():
     parser.add_argument("--cwd", default=".")
     parser.add_argument("--with-git", action="store_true")
     parser.add_argument("--request-id")
+    parser.add_argument("--label")
+    parser.add_argument("--all", action="store_true")
     parser.add_argument("items", nargs="*")
     parser.add_argument("--wait-timeout", type=float)
     parser.add_argument("--after", type=int, default=0)
@@ -115,18 +123,19 @@ def dispatch(server, args):
         if len(words) > 2:
             raise Refusal()
         if len(words) == 2:
+            row = server.job(words[1])
             result = server.status(words[1])
             server.note(words[1], "status")
-            if "outcome" in result:
-                server.note(words[1], "read")
             print_json(result)
+            if row["result_digest"]:
+                deliver(server, row)
         else:
-            print_json({"channel": server.channel(), "jobs": server.queue()})
+            print_json({"channel": server.channel(), **server.queue(args.all)})
         return 0
     if action == "queue":
         if len(words) != 1:
             raise Refusal()
-        print_json({"jobs": server.queue()})
+        print_json(server.queue(True))
         return 0
     if action == "feedback":
         if len(words) > 2 or not args.category:
@@ -174,32 +183,45 @@ def dispatch(server, args):
     else:
         if len(words) != 1:
             raise Refusal()
-        result = server.submit(words[0], None if args.no_sync else args.sync or os.getcwd(), args.cwd, args.timeout, args.request_id or opaque(), args.with_git)
+        request = args.request_id or opaque()
+        channel = server.channel()["state"]
+        if not args.background and channel != "READY" and server.find(request) is None:
+            # Waiting on a Mac that cannot run anything only burns the caller's time budget;
+            # `--background` still queues the job for when the Mac returns.
+            raise Refusal("CHANNEL_" + channel, 75)
+        result = server.submit(words[0], None if args.no_sync else args.sync or os.getcwd(), args.cwd, args.timeout, request, args.with_git, args.label)
         job = result["job_id"]
         if args.background:
             print_json(result)
             return 0
+        # Acceptance comes first on stderr, so an interrupted wait still leaves the job_id.
+        print_json({"accepted": True, "job_id": job, "request_id": request, "channel": channel}, sys.stderr)
     if action == "wait":
         server.job(job)
         server.note(job, "wait")
-    deadline = time.monotonic() + args.wait_timeout if args.wait_timeout is not None else None
+    deadline = time.monotonic() + (args.wait_timeout if args.wait_timeout is not None else DEFAULT_WAIT)
     while True:
         row = server.job(job)
         if row["result_digest"]:
             result = server.status(job)
-            # Successful delivery to stdout is the consumer receipt boundary.
             print_json(result)
-            server.ack(job, row["result_digest"])
-            server.note(job, "read")
-            if not server.bundle(row)["artifacts"]:
-                server.ack(job, row["result_digest"], artifacts=True)
+            deliver(server, row)
             return result["exit_code"]
-        if deadline is not None and time.monotonic() >= deadline:
+        if time.monotonic() >= deadline:
             if action == "wait":
                 server.note(job, "wait_timeout")
-            print_json({"job_id": job, "state": "pending", "reason": "WAIT_TIMEOUT"})
+            status = server.status(job)
+            print_json({"job_id": job, "state": "pending", "reason": "WAIT_TIMEOUT", "job_state": status["state"], "channel": server.channel()["state"], "timing": status["timing"]})
             return 75
         time.sleep(0.1)
+
+
+def deliver(server, row):
+    """Successful delivery to stdout is the consumer receipt boundary."""
+    server.ack(row["id"], row["result_digest"])
+    server.note(row["id"], "read")
+    if not server.bundle(row)["artifacts"]:
+        server.ack(row["id"], row["result_digest"], artifacts=True)
 
 
 def main():

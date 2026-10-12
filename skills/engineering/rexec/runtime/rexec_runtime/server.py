@@ -18,7 +18,7 @@ GC_INTERVAL = 3600
 LEASE = 600
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, request TEXT UNIQUE NOT NULL, spec_digest TEXT NOT NULL, workspace TEXT NOT NULL, command TEXT NOT NULL, cwd TEXT NOT NULL, timeout INTEGER NOT NULL, snapshot TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('QUEUED','CLAIMED','RESULT_STORED')), claim TEXT UNIQUE, cancel INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, completed REAL, result_digest TEXT, ack INTEGER NOT NULL DEFAULT 0, artifact_ack INTEGER NOT NULL DEFAULT 0, claimed REAL);
+CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, request TEXT UNIQUE NOT NULL, spec_digest TEXT NOT NULL, workspace TEXT NOT NULL, command TEXT NOT NULL, cwd TEXT NOT NULL, timeout INTEGER NOT NULL, snapshot TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('QUEUED','CLAIMED','RESULT_STORED')), claim TEXT UNIQUE, cancel INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, completed REAL, result_digest TEXT, ack INTEGER NOT NULL DEFAULT 0, artifact_ack INTEGER NOT NULL DEFAULT 0, claimed REAL, label TEXT);
 CREATE TABLE IF NOT EXISTS claims(request TEXT PRIMARY KEY, job_id TEXT REFERENCES jobs(id));
 CREATE TABLE IF NOT EXISTS workspaces(source TEXT PRIMARY KEY, id TEXT UNIQUE NOT NULL);
 CREATE TABLE IF NOT EXISTS events(job_id TEXT REFERENCES jobs(id) ON DELETE CASCADE, sequence INTEGER, value TEXT NOT NULL, PRIMARY KEY(job_id,sequence));
@@ -28,6 +28,9 @@ CREATE TABLE IF NOT EXISTS health(batch TEXT NOT NULL, at REAL NOT NULL, reason 
 CREATE TABLE IF NOT EXISTS cli_errors(at REAL NOT NULL, action TEXT NOT NULL, reason TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS feedback(id INTEGER PRIMARY KEY, at REAL NOT NULL, job_id TEXT, category TEXT NOT NULL, note TEXT NOT NULL);
 """
+# Default `rexec status` lists active and unread jobs plus this many recent others.
+RECENT = 5
+LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/ -]{0,63}")
 # Per-job usage counters that a CLI call can bump; read and fetched record the first time.
 USAGE = {"status": "status_calls", "wait": "wait_calls", "trace": "trace_calls", "wait_timeout": "wait_timeouts"}
 
@@ -41,10 +44,11 @@ class Server:
         self.migrate()
 
     def migrate(self):
-        if "claimed" not in {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}:
-            with transaction(self.db):
-                if "claimed" not in {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}:
-                    self.db.execute("ALTER TABLE jobs ADD COLUMN claimed REAL")
+        for column, kind in (("claimed", "REAL"), ("label", "TEXT")):
+            if column not in {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}:
+                with transaction(self.db):
+                    if column not in {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}:
+                        self.db.execute("ALTER TABLE jobs ADD COLUMN " + column + " " + kind)
         if not self.db.execute("SELECT 1 FROM settings WHERE key='summaries_backfilled'").fetchone():
             # Jobs from before summaries existed keep their outcome; claim times were not recorded.
             with transaction(self.db):
@@ -101,10 +105,12 @@ class Server:
         if not isinstance(token, str) or not path.exists() or not hmac.compare_digest(token, path.read_text()):
             raise Refusal("AUTHORIZATION_REQUIRED", 77)
 
-    def submit(self, command, source, cwd, timeout, request, with_git=False):
+    def submit(self, command, source, cwd, timeout, request, with_git=False, label=None):
         valid_id(request)
         if not isinstance(command, str) or not command or len(command.encode()) > 65536 or not 1 <= timeout <= 86400:
             raise Refusal()
+        if label is not None and (not isinstance(label, str) or not LABEL.fullmatch(label) or self.publisher.sanitize(label) != label):
+            raise Refusal("LABEL_INVALID")
         if cwd != ".":
             safe_name(cwd)
         workspace_source = str(Path(source).resolve()) if source is not None else "no-sync"
@@ -129,7 +135,7 @@ class Server:
                 workspace = (opaque(),)
                 self.db.execute("INSERT INTO workspaces VALUES(?,?)", (workspace_source, workspace[0]))
             job = opaque()
-            self.db.execute("INSERT INTO jobs(id,request,spec_digest,workspace,command,cwd,timeout,snapshot,state,created) VALUES(?,?,?,?,?,?,?,?,?,?)", (job, request, spec, workspace[0], command, cwd, timeout, snapshot, "QUEUED", time.time()))
+            self.db.execute("INSERT INTO jobs(id,request,spec_digest,workspace,command,cwd,timeout,snapshot,state,created,label) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (job, request, spec, workspace[0], command, cwd, timeout, snapshot, "QUEUED", time.time(), label))
             event(self.db, job, "QUEUED", "ACCEPTED")
             self.summarize(self.job(job), channel)
         return self.status(job)
@@ -226,8 +232,35 @@ class Server:
         return {"state": state, "last_contact_age_seconds": age, "reserved": reserved, "worker_timing": json.loads(timing[0]) if timing else None,
                 "recent_failures": failures, "last_failure": {"reason": last[0], "age_seconds": round(max(0, time.time() - last[1]), 3)} if last else None}
 
-    def queue(self):
-        return [self.status(row[0]) for row in self.db.execute("SELECT id FROM jobs ORDER BY created DESC LIMIT 100")]
+    def find(self, request):
+        row = self.db.execute("SELECT id FROM jobs WHERE request=?", (request,)).fetchone()
+        return row[0] if row else None
+
+    def queue(self, everything=False):
+        """One line per job, newest first. Full output stays behind `status JOB`.
+
+        By default only jobs that need attention are listed: queued or running jobs,
+        results nobody has read, and the few most recent others."""
+        now = time.time()
+        rows = self.db.execute("SELECT jobs.id,jobs.label,jobs.state,jobs.created,jobs.ack,jobs.cancel,summaries.outcome,summaries.exit_code,summaries.reason FROM jobs LEFT JOIN summaries ON summaries.job_id=jobs.id ORDER BY jobs.created DESC LIMIT 100").fetchall()
+        listed = []
+        recent = 0
+        for row in rows:
+            pending = row["state"] != "RESULT_STORED"
+            unread = not pending and not row["ack"]
+            if not (everything or pending or unread):
+                recent += 1
+                if recent > RECENT:
+                    continue
+            item = {"job_id": row["id"], "state": row["state"], "age_s": round(max(0.0, now - row["created"]), 1)}
+            if row["label"]:
+                item["label"] = row["label"]
+            if row["cancel"]:
+                item["cancel_requested"] = True
+            if not pending:
+                item.update({"outcome": row["outcome"], "exit_code": row["exit_code"], "reason": row["reason"], "unread": unread})
+            listed.append(item)
+        return {"jobs": listed, "hidden": len(rows) - len(listed)}
 
     def trace(self, job, after=0):
         self.job(job)

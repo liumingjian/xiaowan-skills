@@ -45,8 +45,8 @@ Stopping the worker pauses claims and reporting. Healthy job supervisors keep ru
 The VPS CLI is:
 
 ```bash
-rexec [--background] [--timeout SECONDS] [--sync DIR | --no-sync] [--cwd RELATIVE] [--with-git] [--request-id ID] 'shell command'
-rexec status [JOB]
+rexec [--background] [--timeout SECONDS] [--sync DIR | --no-sync] [--cwd RELATIVE] [--with-git] [--request-id ID] [--label LABEL] [--wait-timeout SECONDS] 'shell command'
+rexec status [JOB] [--all]
 rexec queue
 rexec wait JOB [--wait-timeout SECONDS]
 rexec trace JOB [--after SEQUENCE]
@@ -57,7 +57,9 @@ rexec feedback [JOB] --category CATEGORY [--note TEXT]
 rexec report [--since 7d]
 ```
 
-Default submission durably enqueues, then waits. `--background` returns acceptance JSON immediately. Retrying a submission with the same `--request-id` is idempotent; retain that ID when recovering a lost acceptance response. Execution deadlines are finite, default 1800 seconds and range 1 to 86400. Wait timeout is separate from execution timeout.
+Default submission durably enqueues, prints acceptance JSON on stderr, then waits up to 540 seconds (`--wait-timeout`), the same default as `rexec wait`. A wait that ends first exits 75 with `reason` `WAIT_TIMEOUT`, the server-side `job_state`, `channel`, and `timing`. While the channel is not `READY`, a new foreground submission is refused with `CHANNEL_<STATE>` and exit 75 before anything is queued. `--background` returns acceptance JSON immediately, whatever the channel state. A label is 1 to 64 letters, digits, spaces, or `._:/-`, starting with a letter or digit; anything else is refused with `LABEL_INVALID`.
+
+`rexec status` lists one line per job, newest first: `job_id`, `state`, `age_s`, `label`, and, once finished, `outcome`, `exit_code`, `reason`, and `unread`. It lists queued and running jobs, unread results, and the five most recent others; `hidden` counts the rest, and `--all` or `rexec queue` lists up to 100. Output, artifacts, and timing stay behind `rexec status JOB`. Printing a finished result through `status JOB` or `wait` counts as reading it. Retrying a submission with the same `--request-id` is idempotent; retain that ID when recovering a lost acceptance response. Execution deadlines are finite, default 1800 seconds and range 1 to 86400. Wait timeout is separate from execution timeout.
 
 `--no-sync` supplies an empty snapshot, not a previous project checkout. Submission freezes the input snapshot. The worker verifies its digest before extraction; rejected sync does not execute stale files. Sync excludes fixed secret paths, dependency caches, `.codex-out/`, and `.git` by default. Explicit history transfer excludes Git hooks and local credential configuration. Snapshot validation rejects unsafe paths, links, special files, and excessive file counts or bytes. Snapshot exclusions are fixed; do not infer them from `.gitignore`. Keep handoffs outside excluded secret and dependency paths.
 

@@ -835,6 +835,44 @@ sys.exit(result.returncode)
                 Transport(self.mac).call("heartbeat", state="READY")
         self.assertEqual(caught.exception.reason, "AUTHORIZATION_REQUIRED")
 
+    def test_foreground_submit_reports_job_first_and_refuses_offline_mac(self):
+        environment = dict(self.environment, REXEC_STATE_DIR=str(self.remote))
+        cli = lambda *words: subprocess.run([sys.executable, "-m", "rexec_runtime", "server", *words], env=environment, capture_output=True, cwd=self.source)
+        offline = cli("printf hi")
+        self.assertEqual((offline.returncode, json.loads(offline.stdout)), (75, {"error": "CHANNEL_OFFLINE"}))
+        self.assertEqual(self.server.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0)
+        self.server.rpc({"token": self.server.provision(), "action": "heartbeat", "state": "READY"})
+        pending = cli("--label", "unit tests", "--wait-timeout", "0", "printf hi")
+        self.assertEqual(pending.returncode, 75)
+        job = json.loads(pending.stderr)["job_id"]
+        waited = json.loads(pending.stdout)
+        self.assertEqual((waited["job_id"], waited["job_state"], waited["channel"]), (job, "QUEUED", "READY"))
+        self.spawn("worker")
+        self.finished(job)
+        item = json.loads(cli("status").stdout)["jobs"][0]
+        self.assertEqual((item["job_id"], item["label"], item["exit_code"], item["unread"]), (job, "unit tests", 0, True))
+        self.assertNotIn("stdout", item)
+        self.assertEqual(json.loads(cli("status", job).stdout)["stdout"], "hi")
+        self.assertFalse(json.loads(cli("status").stdout)["jobs"][0]["unread"])
+        self.assertEqual(json.loads(cli("--background", "--label", "/home/agent/private", "true").stdout), {"error": "LABEL_INVALID"})
+
+    def test_status_lists_only_jobs_needing_attention(self):
+        settled = []
+        for index in range(8):
+            source = self.root / f"settled{index}"
+            source.mkdir()
+            job = self.server.submit("true", source, ".", 10, opaque())["job_id"]
+            self.server.cancel(job)
+            self.server.ack(job, self.server.job(job)["result_digest"])
+            settled.append(job)
+        unread = self.submit()
+        self.server.cancel(unread)
+        queued = self.server.submit("true", self.root, ".", 10, opaque())["job_id"]
+        listing = self.server.queue()
+        self.assertEqual({item["job_id"] for item in listing["jobs"]}, {queued, unread, *settled[-5:]})
+        self.assertEqual(listing["hidden"], 3)
+        self.assertEqual(len(self.server.queue(True)["jobs"]), 10)
+
     def test_cli_usage_and_errors_are_recorded(self):
         environment = dict(self.environment, REXEC_STATE_DIR=str(self.remote))
         cli = lambda *words: subprocess.run([sys.executable, "-m", "rexec_runtime", "server", *words], env=environment, capture_output=True)
