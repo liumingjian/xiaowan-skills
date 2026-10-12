@@ -32,9 +32,11 @@ REASONS = {"ACCEPTED", "CLAIMED", "PREPARING", "STARTED", "COMPLETED", "CANCELLE
 
 
 class Refusal(Exception):
-    def __init__(self, reason="INVALID_REQUEST", code=2):
+    def __init__(self, reason="INVALID_REQUEST", code=2, detail=None):
         self.reason = reason
         self.code = code
+        # Shown only by the VPS CLI to its own caller, never sent across the channel.
+        self.detail = detail or {}
         super().__init__(reason)
 
 
@@ -167,8 +169,10 @@ def reject_legacy():
         raise Refusal("REMOVED_CONTROL")
 
 
-def walk_regular(root, byte_limit, count_limit, prune=None, include_directories=False):
-    """Walk descriptor-relative entries so directory swaps cannot follow links."""
+def walk_regular(root, byte_limit, count_limit, prune=None, include_directories=False, other=None):
+    """Walk descriptor-relative entries so directory swaps cannot follow links.
+
+    Links and special files are refused, or passed to `other` when given."""
     import stat
     root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     count = total = 0
@@ -188,7 +192,7 @@ def walk_regular(root, byte_limit, count_limit, prune=None, include_directories=
                 continue
             count += 1
             if count > count_limit:
-                raise Refusal("TREE_LIMIT")
+                raise Refusal("TREE_LIMIT", detail={"at": relative})
             mode = os.stat(name, dir_fd=parent_fd, follow_symlinks=False).st_mode
             flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
             if stat.S_ISDIR(mode):
@@ -204,15 +208,17 @@ def walk_regular(root, byte_limit, count_limit, prune=None, include_directories=
                 try:
                     info = os.fstat(child)
                     if not stat.S_ISREG(info.st_mode) or info.st_size > byte_limit - total:
-                        raise Refusal("TREE_LIMIT")
+                        raise Refusal("TREE_BYTES", detail={"at": relative})
                     with os.fdopen(child, "rb", closefd=False) as stream:
                         data = stream.read(byte_limit - total + 1)
                     total += len(data)
                     if total > byte_limit:
-                        raise Refusal("TREE_LIMIT")
+                        raise Refusal("TREE_BYTES", detail={"at": relative})
                     yield relative, data, info.st_mode
                 finally:
                     os.close(child)
+            elif other is not None:
+                other(relative)
             else:
                 raise Refusal("UNSAFE_FILE")
     try:

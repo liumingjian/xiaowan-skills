@@ -19,8 +19,9 @@ DEFAULT_WAIT = 540
 
 
 def print_json(value, stream=None):
+    # Display only: readable non-ASCII text costs agents far fewer tokens than escapes.
     stream = stream or sys.stdout
-    stream.buffer.write(encode(value) + b"\n")
+    stream.buffer.write(json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8", "backslashreplace") + b"\n")
     stream.buffer.flush()
 
 
@@ -37,6 +38,7 @@ def arguments():
     sync.add_argument("--no-sync", action="store_true")
     parser.add_argument("--cwd", default=".")
     parser.add_argument("--with-git", action="store_true")
+    parser.add_argument("--include-ignored", action="store_true")
     parser.add_argument("--request-id")
     parser.add_argument("--label")
     parser.add_argument("--all", action="store_true")
@@ -189,13 +191,13 @@ def dispatch(server, args):
             # Waiting on a Mac that cannot run anything only burns the caller's time budget;
             # `--background` still queues the job for when the Mac returns.
             raise Refusal("CHANNEL_" + channel, 75)
-        result = server.submit(words[0], None if args.no_sync else args.sync or os.getcwd(), args.cwd, args.timeout, request, args.with_git, args.label)
+        result = server.submit(words[0], None if args.no_sync else args.sync or os.getcwd(), args.cwd, args.timeout, request, args.with_git, args.label, args.include_ignored)
         job = result["job_id"]
         if args.background:
             print_json(result)
             return 0
         # Acceptance comes first on stderr, so an interrupted wait still leaves the job_id.
-        print_json({"accepted": True, "job_id": job, "request_id": request, "channel": channel}, sys.stderr)
+        print_json({"accepted": True, "job_id": job, "request_id": request, "channel": channel, **({"snapshot": result["snapshot"]} if "snapshot" in result else {})}, sys.stderr)
     if action == "wait":
         server.job(job)
         server.note(job, "wait")
@@ -268,7 +270,7 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Refusal as error:
-        print_json({"error": error.reason})
+        print_json({"error": error.reason, **error.detail})
         sys.exit(error.code)
     except (KeyboardInterrupt, BrokenPipeError):
         sys.exit(75)

@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 RUNTIME = Path(__file__).resolve().parents[1] / "runtime"
 sys.path.insert(0, str(RUNTIME))
-from rexec_runtime.common import MAX_LOG, Refusal, atomic, digest, encode, immutable, opaque, transaction
+from rexec_runtime.common import MAX_ARTIFACT, MAX_LOG, Refusal, atomic, digest, encode, immutable, opaque, transaction
 from rexec_runtime.export import Publisher
 from rexec_runtime.local import Local, Transport
 from rexec_runtime.server import Server
@@ -445,8 +445,11 @@ sys.exit(result.returncode)
 
     def test_snapshot_rejects_links_traversal_and_wrong_digest(self):
         (self.source / "link").symlink_to("outside")
-        with self.assertRaises(Refusal):
-            freeze(self.source)
+        (self.source / "kept.txt").write_text("safe")
+        report = {}
+        with tarfile.open(fileobj=io.BytesIO(freeze(self.source, report=report))) as archive:
+            self.assertEqual(archive.getnames(), ["kept.txt"])
+        self.assertEqual((report["skipped"], report["skipped_count"], report["files"]), (["link"], 1, 1))
         (self.source / "link").unlink()
         link = self.root / "source-link"
         link.symlink_to(self.source)
@@ -872,6 +875,50 @@ sys.exit(result.returncode)
         self.assertEqual({item["job_id"] for item in listing["jobs"]}, {queued, unread, *settled[-5:]})
         self.assertEqual(listing["hidden"], 3)
         self.assertEqual(len(self.server.queue(True)["jobs"]), 10)
+
+    def test_snapshot_follows_gitignore_and_names_its_failures(self):
+        git = lambda *words: subprocess.run(["git", "-C", str(self.source), *words], check=True, capture_output=True)
+        git("init", "-q")
+        for name in ("src/app.py", "build/out.txt", "secret_store.py", "secrets.yaml", "notes.txt"):
+            (self.source / name).parent.mkdir(exist_ok=True)
+            (self.source / name).write_text("safe")
+        (self.source / ".gitignore").write_text("build/\n")
+        git("add", "src/app.py")
+        report = {}
+        with tarfile.open(fileobj=io.BytesIO(freeze(self.source, report=report))) as archive:
+            names = {entry.name for entry in archive if entry.isfile()}
+        self.assertEqual(names, {".gitignore", "src/app.py", "secret_store.py", "notes.txt"})
+        self.assertTrue(report["gitignore"])
+        with tarfile.open(fileobj=io.BytesIO(freeze(self.source, ignored=True))) as archive:
+            self.assertIn("build/out.txt", archive.getnames())
+        with patch("rexec_runtime.snapshot.MAX_FILES", 2):
+            with self.assertRaises(Refusal) as caught:
+                freeze(self.source)
+        self.assertEqual(caught.exception.reason, "SNAPSHOT_TOO_MANY_FILES")
+        self.assertIn("at", caught.exception.detail)
+        with self.assertRaises(Refusal) as caught:
+            self.server.submit("true", self.source, "missing", 10, opaque())
+        self.assertEqual(caught.exception.reason, "CWD_NOT_FOUND")
+        self.assertEqual(self.server.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0)
+
+    def test_output_keeps_workspace_paths_and_times(self):
+        local = Local(self.mac)
+        workspace = self.mac / "jobs" / opaque() / "workspace"
+        text = local.publisher.sanitize(f'File "{workspace}/src/app.py", line 12 at 12:34:56 from fe80::1 and 2001:db8:0:0:0:0:0:1')
+        self.assertEqual(text, 'File "$WS/src/app.py", line 12 at 12:34:56 from [private] and [private]')
+        self.assertEqual(Publisher().sanitize(text), text)
+
+    def test_one_refused_artifact_keeps_the_others(self):
+        artifacts = self.root / "artifact-source"
+        artifacts.mkdir()
+        (artifacts / "report.xml").write_text("<ok/>")
+        (artifacts / "huge.txt").write_text("x" * (MAX_ARTIFACT + 1))
+        (artifacts / "value.bin").write_text("safe")
+        accepted, refused = Publisher().collect(artifacts)
+        self.assertEqual([item["name"] for item in accepted], ["report.xml"])
+        self.assertEqual(refused, ["huge.txt", None])
+        bundle = Publisher().bundle(opaque(), opaque(), "completed", 0, "COMPLETED", artifacts=accepted, refused=refused)
+        self.assertEqual(Publisher().validate_bundle(bundle)["artifacts_refused"], ["huge.txt", None])
 
     def test_cli_usage_and_errors_are_recorded(self):
         environment = dict(self.environment, REXEC_STATE_DIR=str(self.remote))

@@ -105,22 +105,30 @@ class Server:
         if not isinstance(token, str) or not path.exists() or not hmac.compare_digest(token, path.read_text()):
             raise Refusal("AUTHORIZATION_REQUIRED", 77)
 
-    def submit(self, command, source, cwd, timeout, request, with_git=False, label=None):
+    def submit(self, command, source, cwd, timeout, request, with_git=False, label=None, ignored=False):
         valid_id(request)
         if not isinstance(command, str) or not command or len(command.encode()) > 65536 or not 1 <= timeout <= 86400:
             raise Refusal()
         if label is not None and (not isinstance(label, str) or not LABEL.fullmatch(label) or self.publisher.sanitize(label) != label):
             raise Refusal("LABEL_INVALID")
         if cwd != ".":
-            safe_name(cwd)
+            try:
+                safe_name(cwd)
+            except Refusal:
+                raise Refusal("CWD_INVALID")
+            # Checked here so a typo fails now instead of after the transfer to the Mac.
+            if source is None or not (Path(source) / cwd).is_dir():
+                raise Refusal("CWD_NOT_FOUND")
         workspace_source = str(Path(source).resolve()) if source is not None else "no-sync"
-        spec = digest(encode([command, workspace_source, cwd, timeout, bool(with_git)]))
+        # Older specs omit the flag, so retries of their requests keep matching.
+        spec = digest(encode([command, workspace_source, cwd, timeout, bool(with_git)] + ([True] if ignored else [])))
         old = self.db.execute("SELECT * FROM jobs WHERE request=?", (request,)).fetchone()
         if old:
             if old["spec_digest"] != spec:
                 raise Refusal("REQUEST_CONFLICT")
             return self.status(old["id"])
-        blob = freeze(source, with_git) if source is not None else freeze_empty()
+        report = {}
+        blob = freeze(source, with_git, ignored, report, cwd) if source is not None else freeze_empty()
         snapshot = digest(blob)
         channel = self.channel()["state"]
         with transaction(self.db):
@@ -138,7 +146,10 @@ class Server:
             self.db.execute("INSERT INTO jobs(id,request,spec_digest,workspace,command,cwd,timeout,snapshot,state,created,label) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (job, request, spec, workspace[0], command, cwd, timeout, snapshot, "QUEUED", time.time(), label))
             event(self.db, job, "QUEUED", "ACCEPTED")
             self.summarize(self.job(job), channel)
-        return self.status(job)
+        result = self.status(job)
+        if report:
+            result["snapshot"] = report
+        return result
 
     def feedback(self, job, category, note):
         """Store an agent's note; it is reported in aggregate and never joins the trace."""

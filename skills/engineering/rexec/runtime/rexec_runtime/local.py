@@ -151,7 +151,7 @@ class Local:
             if not isinstance(configured, list) or any(not isinstance(item, str) or not item for item in configured):
                 raise Refusal("OUTPUT_BLOCKED")
             literals.extend(configured)
-        self.publisher = Publisher(literals)
+        self.publisher = Publisher(literals, self.root / "jobs")
         if isinstance(self.transport, Transport):
             self.transport.maintenance = self.recover
 
@@ -256,15 +256,15 @@ class Local:
         if row["state"] == "TERMINAL":
             return
         # Filtering output and artifacts can be slow, so it runs before the write lock.
-        artifacts = []
+        artifacts = refused = []
         try:
-            artifacts = self.publisher.artifacts(self.root / "jobs" / job / "artifacts")
+            artifacts, refused = self.publisher.collect(self.root / "jobs" / job / "artifacts")
         except Exception:
             reason = "ARTIFACT_BLOCKED"
         now = time.time()
         started = row["started"]
         timing = {"start_s": round(max(0.0, started - row["created"]), 3) if started else None, "run_s": round(max(0.0, now - started), 3) if started else None}
-        bundle = self.publisher.bundle(job, row["claim"], outcome, code, reason, stdout, stderr, artifacts, truncated, timing)
+        bundle = self.publisher.bundle(job, row["claim"], outcome, code, reason, stdout, stderr, artifacts, truncated, timing, refused)
         try:
             self.publisher.validate_bundle(bundle)
         except Exception:
