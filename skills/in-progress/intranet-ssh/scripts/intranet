@@ -1,0 +1,227 @@
+#!/usr/bin/ruby
+# frozen_string_literal: true
+
+require 'json'
+require 'socket'
+require 'timeout'
+require 'shellwords'
+
+module Intranet
+  class Error < StandardError; end
+  LoginConfig = Struct.new(:server, :port, :username, :password, :ssh_password)
+  Login = Struct.new(:ip)
+  Command = Struct.new(:ip, :shell_command)
+  Upload = Struct.new(:ip, :local_path, :remote_path)
+  Download = Struct.new(:ip, :remote_path, :local_path)
+  CONFIG_DIR = File.join(Dir.home, '.config', 'company-intranet')
+  CONFIG_FILE = File.join(CONFIG_DIR, 'config.json')
+  HELP = <<~TEXT
+    Usage: intranet 192.168.x.x
+           intranet exec 192.168.x.x 'COMMAND'
+           intranet upload 192.168.x.x LOCAL REMOTE
+           intranet download 192.168.x.x REMOTE LOCAL
+    Log in as root, run one shell command, or copy one file over SFTP.
+    Remote paths must be absolute. Existing destinations follow native scp behavior.
+  TEXT
+
+  def self.transfer_path(value, remote: false)
+    raise Error, 'File paths must be nonempty and contain no control characters.' if value.empty? || value.match?(/[\x00-\x1f\x7f]/)
+    if remote
+      raise Error, 'Remote file paths must be absolute.' unless value.start_with?('/')
+      value
+    else
+      File.expand_path(value)
+    end
+  rescue ArgumentError
+    raise Error, 'Cannot expand the local file path.'
+  end
+
+  def self.parse(argv)
+    case argv.first
+    when 'exec'
+      raise Error, HELP unless argv.length == 3
+      ip = target(argv[1])
+      raise Error, 'Expected one nonempty shell command without NUL bytes.' if argv[2].empty? || argv[2].include?("\0")
+      Command.new(ip, argv[2])
+    when 'upload'
+      raise Error, HELP unless argv.length == 4
+      Upload.new(target(argv[1]), transfer_path(argv[2]), transfer_path(argv[3], remote: true))
+    when 'download'
+      raise Error, HELP unless argv.length == 4
+      Download.new(target(argv[1]), transfer_path(argv[2], remote: true), transfer_path(argv[3]))
+    else
+      raise Error, HELP unless argv.length == 1
+      Login.new(target(argv[0]))
+    end
+  end
+
+  def self.target(value)
+    parts = value.to_s.split('.', -1)
+    unless parts.length == 4 && parts.all? { |p| p.match?(/\A(?:0|[1-9][0-9]{0,2})\z/) && p.to_i <= 255 } && parts[0, 2] == %w[192 168]
+      raise Error, 'Expected one IPv4 address in 192.168.0.0/16.'
+    end
+    value
+  end
+
+  def self.private_stat!(stat, mode)
+    raise Error, 'Private configuration permissions must be 0700 for the directory and 0600 for files.' unless stat.uid == Process.uid && (stat.mode & 0777) == mode
+  end
+
+  def self.config
+    directory = File.lstat(CONFIG_DIR)
+    raise Error, 'Private configuration directory must be a real directory.' unless directory.directory?
+    private_stat!(directory, 0700)
+    flags = File::RDONLY | File::NOFOLLOW
+    raw = File.open(CONFIG_FILE, flags) do |file|
+      raise Error, 'Private configuration must be a regular file.' unless file.stat.file?
+      private_stat!(file.stat, 0600)
+      raise Error, 'Private configuration is too large.' if file.stat.size > 16_384
+      JSON.parse(file.read(16_385))
+    end
+    raise Error, 'Private configuration must be a JSON object.' unless raw.is_a?(Hash)
+    server, port, username, password = raw.values_at('server', 'port', 'username', 'password')
+    ssh_password = raw['ssh_password']
+    valid_proxy = server.is_a?(String) && server.bytesize.between?(1, 253) && !server.match?(/[\s\x00-\x1f\x7f]/) && port.is_a?(Integer) && port.between?(1, 65_535)
+    valid_proxy &&= [username, password].all? { |s| s.is_a?(String) && s.bytesize.between?(1, 255) }
+    valid_ssh = raw['ssh_username'] == 'root' && ssh_password.is_a?(String) && ssh_password.bytesize.between?(1, 1024) && !ssh_password.match?(/[\r\n\x00]/)
+    raise Error, 'Private configuration has invalid proxy or SSH credentials.' unless valid_proxy && valid_ssh
+    LoginConfig.new(server, port, username, password, ssh_password)
+  rescue JSON::ParserError
+    raise Error, 'Private configuration is not valid JSON.'
+  rescue SystemCallError
+    raise Error, 'Cannot read the private configuration.'
+  end
+
+  def self.known_hosts
+    path = File.join(CONFIG_DIR, 'known_hosts')
+    File.open(path, File::WRONLY | File::CREAT | File::NOFOLLOW, 0600) do |file|
+      raise Error, 'Private known_hosts must be a regular file.' unless file.stat.file?
+      private_stat!(file.stat, 0600)
+    end
+    path
+  rescue SystemCallError
+    raise Error, 'Cannot open the private known_hosts file.'
+  end
+
+  def self.sshpass_path
+    candidates = ['/opt/homebrew/bin/sshpass', '/usr/local/bin/sshpass']
+    candidates.concat(ENV.fetch('PATH', '').split(File::PATH_SEPARATOR).map { |dir| File.join(dir, 'sshpass') })
+    candidates.find { |path| File.file?(path) && File.executable?(path) } || raise(Error, 'Install sshpass before using intranet.')
+  end
+
+  def self.connection_options(ip, hosts)
+    raise Error, 'Configuration path contains unsupported control characters.' if hosts.match?(/[\x00-\x1f\x7f]/)
+    quoted_hosts = '"' + hosts.gsub('%', '%%').gsub(/[\\"]/) { |c| '\\' + c } + '"'
+    proxy = Shellwords.join(['/usr/bin/ruby', File.realpath(__FILE__), '--internal-proxy', ip]).gsub('%', '%%')
+    settings = [
+      'PreferredAuthentications=password', 'PubkeyAuthentication=no',
+      'KbdInteractiveAuthentication=no', 'NumberOfPasswordPrompts=1',
+      'ConnectTimeout=15', 'StrictHostKeyChecking=accept-new',
+      "UserKnownHostsFile=#{quoted_hosts}", 'GlobalKnownHostsFile=/dev/null',
+      'UpdateHostKeys=no', "ProxyCommand=#{proxy}"
+    ]
+    settings.flat_map { |setting| ['-o', setting] }
+  end
+
+  def self.download_pattern(path)
+    path.gsub(/[\\*?\[\]]/) { |character| '\\' + character }
+  end
+
+  def self.native_argv(operation, hosts)
+    options = connection_options(operation.ip, hosts)
+    case operation
+    when Login, Command
+      args = ['/usr/bin/ssh', '-F', '/dev/null', operation.is_a?(Login) ? '-tt' : '-T', '-l', 'root', '-p', '22'] + options + [operation.ip]
+      args << operation.shell_command if operation.is_a?(Command)
+      args
+    when Upload
+      ['/usr/bin/scp', '-F', '/dev/null', '-P', '22'] + options + ['--', operation.local_path, "root@#{operation.ip}:#{operation.remote_path}"]
+    when Download
+      ['/usr/bin/scp', '-F', '/dev/null', '-P', '22'] + options + ['--', "root@#{operation.ip}:#{download_pattern(operation.remote_path)}", operation.local_path]
+    end
+  end
+
+  def self.run_authenticated(operation)
+    settings = config
+    args = [sshpass_path, '-d', '3'] + native_argv(operation, known_hosts)
+    reader, writer = IO.pipe
+    writer.write(settings.ssh_password + "\n")
+    writer.close
+    exec(*args, 3 => reader, close_others: true)
+  ensure
+    reader.close if reader && !reader.closed?
+    writer.close if writer && !writer.closed?
+  end
+
+  def self.read_exact(socket, length)
+    data = ''.b
+    while data.bytesize < length
+      chunk = socket.read(length - data.bytesize)
+      raise Error, 'SOCKS proxy closed during the handshake.' unless chunk
+      data << chunk
+    end
+    data
+  end
+
+  def self.connect(settings, ip)
+    socket = nil
+    Timeout.timeout(15) do
+      socket = TCPSocket.new(settings.server, settings.port)
+      socket.write([5, 1, 2].pack('C*'))
+      raise Error, 'SOCKS proxy rejected password authentication.' unless read_exact(socket, 2).bytes == [5, 2]
+      socket.write([1, settings.username.bytesize].pack('C*') + settings.username.b + [settings.password.bytesize].pack('C') + settings.password.b)
+      raise Error, 'SOCKS proxy authentication failed.' unless read_exact(socket, 2).bytes == [1, 0]
+      socket.write([5, 1, 0, 1, *ip.split('.').map(&:to_i), 0, 22].pack('C*'))
+      version, reply, reserved, address_type = read_exact(socket, 4).bytes
+      raise Error, 'SOCKS proxy returned an invalid CONNECT response.' unless version == 5 && reserved == 0 && [1, 3, 4].include?(address_type)
+      raise Error, 'SOCKS proxy could not connect to the SSH server.' unless reply == 0
+      length = { 1 => 4, 4 => 16 }[address_type] || read_exact(socket, 1).unpack1('C')
+      raise Error, 'SOCKS proxy returned an empty bound address.' if length.zero?
+      read_exact(socket, length + 2)
+    end
+    socket
+  rescue Exception
+    socket.close if socket && !socket.closed?
+    raise
+  end
+
+  def self.bridge(ip)
+    socket = connect(config, ip)
+    STDIN.binmode
+    STDOUT.binmode
+    uplink = Thread.new do
+      begin
+        IO.copy_stream(STDIN, socket)
+        socket.close_write
+      rescue IOError, SystemCallError
+        # The SSH process or remote peer may close either direction first.
+      end
+    end
+    IO.copy_stream(socket, STDOUT)
+  ensure
+    uplink.kill.join if uplink
+    socket.close if socket && !socket.closed?
+  end
+
+  def self.run(argv)
+    if argv == ['-h'] || argv == ['--help']
+      STDOUT.write(HELP)
+    elsif argv.length == 2 && argv[0] == '--internal-proxy'
+      bridge(target(argv[1]))
+    else
+      run_authenticated(parse(argv))
+    end
+    0
+  rescue Error => error
+    warn "intranet: #{error.message}"
+    1
+  rescue Timeout::Error
+    warn 'intranet: SOCKS connection timed out.'
+    1
+  rescue SystemCallError, IOError
+    warn 'intranet: Connection or executable failed.'
+    1
+  end
+end
+
+exit Intranet.run(ARGV) if $PROGRAM_NAME == __FILE__
