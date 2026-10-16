@@ -195,7 +195,7 @@ sys.exit(result.returncode)
         self.assertEqual(second.wait(timeout=3), 73)
         self.assertIsNone(first.poll())
 
-    def test_same_workspace_serial_and_unbounded_capacity(self):
+    def test_unbounded_capacity_including_one_source(self):
         first = self.submit()
         second = self.submit()
         others = []
@@ -203,10 +203,9 @@ sys.exit(result.returncode)
             other = self.root / f"other{index}"
             other.mkdir()
             others.append(self.server.submit("true", other, ".", 10, opaque())["job_id"])
-        claimed = {self.server.claim(opaque())["job"]["id"] for _ in range(5)}
-        self.assertEqual(claimed, {first, *others})
+        claimed = {self.server.claim(opaque())["job"]["id"] for _ in range(6)}
+        self.assertEqual(claimed, {first, second, *others})
         self.assertIsNone(self.server.claim(opaque())["job"])
-        self.assertEqual(self.server.job(second)["state"], "QUEUED")
 
     def test_cancel_claim_serialization(self):
         job = self.submit()
@@ -1028,7 +1027,6 @@ if sys.argv[1]=="bootstrap":
         finally:
             timer.join()
         self.assertLess(time.monotonic() - started, 5)
-        # The job above still holds the source workspace, so this one runs in its own.
         job = self.server.submit("printf safe", None, ".", 10, opaque())["job_id"]
         claimed = self.server.claim(opaque())["job"]["id"]
         self.assertEqual(claimed, job)
@@ -1261,6 +1259,64 @@ if sys.argv[1]=="bootstrap":
             self.assertEqual(cli("report", "--since", since).returncode, 2)
         self.assertEqual(self.server.overview(3600)["timing"]["queued_s"]["count"], 2)
 
+
+    def test_dependency_trees_carry_to_the_next_job_of_a_source(self):
+        (self.source / "pkg").mkdir()
+        (self.source / "pkg" / "keep.txt").write_text("x")
+        self.spawn("worker")
+        first = self.submit("mkdir -p node_modules/a/.bin node_modules/.vite pkg/node_modules/b && printf 1 > node_modules/a/f")
+        self.assertEqual(self.finished(first)["exit_code"], 0)
+        failed = self.submit("printf 2 > node_modules/a/f; exit 1")
+        self.assertEqual(self.finished(failed)["exit_code"], 1)
+        second = self.submit("cat node_modules/a/f; test -d pkg/node_modules/b && printf ' b'; test -d node_modules/.vite || printf ' fresh-vite'")
+        self.assertEqual(self.finished(second)["stdout"], "1 b fresh-vite")
+        other = self.root / "other"
+        other.mkdir()
+        cold = self.server.submit("test -d node_modules || printf cold", other, ".", 10, opaque())["job_id"]
+        self.assertEqual(self.finished(cold)["stdout"], "cold")
+
+    def test_warm_prune_drops_superseded_and_idle_entries(self):
+        from rexec_runtime import warm
+        local = Local(self.mac)
+        base = self.mac / "warm" / "w1"
+        for name in ("old", "new"):
+            (base / name / "node_modules").mkdir(parents=True)
+        atomic(base / "current", b"new")
+        stale = time.time() - warm.SUPERSEDED_GRACE - 10
+        os.utime(base / "old", (stale, stale))
+        idle = self.mac / "warm" / "w2"
+        (idle / "only" / "node_modules").mkdir(parents=True)
+        atomic(idle / "current", b"only")
+        gone = time.time() - warm.RETENTION - 10
+        os.utime(idle / "only", (gone, gone))
+        warm.prune(local)
+        self.assertEqual(sorted(path.name for path in base.iterdir()), ["current", "new"])
+        self.assertFalse(idle.exists())
+
+    def test_tmpdir_is_short_enough_for_unix_sockets(self):
+        self.spawn("worker")
+        probe = "import os,socket; s=socket.socket(socket.AF_UNIX); s.bind(os.path.join(os.environ['TMPDIR'], 'x'*64+'.sock')); print(os.environ['TMPDIR'])"
+        job = self.submit(f"{sys.executable} -c \"{probe}\"")
+        result = self.finished(job)
+        self.assertEqual((result["exit_code"], result["stdout"].strip()), (0, "$TMPDIR"))
+        self.until(lambda: not Path(f"/tmp/rx-{job[:12]}").is_symlink())
+
+    def test_snapshot_takes_an_npmrc_without_credentials(self):
+        def names(blob):
+            with tarfile.open(fileobj=io.BytesIO(blob)) as archive:
+                return set(archive.getnames())
+        for folder in ("plain", "token", "scoped", "inline", "env"):
+            (self.source / folder).mkdir()
+        (self.source / "plain" / ".npmrc").write_text("# pinned\nsave-exact=true\nuse-node-version=24.21.0\nnode-mirror:release=https://npmmirror.com/mirrors/node/\n@baox:registry=https://registry.example/\n")
+        (self.source / "token" / ".npmrc").write_text("_authToken=abc\n")
+        (self.source / "scoped" / ".npmrc").write_text("//registry.npmjs.org/:_authToken=abc\n")
+        (self.source / "inline" / ".npmrc").write_text("registry=https://user:pass@registry.example/\n")
+        (self.source / "env" / ".npmrc").write_text("registry=${PRIVATE_REGISTRY}\n")
+        report = {}
+        taken = names(freeze(self.source, report=report))
+        self.assertIn("plain/.npmrc", taken)
+        self.assertEqual({name for name in taken if name.endswith(".npmrc")}, {"plain/.npmrc"})
+        self.assertEqual(report["excluded"], 4)
 
 if __name__ == "__main__":
     unittest.main()

@@ -32,6 +32,8 @@ TEXT = (".md", ".txt", ".patch", ".diff", ".json", ".xml", ".csv")
 PACKAGES = (".zip", ".vsix", ".whl", ".jar", ".tgz", ".tar.gz")
 PACKAGE_MEMBERS = 4096
 PACKAGE_EXPANDED = 64 * 1024 * 1024
+# A job's short TMPDIR link (local.short_tmp), as given or as macOS resolves /tmp.
+SHORT_TMP = re.compile(r"(?:/private)?/tmp/rx-[a-f0-9]{12}\b")
 PRIVATE_MEMBERS = {".git", ".ssh", ".aws", ".rexec", ".netrc", ".npmrc", ".pypirc", ".git-credentials", "auth.json"}
 FORBIDDEN = re.compile(r"(?i)(?:^|[/.])(?:\.env(?:\.|$)|\.git|\.ssh|credentials?|secrets?|config(?:\.|$)|.*\.(?:jsonl|stderr|log|pem|key)$)")
 
@@ -150,6 +152,7 @@ class Publisher:
         text = CONTROL.sub("", text)
         if self.places:
             text = self.places.sub(lambda match: {"workspace": "$WS", "tmp": "$TMPDIR", "artifacts": "$REXEC_ARTIFACTS"}[match[1]], text)
+            text = SHORT_TMP.sub("$TMPDIR", text)
         for pattern in [re.compile(re.escape(literal)) for literal in self.literals] + PATTERNS:
             text = "".join(part if part == "[private]" else pattern.sub("[private]", part)
                            for part in re.split(r"(\[private\])", text))

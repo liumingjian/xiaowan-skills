@@ -16,6 +16,7 @@ import time
 from .common import CODE, ID, MAX_LOG, MAX_RECONCILE, MAX_RPC, MIN_FREE, RETENTION, Refusal, atomic, connect, digest, encode, event, immutable, opaque, private_dir, read_json, runtime_version, transaction, valid_id
 from .export import Publisher
 from .snapshot import extract
+from . import warm
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, claim TEXT UNIQUE NOT NULL, workspace TEXT NOT NULL, spec TEXT NOT NULL, snapshot TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('RECEIVED','PREPARING','READY','START_RESERVED','RUNNING','TERMINAL')), cancel INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL, nonce TEXT, socket TEXT, reserved REAL, started REAL, child_pid INTEGER, result_digest TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, completed REAL);
@@ -284,6 +285,10 @@ class Local:
     def scrub(self, job):
         """Drop a finished job's bulky files; the sealed outbox keeps its result."""
         folder = self.root / "jobs" / job
+        link = short_tmp(job)
+        if link.is_symlink() and os.readlink(link) == str(folder / "tmp"):
+            with contextlib.suppress(OSError):
+                link.unlink()
         for name in ("workspace", "tmp", "artifacts"):
             path = folder / name
             if path.is_dir() and not path.is_symlink():
@@ -585,6 +590,7 @@ class Local:
             folder = self.root / "jobs" / row[0]
             if any((folder / name).exists() for name in ("workspace", "tmp", "artifacts")):
                 self.scrub(row[0])
+        warm.prune(self)
         self.sweep()
 
     def health(self):
@@ -697,13 +703,14 @@ def supervise(root, job):
     spec = json.loads(row["spec"])
     folder = local.root / "jobs" / job
     environment = {key: value for key, value in os.environ.items() if not key.startswith("REXEC_")}
-    environment.update({"REXEC_ARTIFACTS": str(folder / "artifacts"), "TMPDIR": str(folder / "tmp"), "PYTHONPATH": str(Path(__file__).resolve().parent.parent)})
+    environment.update({"REXEC_ARTIFACTS": str(folder / "artifacts"), "TMPDIR": temporary(job, folder / "tmp"), "PYTHONPATH": str(Path(__file__).resolve().parent.parent)})
+    entry = warm.current(local.root, row["workspace"])
     read_gate, write_gate = os.pipe()
     read_done, write_done = os.pipe()
     process = None
     try:
         # The gate child can exist, but no command executes before RUNNING commits.
-        process = subprocess.Popen([sys.executable, "-m", "rexec_runtime", "gate", str(read_gate), str(write_done), str(spec["timeout"]), spec["command"]], cwd=folder / "workspace" / spec["cwd"], env=environment, pass_fds=(read_gate, write_done), start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = subprocess.Popen([sys.executable, "-m", "rexec_runtime", "gate", str(read_gate), str(write_done), str(spec["timeout"]), spec["command"], *([str(entry), str(folder / "workspace")] if entry else [])], cwd=folder / "workspace" / spec["cwd"], env=environment, pass_fds=(read_gate, write_done), start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         os.close(read_gate)
         read_gate = -1
         os.close(write_done)
@@ -810,6 +817,9 @@ def supervise(root, job):
         if code < 0:
             code = min(255, 128 - code)
         local.terminal(job, outcome, code, reason, (folder / "stdout").read_bytes(), (folder / "stderr").read_bytes(), truncated)
+        if outcome == "completed" and code == 0:
+            with contextlib.suppress(OSError):
+                warm.keep(local, row["workspace"], job, folder / "workspace")
         local.scrub(job)
         local.sweep()
     except BaseException:
@@ -829,12 +839,30 @@ def supervise(root, job):
             os.rmdir(str(Path(row["socket"]).parent))
 
 
-def gate(fd, done_fd, timeout, command):
+def short_tmp(job):
+    return Path("/tmp") / f"rx-{job[:12]}"
+
+
+def temporary(job, folder):
+    """A short TMPDIR: the job folder's path pushes Unix socket names past their 104-byte limit."""
+    link = short_tmp(job)
+    try:
+        os.symlink(folder, link)
+    except OSError:
+        return str(folder)
+    return str(link)
+
+
+def gate(fd, done_fd, timeout, command, entry=None, workspace=None):
     if os.read(fd, 1) != b"G":
         os._exit(125)
     os.set_blocking(fd, False)
-    process = subprocess.Popen(["/bin/sh", "-c", command], close_fds=True)
     deadline = time.monotonic() + timeout
+    if entry:
+        # Cloning runs inside the job: it counts against the deadline and dies with the group on cancel.
+        with contextlib.suppress(Exception):
+            warm.restore(Path(entry), workspace)
+    process = subprocess.Popen(["/bin/sh", "-c", command], close_fds=True)
     sent = False
     while True:
         # The gate is the stable group leader until supervisor cleanup. It also

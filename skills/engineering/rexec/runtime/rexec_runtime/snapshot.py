@@ -1,6 +1,7 @@
 import io
 import os
 from pathlib import Path, PurePosixPath
+import re
 import stat
 import subprocess
 import tarfile
@@ -11,6 +12,10 @@ EXCLUDED = {".netrc", ".npmrc", ".pypirc", ".git-credentials", "auth.json", ".co
 SECRET_SUFFIXES = (".pem", ".key", ".p12", ".pfx")
 # Files named like these hold secrets; `secret_store.py` or `test_credentials.py` are code.
 SECRET_STEMS = {"secret", "secrets", "credential", "credentials"}
+# An `.npmrc` travels only when every setting is plain configuration (a Node version, a registry or mirror URL):
+# no scoped `//host/:` entry, no credential key, no `user:password@` inside a URL.
+NPMRC_KEY = re.compile(r"^@?[a-z0-9][a-z0-9-]*(:[a-z0-9-]+)?$")
+NPMRC_SECRET = re.compile(r"auth|token|password|username|email|cert|key|^ca(file)?$")
 # Snapshot reports list at most this many skipped paths.
 REPORTED = 10
 
@@ -20,6 +25,22 @@ def safe_name(name):
     if not name or len(name) > 1024 or path.is_absolute() or "\\" in name or any(p in ("", ".", "..") for p in name.split("/")) or any(ord(c) < 32 for c in name):
         raise Refusal("SNAPSHOT_REJECTED")
     return name
+
+
+def plain_npmrc(data):
+    try:
+        lines = data.decode("utf-8").splitlines()
+    except UnicodeError:
+        return False
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        key, separator, value = line.partition("=")
+        key = key.strip().lower()
+        if not separator or not NPMRC_KEY.fullmatch(key) or NPMRC_SECRET.search(key.split(":")[-1]) or re.search(r"://[^/\s]*@", value) or "${" in value:
+            return False
+    return True
 
 
 def git_listing(source):
@@ -56,7 +77,9 @@ def freeze(source, with_git=False, ignored=False, report=None, cwd="."):
         if ".git" in parts:
             return not with_git or any(part in {"hooks", "logs", "config", "config.worktree", "credentials"} for part in parts[parts.index(".git") + 1:])
         leaf = parts[-1].lower()
-        if any(part in EXCLUDED or part.startswith(".env") for part in parts) or leaf.endswith(SECRET_SUFFIXES) or leaf.split(".")[0] in SECRET_STEMS:
+        # An `.npmrc` is judged by its content once read (plain_npmrc), not by its name.
+        npmrc = parts[-1] == ".npmrc" and not any(part in EXCLUDED for part in parts[:-1])
+        if any(part.startswith(".env") for part in parts) or (not npmrc and any(part in EXCLUDED for part in parts)) or leaf.endswith(SECRET_SUFFIXES) or leaf.split(".")[0] in SECRET_STEMS:
             report["excluded"] += 1
             return True
         if listing is not None and name not in parents and not any(str(PurePosixPath(*parts[:index])) in listing for index in range(1, len(parts) + 1)):
@@ -76,6 +99,9 @@ def freeze(source, with_git=False, ignored=False, report=None, cwd="."):
                     entry = tarfile.TarInfo(safe_name(name))
                 except Refusal:
                     raise Refusal("SNAPSHOT_UNSAFE_NAME")
+                if data is not None and PurePosixPath(name).name == ".npmrc" and not plain_npmrc(data):
+                    report["excluded"] += 1
+                    continue
                 entry.size = len(data) if data is not None else 0
                 if data is None:
                     entry.type = tarfile.DIRTYPE
