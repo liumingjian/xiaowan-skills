@@ -331,7 +331,8 @@ class Server:
                 # A retried claim gets its job back only while that claim still holds it.
                 row = self.db.execute("SELECT * FROM jobs WHERE id=? AND state='CLAIMED' AND result_digest IS NULL", (previous[0],)).fetchone() if previous[0] else None
                 return row, True
-            row = self.db.execute("SELECT * FROM jobs AS candidate WHERE state='QUEUED' AND cancel=0 AND NOT EXISTS(SELECT 1 FROM jobs AS active WHERE active.workspace=candidate.workspace AND active.state='CLAIMED') ORDER BY created LIMIT 1").fetchone()
+            # Every job extracts its own workspace, so jobs from one source run side by side too.
+            row = self.db.execute("SELECT * FROM jobs WHERE state='QUEUED' AND cancel=0 ORDER BY created LIMIT 1").fetchone()
             if row:
                 claim = opaque()
                 now = time.time()

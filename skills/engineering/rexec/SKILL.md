@@ -22,14 +22,19 @@ description: Run builds, dependency installation, test suites, services for end-
    rexec --no-sync 'node --version'
    ```
 
-   A foreground submission prints `{"accepted":true,"job_id":...}` on stderr first, then waits up to 540 seconds (`--wait-timeout` changes it) and prints the receipt on stdout. If the wait ends first, it prints pending with `job_state` and `channel` and exits 75; the job keeps running, so continue with `rexec wait JOB` instead of resubmitting.
-3. For work to collect later, submit with `--background` and save `job_id` from the acceptance JSON. Every job has an execution deadline of 1 to 86400 seconds, default 1800. Set `--timeout` to the required finite bound. A receipt saying accepted confirms submission, not completion.
+   Submit in the foreground only what finishes in about a minute (a version check, a typecheck, one test file). A foreground submission prints `{"accepted":true,"job_id":...}` on stderr first, then waits up to 540 seconds (`--wait-timeout` changes it) and prints the receipt on stdout. If the wait ends first, it prints pending with `job_state` and `channel` and exits 75; the job keeps running, so continue with `rexec wait JOB` instead of resubmitting.
+3. Anything longer (installs, builds, whole suites) runs in the background, and you keep working while it runs. Every job has an execution deadline of 1 to 86400 seconds, default 1800; set `--timeout` to the required finite bound.
+   1. Submit with `--background` and save `job_id` from the acceptance JSON. A receipt saying accepted confirms submission, not completion.
+   2. Start one `rexec wait JOB` with `--wait-timeout` above the job's `--timeout`, as a background shell command that notifies you when it exits (Claude Code: Bash with `run_in_background`).
+   3. Spend the wait on the next edit, a review, or another independent job; the Mac runs jobs in parallel.
+   4. Read the receipt when the notification arrives.
 
    ```bash
-   rexec --background --timeout 3600 'cargo build --release'
-   rexec wait JOB --wait-timeout 60
-   rexec trace JOB --after 0
+   rexec --background --timeout 3600 --label build 'cargo build --release'   # → job_id
+   rexec wait JOB --wait-timeout 3700                                        # as a background shell command
    ```
+
+   One background wait replaces every status poll and `sleep` loop. `rexec status JOB` and `rexec trace JOB --after 0` answer a question about a job you are already waiting on; they are not a way to wait.
 
 4. Read the terminal receipt and exit status. Successful completion returns 0; command failures pass through their exit codes. Timeout returns 124, cancellation 125, and an expired wait returns pending with 75. Exit 126 with outcome `failed` means the command never started; fix the reported reason and resubmit. Outcome `unknown` (exit 70) means the command may have partly run: check its side effects before resubmitting, never assume it failed. See [REFERENCE.md](REFERENCE.md#recovery-and-results) for recovery and acknowledgment behavior.
 5. Fetch requested artifacts with `rexec artifacts JOB --into DIR`. Commands publish them as bounded regular files beneath `$REXEC_ARTIFACTS`: UTF-8 text, or a build output packaged as `.zip`, `.vsix`, `.whl`, `.jar`, `.tgz`, or `.tar.gz`; zip any other binary first. Use `$TMPDIR` for private scratch files. Verify the collected result before claiming the work passed. See [REFERENCE.md](REFERENCE.md#output-and-artifacts) for export limits.
