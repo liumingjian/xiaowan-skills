@@ -1,0 +1,6 @@
+interface:
+  display_name: "Intranet SSH"
+  short_description: "Log in, run commands, and transfer intranet files"
+  default_prompt: "Use $intranet-ssh to access the specified company server and complete the requested SSH operation."
+policy:
+  allow_implicit_invocation: false
