@@ -23,10 +23,12 @@ description: Run builds, dependency installation, test suites, services for end-
    ```
 
    Submit in the foreground only what finishes in about a minute (a version check, a typecheck, one test file). A foreground submission prints `{"accepted":true,"job_id":...}` on stderr first, then waits up to 540 seconds (`--wait-timeout` changes it) and prints the receipt on stdout. If the wait ends first, it prints pending with `job_state` and `channel` and exits 75; the job keeps running, so continue with `rexec wait JOB` instead of resubmitting.
+
+   From a Claude Code worktree session, a guard refuses payloads it cannot read. Write the command literally: run a script as `./run.sh` after `chmod +x` (not `bash run.sh`), pass literal arguments and job ids (not `$(...)` or `$VAR`), and submit each job as its own command (not inside a loop).
 3. Anything longer (installs, builds, whole suites) runs in the background, and you keep working while it runs. Every job has an execution deadline of 1 to 86400 seconds, default 1800; set `--timeout` to the required finite bound.
-   1. Submit with `--background` and save `job_id` from the acceptance JSON. A receipt saying accepted confirms submission, not completion.
+   1. Tell the user how long the job should take, then submit with `--background` and save `job_id` from the acceptance JSON. A receipt saying accepted confirms submission, not completion.
    2. Start one `rexec wait JOB` with `--wait-timeout` above the job's `--timeout`, as a background shell command that notifies you when it exits (Claude Code: Bash with `run_in_background`).
-   3. Spend the wait on the next edit, a review, or another independent job; the Mac runs jobs in parallel.
+   3. Spend the wait on the next edit, a review, or another independent job; the Mac runs jobs in parallel. Whole test suites are the exception: run them one at a time, since two at once push timing-sensitive tests into timeouts. Judge whether the Mac is busy by CPU use (`rexec --no-sync 'top -l 2 -o cpu -n 10'`): it has 12 cores and 64 GB, so a load average of 5 to 15 is normal.
    4. Read the receipt when the notification arrives.
 
    ```bash
