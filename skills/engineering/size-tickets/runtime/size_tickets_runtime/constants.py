@@ -1,6 +1,7 @@
 # Shipped knowledge. Only the learn branch changes these, through a reviewed PR.
 
-# Placeholder coefficients: not fitted to any measured session yet (#42 replaces them).
+# Placeholders while CALIBRATED is False. `backtest --adopt` (learn branch) rewrites
+# CALIBRATED and COEFFICIENTS with values fitted over calibration.tsv.
 CALIBRATED = False
 COEFFICIENTS = {
     "base": 30000,          # tokens every implementer spends before touching the ticket

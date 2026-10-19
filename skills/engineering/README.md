@@ -7,4 +7,4 @@ Stable skills for day-to-day code work.
 
 `rexec` depends on the fixed `vps-cc` SSH alias, dedicated private credentials, and a user background service on one Mac mini. Viewers are independent of execution. Setup and service tooling is provided; installing the skill does not deploy it. See [the reference](./rexec/REFERENCE.md) for setup, recovery, and privacy limits.
 
-`size-tickets` needs `python3` and `git`. Its coefficients are placeholders until the `learn` branch ships, so every report is marked uncalibrated.
+`size-tickets` needs `python3` and `git`. Its coefficients are placeholders, and every report is marked uncalibrated, until a `learn` run's backtest adopts fitted ones through a reviewed PR.

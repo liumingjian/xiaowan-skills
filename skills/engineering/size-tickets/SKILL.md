@@ -60,7 +60,7 @@ Stateless: every run re-estimates every ticket from scratch. Read no repo config
 
 ## Learn
 
-Run after a spec is implemented, from the repo that holds it. Compares the current skill version's estimate of each published ticket with the context peak its implementer actually reached, then appends the results to `SKILL_DIR/calibration.tsv`. That file is the only thing this branch writes outside the temp directory.
+Run after a spec is implemented, from the repo that holds it. Compares the current skill version's estimate of each published ticket with the context peak its implementer actually reached, appends the results to `SKILL_DIR/calibration.tsv`, and refits the coefficients behind a regression guard. It writes only inside the temp directory and the skill's own repo (`SKILL_REPO` = `git -C SKILL_DIR rev-parse --show-toplevel`, the `xiaowan-skills` checkout), and coefficient changes reach the user only as a PR.
 
 1. **Estimate the published tickets.** Run Estimate steps 1–4 on `<spec>` as a published spec: its child tickets' bodies verbatim, since that is what the implementers received. Keep the temp directory and the estimate output. Human tickets are skipped there and stay out of everything below.
 2. **Find the logs.** Claude Code keeps one directory per working directory under `~/.claude/projects`, named after the path with `/` and `.` replaced by `-`, and each worktree gets its own. Take every directory whose name starts with the repo root's encoded path (e.g. `/home/me/app` → `-home-me-app`, which also matches `-home-me-app--claude-worktrees-x`). Only read these logs; never write under `~/.claude/projects`.
@@ -82,4 +82,20 @@ Run after a spec is implemented, from the repo that holds it. Compares the curre
    ```
 
    `repo` is `git remote get-url origin` reduced to `host/owner/name` (no scheme, user, port or `.git`). `estimate`, `semantic_bytes` and `mechanical_files` come from step 1, `actual` and `compacted` from step 3, and `date` is today's UTC date. Run `SKILL_DIR/bin/size-tickets record <tmp>/rows.json`. It prints `{"calibration", "appended", "replaced"}`; a rerun replaces a ticket's existing row instead of adding a second one. Exit 2 with `{"error":"INVALID_REQUEST"}` means a row is malformed and nothing was written: fix it and rerun.
-6. Delete the temp directory. Tell the user how many rows were appended or replaced in `calibration.tsv` and that the change is uncommitted in the skill's checkout. Refitting the coefficients and extracting rules from outliers ship in a later version, so stop here.
+6. **Backtest.** Run `SKILL_DIR/bin/size-tickets backtest`. It refits `base`, `k_semantic` and `k_mechanical` over every row of `calibration.tsv` from the stored `semantic_bytes` and `mechanical_files` columns, so never re-explore a repo for it. The fit minimises squared *relative* error (each row's miss divided by its actual peak, matching the ±50% bar), keeps coefficients non-negative, leaves a coefficient no row informs at its shipped value, and drops compacted rows (their peak is a lower bound). It prints one JSON line:
+   - `before` (shipped constants) and `after` (refit), each `coefficients`, `tier_accuracy`, `median_error` (median of |estimate − actual| / actual) and `within_50` (share of rows within ±50%); `after` is `null` when no fit was made.
+   - `verdict`: `adopt`, or `refuse` with `reasons[]`: `tier_accuracy_dropped`, `median_error_rose`, `too_few_rows` (under 3 usable rows), `unchanged` (the refit equals the shipped coefficients), `no_fit`.
+   - `rows` used and `excluded[]` (`repo`, `ticket`, `reason`).
+
+   Show the user a before/after table of the three coefficients, tier accuracy, median error and within ±50%, plus the verdict.
+7. **Refused.** Say why, from `reasons`, and change nothing else: no constants, no branch, no commit. The new rows stay uncommitted in `calibration.tsv`, so the next learning run fits over them too. Go to step 9.
+8. **Adopted.** Ship the refit as a PR for the user to merge; never merge it yourself.
+   1. `git -C SKILL_REPO status --porcelain` must list only `calibration.tsv`. Anything else: stop and tell the user, so their uncommitted work never rides along.
+   2. `git -C SKILL_REPO switch -c size-tickets/learn-<repo name>-<spec>` from the current branch.
+   3. Run `SKILL_DIR/bin/size-tickets backtest --adopt`. The same data gives the same verdict; it now rewrites `CALIBRATED` and `COEFFICIENTS` in `runtime/size_tickets_runtime/constants.py` and prints `"written": true`. Anything else: stop and report.
+   4. Commit `calibration.tsv` and `constants.py` with `feat(size-tickets): refit coefficients on <repo> spec #<spec>`, push the branch, and open a PR against the repo's default branch with `gh pr create`. Write the body with the `pr` skill's template:
+      - **Summary**: a `diff` of the `COEFFICIENTS` block, and the rows the fit used (count, repos, specs).
+      - **Evidence**: the backtest table, before → after, for tier accuracy, median error and within ±50%, with `rows` and `excluded`.
+      - **Merge Danger**: a two-way door (revert the commit); blast radius: every future estimate's numbers and tiers.
+   5. `git -C SKILL_REPO switch -` back to the branch you started from, so the installed skill keeps the shipped constants until the user merges.
+9. Delete the temp directory. Tell the user how many rows were appended or replaced in `calibration.tsv`, the verdict, and the PR link when one was opened. Extracting rules from outliers ships in a later version.
