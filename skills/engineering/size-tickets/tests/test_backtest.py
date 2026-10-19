@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -21,10 +22,14 @@ def tsv_row(ticket, actual, semantic_bytes, mechanical_files=0, estimate=0, comp
 
 
 def constants_text(base, k_semantic, k_mechanical, offsets=None, rules=None):
-    text = (SHIPPED_CONSTANTS.read_text(encoding="utf-8")
-            .replace('"base": 30000,', f'"base": {base},')
-            .replace('"k_semantic": 0.5,', f'"k_semantic": {k_semantic},')
-            .replace('"k_mechanical": 1500,', f'"k_mechanical": {k_mechanical},'))
+    """The shipped constants file with the given knowledge, whatever values it currently ships."""
+    text = SHIPPED_CONSTANTS.read_text(encoding="utf-8")
+    text = re.sub(r"^CALIBRATED = .*$", "CALIBRATED = False", text, count=1, flags=re.M)
+    text = re.sub(r"^REPO_OFFSETS = \{\}$|^REPO_OFFSETS = \{.*?^\}$", "REPO_OFFSETS = {}", text, count=1, flags=re.M | re.S)
+    text = re.sub(r"^RULES = \[\]$|^RULES = \[.*?^\]$", "RULES = []", text, count=1, flags=re.M | re.S)
+    for name, value in (("base", base), ("k_semantic", k_semantic), ("k_mechanical", k_mechanical)):
+        text, count = re.subn(rf'^(    "{name}": )[^,]+,', rf"\g<1>{value},", text, count=1, flags=re.M)
+        assert count == 1, name
     if offsets is not None:
         text = text.replace("REPO_OFFSETS = {}", f"REPO_OFFSETS = {offsets!r}")
     if rules is not None:
@@ -130,10 +135,14 @@ class BacktestTests(unittest.TestCase):
         self.assertEqual((out["verdict"], out["reasons"], out["after"], out["written"]),
                          ("refuse", ["too_few_rows"], None, False))
 
-    def test_the_shipped_empty_table_is_too_few_rows(self):
-        code, out = self.backtest("--calibration", str(SKILL / "calibration.tsv"))
+    def test_the_shipped_table_and_constants_agree(self):
+        # The shipped coefficients are the backtest of the shipped table: rerunning it changes nothing.
+        code, out = self.backtest("--calibration", str(SKILL / "calibration.tsv"),
+                                  "--constants", str(SHIPPED_CONSTANTS))
         self.assertEqual(code, 0)
-        self.assertEqual((out["rows"], out["verdict"], out["reasons"]), (0, "refuse", ["too_few_rows"]))
+        self.assertGreaterEqual(out["rows"], 3)
+        self.assertEqual((out["verdict"], out["reasons"], out["written"]), ("refuse", ["unchanged"], False))
+        self.assertIs(read_constants(SHIPPED_CONSTANTS)["CALIBRATED"], True)
 
     def test_compacted_rows_are_excluded_because_their_peak_is_a_lower_bound(self):
         self.rows(

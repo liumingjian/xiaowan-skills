@@ -1,7 +1,6 @@
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -28,7 +27,9 @@ class RecordTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="size-tickets-test-")
         self.table = Path(self.temp.name) / "calibration.tsv"
-        shutil.copyfile(SKILL / "calibration.tsv", self.table)
+        # Start from the shipped columns only, so the tests don't depend on the shipped rows.
+        header = (SKILL / "calibration.tsv").read_text(encoding="utf-8").splitlines()[0]
+        self.table.write_text(header + "\n", encoding="utf-8")
 
     def tearDown(self):
         self.temp.cleanup()
