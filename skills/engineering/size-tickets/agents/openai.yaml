@@ -1,0 +1,7 @@
+interface:
+  display_name: "Size Tickets"
+  short_description: "Estimate each ticket's implementer context peak and tier"
+  default_prompt: "Use $size-tickets to estimate the context peak and tier of each draft ticket before we publish them."
+
+policy:
+  allow_implicit_invocation: false
