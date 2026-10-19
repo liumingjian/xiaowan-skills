@@ -5,6 +5,7 @@ import sys
 from .common import Refusal
 from .estimate import estimate
 from .measure import measure
+from .record import record
 
 
 def print_json(value):
@@ -25,7 +26,10 @@ def arguments(argv):
     logs = commands.add_parser("measure", help="read each ticket's actual context peak from session logs")
     logs.add_argument("--logs", action="append", required=True, help="session-log directory, searched recursively; repeatable")
     logs.add_argument("tickets", nargs="+", help="ticket numbers, with or without #")
-    for each in (parser, run, logs):
+    rows = commands.add_parser("record", help="append measured tickets to calibration.tsv")
+    rows.add_argument("--calibration", help="table to append to (default: the skill's calibration.tsv)")
+    rows.add_argument("input", help="rows JSON file, or - for stdin")
+    for each in (parser, run, logs, rows):
         # argparse would echo user text and exit 2 with prose; keep the JSON error contract.
         each.error = refuse
     return parser.parse_args(argv)
@@ -47,6 +51,8 @@ def main(argv):
         print_json(estimate(read_request(args.input)))
     elif args.command == "measure":
         print_json(measure(args.logs, args.tickets))
+    elif args.command == "record":
+        print_json(record(read_request(args.input), args.calibration))
     return 0
 
 
