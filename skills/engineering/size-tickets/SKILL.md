@@ -36,17 +36,26 @@ Stateless: every run re-estimates every ticket from scratch. Read no repo config
    ```json
    {"repo": "<repo root>",
     "tickets": [{"id": "#12", "title": "...", "human": false, "labels": [], "blocked_by": ["#11"],
-                 "footprint": [{"path": "src/a.py", "kind": "semantic"}]}]}
+                 "footprint": [{"path": "src/a.py", "kind": "semantic", "group": "parse totals"}]}]}
    ```
 
-   `footprint` is the subagent's list as returned. Byte counts are measured by the CLI from the files on disk (as `wc -c` does); the request never carries a model-written number.
-4. **Estimate.** Run `SKILL_DIR/bin/size-tickets estimate <tmp>/request.json`. It prints one JSON line: `calibrated`, `budget`, `tickets[]` (each with `estimate`, `tier`, `semantic_bytes`, `mechanical_files`, and `files[]` sized per path, `exists: false` for files the ticket creates) and `skipped[]`. Exit 2 with `{"error":"INVALID_REQUEST"}` means the request is malformed: fix it and rerun.
+   `footprint` is the subagent's list as returned, `group` included. Byte counts are measured by the CLI from the files on disk (as `wc -c` does); the request never carries a model-written number.
+4. **Estimate.** Run `SKILL_DIR/bin/size-tickets estimate <tmp>/request.json`. It prints one JSON line: `calibrated`, `budget`, `tickets[]`, `skipped[]` and `merges[]`. Each ticket has `estimate`, `tier`, `semantic_bytes`, `mechanical_files`, `files[]` (sized per path; `exists: false` marks files the ticket creates), `breakdown[]` (its three most expensive groups: `group`, `tokens`, `files`, `largest`) and `split` (`null` unless the ticket is over budget). Exit 2 with `{"error":"INVALID_REQUEST"}` means the request is malformed: fix it and rerun.
+
+   The CLI makes every proposal, so never dispatch another subagent or redo the arithmetic yourself:
+   - **Split** (oversized and must_split): the split line falls between groups. A group is the subagent's `group` tag, or the file's directory when untagged (`split.by` says which). Groups are taken in sorted order and packed into parts while each part's recomputed estimate stays within budget; a group too big alone is cut file by file. Each `split.parts[]` entry has `id` (`<ticket>.1`, ...), `groups`, `paths`, `estimate` and `tier`.
+   - **Merge**: `merges[]` holds a pair only when both tickets are undersized, they are directly adjacent on a blocking chain or share footprint files (`reasons`: `blocking`, `shared_files`), and the recomputed union (shared files counted once) stays within budget. Unrelated small tickets are never paired.
 5. **Report.** One table, in the input's ticket order:
 
-   | Ticket | Title | Estimate | Tier | Semantic KB | Mechanical files |
-   |---|---|---|---|---|---|
+   | Ticket | Title | Estimate | Tier | Semantic KB | Mechanical files | Footprint from | Proposal |
+   |---|---|---|---|---|---|---|---|
 
-   Estimates in k tokens. Tiers: `undersized` (< 50k), `fits` (≤ 150k), `oversized` (< 300k), `must_split` (≥ 300k). Under the table, list skipped tickets with their reason. When `calibrated` is false, open the report with: **Uncalibrated: placeholder coefficients, so read tiers as rough guidance.**
+   Estimates in k tokens. Tiers: `undersized` (< 50k), `fits` (≤ 150k), `oversized` (< 300k), `must_split` (≥ 300k). **Footprint from** lists each `breakdown` entry as `group (largest) Nk`, e.g. `src/api (src/api/b.py) 80k`. **Proposal** is one of:
+   - `split → #7.1 [export] 110k fits; #7.2 [model, view] 140k fits`, one entry per part;
+   - `merge with #2 → 45k undersized (blocking)`, for each `merges` pair naming the ticket;
+   - `—` when there is none.
+
+   Under the table, list skipped tickets with their reason. When `calibrated` is false, open the report with: **Uncalibrated: placeholder coefficients, so read tiers as rough guidance.**
 6. Delete the temp directory.
 
 ## Learn
