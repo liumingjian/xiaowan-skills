@@ -11,6 +11,8 @@ RUNTIME = SKILL / "runtime"
 SHIPPED_CONSTANTS = RUNTIME / "size_tickets_runtime" / "constants.py"
 HEADER = "repo\tspec\tticket\testimate\tactual\tsemantic_bytes\tmechanical_files\tcompacted\tdate"
 REPO = "github.com/example/app"
+OTHER = "github.com/example/other"
+SIZES = [100000, 200000, 50000, 400000, 10000, 300000]
 
 
 def tsv_row(ticket, actual, semantic_bytes, mechanical_files=0, estimate=0, compacted=False, repo=REPO):
@@ -18,11 +20,21 @@ def tsv_row(ticket, actual, semantic_bytes, mechanical_files=0, estimate=0, comp
                                        "true" if compacted else "false", "2026-10-19"])
 
 
-def constants_text(base, k_semantic, k_mechanical):
-    return (SHIPPED_CONSTANTS.read_text(encoding="utf-8")
+def constants_text(base, k_semantic, k_mechanical, offsets=None, rules=None):
+    text = (SHIPPED_CONSTANTS.read_text(encoding="utf-8")
             .replace('"base": 30000,', f'"base": {base},')
             .replace('"k_semantic": 0.5,', f'"k_semantic": {k_semantic},')
             .replace('"k_mechanical": 1500,', f'"k_mechanical": {k_mechanical},'))
+    if offsets is not None:
+        text = text.replace("REPO_OFFSETS = {}", f"REPO_OFFSETS = {offsets!r}")
+    if rules is not None:
+        text = text.replace("RULES = []", f"RULES = {rules!r}")
+    return text
+
+
+def exact(ticket, semantic_bytes, extra=0, repo=REPO, mechanical_files=0):
+    """A row whose actual peak is exactly 20000 + 0.3 * semantic bytes + extra."""
+    return tsv_row(ticket, 20000 + semantic_bytes * 3 // 10 + extra, semantic_bytes, mechanical_files, repo=repo)
 
 
 def read_constants(path):
@@ -42,8 +54,8 @@ class BacktestTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def ship(self, base, k_semantic, k_mechanical):
-        self.constants.write_text(constants_text(base, k_semantic, k_mechanical), encoding="utf-8")
+    def ship(self, base, k_semantic, k_mechanical, offsets=None, rules=None):
+        self.constants.write_text(constants_text(base, k_semantic, k_mechanical, offsets, rules), encoding="utf-8")
 
     def rows(self, *lines):
         self.table.write_text("\n".join([HEADER, *lines]) + "\n", encoding="utf-8")
@@ -88,7 +100,7 @@ class BacktestTests(unittest.TestCase):
         code, out = self.backtest()
         self.assertEqual(code, 0)
         self.assertEqual(out["before"], {
-            "coefficients": {"base": 30000, "k_semantic": 0.5, "k_mechanical": 1500},
+            "coefficients": {"base": 30000, "k_semantic": 0.5, "k_mechanical": 1500}, "offsets": {}, "rules": [],
             "tier_accuracy": 0.6667, "median_error": 0.2, "within_50": 1.0,
         })
 
@@ -181,6 +193,146 @@ class BacktestTests(unittest.TestCase):
         self.assertEqual(out["before"]["coefficients"], {"base": 20000, "k_semantic": 0.3, "k_mechanical": 2000})
         self.assertEqual((out["verdict"], out["reasons"], out["written"]), ("refuse", ["unchanged"], False))
         self.assertEqual(self.constants.read_bytes(), written)
+
+    def test_a_repo_with_five_rows_gets_an_offset_keyed_by_its_remote(self):
+        # The largest repo is the reference the base is fitted to; the other runs 10k hotter.
+        self.rows(*[exact(i, s) for i, s in enumerate(SIZES, 1)],
+                  *[exact(10 + i, s, extra=10000, repo=OTHER) for i, s in enumerate(SIZES[:5], 1)])
+        code, out = self.backtest()
+        self.assertEqual(code, 0)
+        self.assertEqual(out["after"]["coefficients"], {"base": 20000, "k_semantic": 0.3, "k_mechanical": 1500})
+        self.assertEqual(out["after"]["offsets"], {OTHER: 10000})
+        self.assertEqual(out["after"]["median_error"], 0)
+        self.assertEqual(out["before"]["offsets"], {})
+        self.assertEqual(out["repos"], [{"repo": REPO, "rows": 6, "offset": None},
+                                        {"repo": OTHER, "rows": 5, "offset": 10000}])
+        self.assertEqual(out["verdict"], "adopt")
+
+    def test_a_repo_with_four_rows_gets_no_offset(self):
+        self.rows(*[exact(i, s) for i, s in enumerate(SIZES, 1)],
+                  *[exact(10 + i, s, extra=10000, repo=OTHER) for i, s in enumerate(SIZES[:4], 1)])
+        code, out = self.backtest()
+        self.assertEqual(code, 0)
+        self.assertEqual(out["after"]["offsets"], {})
+        self.assertEqual(out["repos"], [{"repo": REPO, "rows": 6, "offset": None},
+                                        {"repo": OTHER, "rows": 4, "offset": None}])
+
+    def test_a_single_repo_is_the_reference_and_gets_no_offset(self):
+        self.rows(*[exact(i, s) for i, s in enumerate(SIZES, 1)])
+        code, out = self.backtest()
+        self.assertEqual(out["after"]["offsets"], {})
+        self.assertEqual(out["repos"], [{"repo": REPO, "rows": 6, "offset": None}])
+
+    def test_a_cost_term_rule_prices_its_rows_and_is_kept_with_its_citations(self):
+        # Tickets 2 and 4 touched migrations, which cost 15k each beyond their bytes.
+        rule = {"id": "migrations", "kind": "term", "enabled": True,
+                "text": "Each migration file in the footprint costs 15k beyond its bytes.",
+                "match": "*/migrations/*.py", "tokens": 15000,
+                "cites": [f"{REPO}#2"], "rows": {f"{REPO}#2": {"units": 2}, f"{REPO}#4": {"units": 1}}}
+        self.ship(30000, 0.5, 1500, rules=[rule])
+        self.rows(exact(1, 100000), exact(2, 200000, extra=30000), exact(3, 50000),
+                  exact(4, 400000, extra=15000), exact(5, 10000))
+        code, out = self.backtest()
+        self.assertEqual(code, 0)
+        self.assertEqual(out["after"]["coefficients"], {"base": 20000, "k_semantic": 0.3, "k_mechanical": 1500})
+        self.assertEqual(out["after"]["median_error"], 0)
+        self.assertEqual(out["after"]["rules"], ["migrations"])
+        [verdict] = out["rules"]
+        self.assertEqual((verdict["id"], verdict["kind"], verdict["cites"], verdict["verdict"]),
+                         ("migrations", "term", [f"{REPO}#2"], "keep"))
+        self.assertGreater(verdict["without"]["median_error"], 0)
+
+    def test_a_rule_whose_removal_changes_nothing_is_deleted_and_adopt_drops_it(self):
+        useful = {"id": "migrations", "kind": "term", "enabled": True, "text": "Migrations cost 15k each.",
+                  "match": "*/migrations/*.py", "tokens": 15000,
+                  "cites": [f"{REPO}#2"], "rows": {f"{REPO}#2": {"units": 2}}}
+        useless = {"id": "fixtures", "kind": "term", "enabled": True, "text": "Fixtures cost 8k each.",
+                   "match": "*/fixtures/*", "tokens": 8000,
+                   "cites": [f"{REPO}#3"], "rows": {f"{REPO}#3": {"units": 0}}}
+        self.ship(30000, 0.5, 1500, rules=[useless, useful])
+        self.rows(exact(1, 100000), exact(2, 200000, extra=30000), exact(3, 50000), exact(4, 400000), exact(5, 10000))
+        code, out = self.backtest("--adopt")
+        self.assertEqual(code, 0)
+        self.assertEqual([(r["id"], r["verdict"]) for r in out["rules"]], [("fixtures", "delete"), ("migrations", "keep")])
+        self.assertEqual(out["after"]["rules"], ["migrations"])
+        self.assertEqual((out["verdict"], out["written"]), ("adopt", True))
+        shipped = read_constants(self.constants)
+        self.assertEqual(shipped["RULES"], [useful])
+        self.assertEqual(shipped["COEFFICIENTS"], {"base": 20000, "k_semantic": 0.3, "k_mechanical": 1500})
+        code, out = self.backtest()
+        self.assertEqual((out["verdict"], out["reasons"]), ("refuse", ["unchanged"]))
+
+    def tagging(self, rows):
+        return {"id": "generated", "kind": "tagging", "enabled": True,
+                "text": "Generated API clients are mechanical, not semantic.", "match": "*/generated/*",
+                "cites": [f"{REPO}#2"], "rows": rows}
+
+    def test_only_rows_a_new_tagging_rule_reclassifies_are_sent_for_re_exploration(self):
+        # Tickets 2 and 4 stored generated clients as semantic bytes; the rule says they are
+        # mechanical. #2 is re-explored already, #4 is not; no other row is touched.
+        self.ship(30000, 0.5, 1500, rules=[self.tagging({
+            f"{REPO}#2": {"semantic_bytes": 200000, "mechanical_files": 0}, f"{REPO}#4": None})])
+        self.rows(exact(1, 100000), tsv_row(2, 80000, 900000), exact(3, 50000),
+                  tsv_row(4, 140000, 700000), exact(5, 10000))
+        before = self.constants.read_bytes()
+        code, out = self.backtest("--adopt")
+        self.assertEqual(code, 0)
+        self.assertEqual(out["reexplore"], [{"repo": REPO, "ticket": 4, "rules": ["generated"]}])
+        self.assertEqual((out["verdict"], out["reasons"], out["written"]), ("refuse", ["needs_reexploration"], False))
+        self.assertEqual(self.constants.read_bytes(), before)
+
+    def test_a_re_explored_tagging_rule_replaces_the_stored_footprint_of_its_rows(self):
+        self.ship(30000, 0.5, 1500, rules=[self.tagging({
+            f"{REPO}#2": {"semantic_bytes": 200000, "mechanical_files": 0},
+            f"{REPO}#4": {"semantic_bytes": 400000, "mechanical_files": 0}})])
+        self.rows(exact(1, 100000), tsv_row(2, 80000, 900000), exact(3, 50000),
+                  tsv_row(4, 140000, 700000), exact(5, 10000))
+        code, out = self.backtest()
+        self.assertEqual(out["reexplore"], [])
+        self.assertEqual(out["after"]["coefficients"], {"base": 20000, "k_semantic": 0.3, "k_mechanical": 1500})
+        self.assertEqual(out["after"]["median_error"], 0)
+        self.assertEqual([(r["id"], r["verdict"]) for r in out["rules"]], [("generated", "keep")])
+
+    def migrations(self, enabled):
+        return {"id": "migrations", "kind": "term", "enabled": enabled, "text": "Migrations cost 15k each.",
+                "match": "*/migrations/*.py", "tokens": 15000,
+                "cites": [f"{REPO}#2"], "rows": {f"{REPO}#2": {"units": 2}, f"{REPO}#4": {"units": 1}}}
+
+    def migration_rows(self):
+        self.rows(exact(1, 100000), exact(2, 200000, extra=30000), exact(3, 50000),
+                  exact(4, 400000, extra=15000), exact(5, 10000))
+
+    def test_toggling_off_a_rule_the_data_needs_is_refused_by_the_guard(self):
+        self.ship(20000, 0.3, 1500, rules=[self.migrations(True)])
+        self.migration_rows()
+        code, out = self.backtest("--disable", "migrations", "--adopt")
+        self.assertEqual(code, 0)
+        self.assertEqual(out["before"]["rules"], ["migrations"])
+        self.assertEqual(out["after"]["rules"], [])
+        self.assertEqual(out["verdict"], "refuse")
+        self.assertIn("median_error_rose", out["reasons"])
+        self.assertFalse(out["written"])
+
+    def test_toggling_on_a_shipped_rule_adopts_it_when_it_helps(self):
+        self.ship(20000, 0.3, 1500, rules=[self.migrations(False)])
+        self.migration_rows()
+        code, out = self.backtest("--enable", "migrations", "--adopt")
+        self.assertEqual((code, out["verdict"], out["written"]), (0, "adopt", True))
+        self.assertEqual([(r["id"], r["verdict"]) for r in out["rules"]], [("migrations", "keep")])
+        self.assertEqual(read_constants(self.constants)["RULES"], [self.migrations(True)])
+
+    def test_toggling_an_unknown_rule_or_shipping_an_uncited_rule_is_refused(self):
+        self.migration_rows()
+        code, out = self.backtest("--enable", "nonexistent")
+        self.assertEqual((code, out), (2, {"error": "INVALID_REQUEST"}))
+        uncited = dict(self.migrations(True), cites=[])
+        self.ship(30000, 0.5, 1500, rules=[uncited])
+        code, out = self.backtest()
+        self.assertEqual((code, out), (2, {"error": "INVALID_REQUEST"}))
+        elsewhere = dict(self.migrations(True), cites=[f"{REPO}#3"])   # cited row the rule does not change
+        self.ship(30000, 0.5, 1500, rules=[elsewhere])
+        code, out = self.backtest()
+        self.assertEqual((code, out), (2, {"error": "INVALID_REQUEST"}))
 
     def test_a_malformed_table_is_refused(self):
         self.table.write_text("not\ta\theader\n", encoding="utf-8")

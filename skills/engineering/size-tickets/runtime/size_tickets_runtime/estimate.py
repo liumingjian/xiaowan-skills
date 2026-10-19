@@ -2,7 +2,8 @@ import os
 from pathlib import Path
 
 from .common import Refusal
-from .constants import BUDGET, CALIBRATED, COEFFICIENTS
+from .constants import BUDGET, CALIBRATED, COEFFICIENTS, REPO_OFFSETS, RULES
+from .rules import checked, terms
 
 HUMAN_LABELS = {"ready-for-human"}
 KINDS = {"semantic", "mechanical"}
@@ -37,6 +38,17 @@ def checked_coefficients(value):
     require(isinstance(value, dict) and set(value) == set(COEFFICIENTS))
     require(all(isinstance(number, (int, float)) and not isinstance(number, bool) for number in value.values()))
     return value, "input"
+
+
+def checked_extras(request):
+    """The repo's offset and the enabled term rules: shipped unless the request overrides them."""
+    remote = request.get("remote")
+    require(remote is None or (isinstance(remote, str) and remote))
+    offsets = request.get("offsets", REPO_OFFSETS)
+    require(isinstance(offsets, dict) and all(isinstance(v, int) and not isinstance(v, bool) for v in offsets.values()))
+    rules = checked(request.get("rules", RULES))
+    return {"offset": offsets.get(remote, 0) if remote else 0,
+            "rules": [rule for rule in rules if rule["enabled"] and rule["kind"] == "term"]}
 
 
 def checked_ticket(ticket):
@@ -76,10 +88,13 @@ def files(repo, footprint):
     return entries
 
 
-def score(entries, coefficients):
+def score(entries, coefficients, extras):
+    """The formula, plus the repo offset and each enabled term rule matching the entries' paths."""
     semantic = sum(entry["bytes"] for entry in entries if entry["kind"] == "semantic")
     mechanical = sum(1 for entry in entries if entry["kind"] == "mechanical")
-    value = round(coefficients["base"] + coefficients["k_semantic"] * semantic + coefficients["k_mechanical"] * mechanical)
+    found = terms([entry["path"] for entry in entries], extras["rules"])
+    value = round(coefficients["base"] + coefficients["k_semantic"] * semantic + coefficients["k_mechanical"] * mechanical
+                  + extras["offset"] + sum(term["tokens"] for term in found))
     return {"semantic_bytes": semantic, "mechanical_files": mechanical, "estimate": value, "tier": tier(value)}
 
 
@@ -112,14 +127,14 @@ def breakdown(entries, coefficients, top=3):
     return rows[:top]
 
 
-def split(ticket_id, entries, coefficients):
+def split(ticket_id, entries, coefficients, extras):
     """Deterministic split line for a ticket over budget; None when it fits.
 
     Groups are taken in sorted key order and packed greedily: a group joins the
     current part while the part's recomputed estimate stays within the budget.
     A group too big for any part on its own is packed file by file in path order.
     """
-    if score(entries, coefficients)["estimate"] <= BUDGET:
+    if score(entries, coefficients, extras)["estimate"] <= BUDGET:
         return None
     by_key = {}
     for entry in entries:
@@ -127,7 +142,7 @@ def split(ticket_id, entries, coefficients):
     parts, current = [], []
 
     def fits(candidate):
-        return score([entry for _, entry in candidate], coefficients)["estimate"] <= BUDGET
+        return score([entry for _, entry in candidate], coefficients, extras)["estimate"] <= BUDGET
 
     for key in sorted(by_key):
         members = [(key, entry) for entry in sorted(by_key[key], key=lambda entry: entry["path"])]
@@ -157,7 +172,7 @@ def split(ticket_id, entries, coefficients):
             "id": f"{ticket_id}.{number}",
             "groups": keys,
             "paths": [entry["path"] for _, entry in part],
-            **score([entry for _, entry in part], coefficients),
+            **score([entry for _, entry in part], coefficients, extras),
         })
     return {"by": "group" if any("group" in entry for entry in entries) else "directory", "parts": result}
 
@@ -171,7 +186,7 @@ def union(first, second):
     return list(merged.values())
 
 
-def merges(tickets, coefficients):
+def merges(tickets, coefficients, extras):
     """Pairs worth merging: both undersized, directly adjacent on a blocking chain
     or sharing footprint files, and the recomputed union still within the budget.
     """
@@ -188,7 +203,7 @@ def merges(tickets, coefficients):
             if not reasons:
                 continue
             entries = union(first["files"], second["files"])
-            combined = score(entries, coefficients)
+            combined = score(entries, coefficients, extras)
             if combined["estimate"] > BUDGET:
                 continue
             proposals.append({
@@ -205,6 +220,7 @@ def estimate(request):
     repo = Path(os.path.realpath(request["repo"]))
     require(repo.is_dir())
     coefficients, source = checked_coefficients(request.get("coefficients"))
+    extras = checked_extras(request)
     footprints = [checked_ticket(ticket) for ticket in request["tickets"]]
     tickets, skipped = [], []
     for ticket, footprint in zip(request["tickets"], footprints):
@@ -218,16 +234,19 @@ def estimate(request):
             "title": title,
             "blocked_by": ticket.get("blocked_by", []),
             "files": entries,
-            **score(entries, coefficients),
+            **score(entries, coefficients, extras),
+            "offset": extras["offset"],
+            "terms": terms([entry["path"] for entry in entries], extras["rules"]),
             "breakdown": breakdown(entries, coefficients),
-            "split": split(ticket["id"], entries, coefficients),
+            "split": split(ticket["id"], entries, coefficients, extras),
         })
     return {
         "budget": BUDGET,
         "calibrated": CALIBRATED,
         "coefficients": coefficients,
         "coefficients_source": source,
+        "remote": request.get("remote"),
         "tickets": tickets,
         "skipped": skipped,
-        "merges": merges(tickets, coefficients),
+        "merges": merges(tickets, coefficients, extras),
     }

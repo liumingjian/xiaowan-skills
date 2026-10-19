@@ -20,6 +20,10 @@ Done when every acceptance criterion traces to at least one file and every chang
 
 When unsure, tag semantic.
 
+### Learned rules
+
+Read `RULES` in `runtime/size_tickets_runtime/constants.py`, beside this file. For every rule with `"kind": "tagging"` and `"enabled": true`, apply its `text` to the files whose path matches its `match` glob (`*` also crosses `/`); where it conflicts with the guidance above, the rule wins. Ignore `"kind": "term"` rules: the CLI prices those itself.
+
 ## Group each file
 
 Give every file a `group`: a short name for the behaviour or acceptance criterion it serves, such as `parse totals` or `export csv`. Put tests and readers in the group of the code they exercise. If the ticket is over budget, it is split between groups, so make each group something an implementer could deliver on its own. A file serving several behaviours goes in the group it matters most to.

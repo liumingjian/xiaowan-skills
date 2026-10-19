@@ -365,6 +365,43 @@ class EstimateTests(unittest.TestCase):
             {"id": "#3", "title": "Approve design", "reason": "human"},
         ])
 
+    def test_the_repo_offset_and_enabled_term_rules_are_added_to_every_estimate(self):
+        self.write("app/models.py", 40000)
+        self.write("app/migrations/0001_a.py", 1000)
+        self.write("app/migrations/0002_b.py", 1000)
+        rule = {"id": "migrations", "kind": "term", "enabled": True, "text": "Migrations cost 15k each.",
+                "match": "*/migrations/*.py", "tokens": 15000,
+                "cites": ["github.com/example/app#2"], "rows": {"github.com/example/app#2": {"units": 2}}}
+        off = dict(rule, id="fixtures", enabled=False, match="*.py")
+        tagging = {"id": "generated", "kind": "tagging", "enabled": True, "text": "Generated code is mechanical.",
+                   "match": "*.py", "cites": ["github.com/example/app#3"], "rows": {"github.com/example/app#3": None}}
+        code, out = self.estimate({
+            "repo": str(self.repo), "remote": "github.com/example/app",
+            "coefficients": UNIT, "offsets": {"github.com/example/app": 10000, "github.com/example/other": 99999},
+            "rules": [rule, off, tagging],
+            "tickets": [{"id": "T1", "title": "Add a field", "footprint": [
+                {"path": "app/models.py", "kind": "semantic"},
+                {"path": "app/migrations/0001_a.py", "kind": "semantic"},
+                {"path": "app/migrations/0002_b.py", "kind": "mechanical"},
+            ]}],
+        })
+        self.assertEqual(code, 0)
+        [ticket] = out["tickets"]
+        self.assertEqual(ticket["estimate"], 41000 + 10000 + 30000)
+        self.assertEqual(ticket["offset"], 10000)
+        self.assertEqual(ticket["terms"], [{"rule": "migrations", "units": 2, "tokens": 30000}])
+        self.assertEqual(out["remote"], "github.com/example/app")
+
+    def test_no_remote_or_an_unknown_remote_gets_no_offset(self):
+        self.write("a.py", 60000)
+        for remote in (None, "github.com/example/unknown"):
+            request = {"repo": str(self.repo), "coefficients": UNIT, "offsets": {"github.com/example/app": 10000},
+                       "tickets": [{"id": "T1", "footprint": [{"path": "a.py", "kind": "semantic"}]}]}
+            if remote:
+                request["remote"] = remote
+            code, out = self.estimate(request)
+            self.assertEqual((code, out["tickets"][0]["estimate"], out["tickets"][0]["offset"]), (0, 60000, 0))
+
 
 if __name__ == "__main__":
     unittest.main()

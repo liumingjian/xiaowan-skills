@@ -33,6 +33,8 @@ def arguments(argv):
     fit.add_argument("--calibration", help="calibration table (default: the skill's calibration.tsv)")
     fit.add_argument("--constants", help="constants file scored as 'before' and written on --adopt (default: the skill's)")
     fit.add_argument("--adopt", action="store_true", help="write the refitted coefficients when the verdict is adopt")
+    fit.add_argument("--enable", action="append", default=[], metavar="RULE", help="score with this shipped rule on; repeatable")
+    fit.add_argument("--disable", action="append", default=[], metavar="RULE", help="score with this shipped rule off; repeatable")
     for each in (parser, run, logs, rows, fit):
         # argparse would echo user text and exit 2 with prose; keep the JSON error contract.
         each.error = refuse
@@ -58,7 +60,7 @@ def main(argv):
     elif args.command == "record":
         print_json(record(read_request(args.input), args.calibration))
     elif args.command == "backtest":
-        print_json(backtest(args.calibration, args.constants, args.adopt))
+        print_json(backtest(args.calibration, args.constants, args.adopt, args.enable, args.disable))
     return 0
 
 
