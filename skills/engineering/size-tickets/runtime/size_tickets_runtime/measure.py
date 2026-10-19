@@ -7,18 +7,17 @@ import json
 from pathlib import Path
 import re
 
-from .common import Refusal
+from .common import require
 
 REF = re.compile(r"(?:#|issues/|gh issue view\s+)(\d+)\b")
 # The opening sentence states the session's role; "implementation" alone (a reviewer's) doesn't count.
 IMPLEMENTER = re.compile(r"\bimplement(?:er)?\b|实现", re.IGNORECASE)
-SENTENCE_END =re.compile(r"[.!?。]\s")
+SENTENCE_END = re.compile(r"[.!?。]\s")
 
 
 def ticket_number(word):
     text = word[1:] if word.startswith("#") else word
-    if not text.isdigit():
-        raise Refusal()
+    require(text.isdigit())
     return int(text)
 
 
@@ -86,8 +85,7 @@ def session_files(directories):
     found = set()
     for directory in directories:
         root = Path(directory)
-        if not root.is_dir():
-            raise Refusal()
+        require(root.is_dir())
         found.update(path for path in root.rglob("*.jsonl") if path.is_file())
     return sorted(found)
 

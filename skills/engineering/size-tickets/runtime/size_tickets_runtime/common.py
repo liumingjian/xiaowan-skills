@@ -6,3 +6,9 @@ class Refusal(Exception):
         self.code = code
         self.detail = detail or {}
         super().__init__(reason)
+
+
+def require(condition):
+    """Refuse the request (INVALID_REQUEST, exit 2) unless condition holds."""
+    if not condition:
+        raise Refusal()

@@ -9,6 +9,7 @@ import unittest
 
 SKILL = Path(__file__).resolve().parents[1]
 RUNTIME = SKILL / "runtime"
+FIXTURES = SKILL / "tests" / "fixtures"
 SHIPPED_CONSTANTS = RUNTIME / "size_tickets_runtime" / "constants.py"
 HEADER = "repo\tspec\tticket\testimate\tactual\tsemantic_bytes\tmechanical_files\tcompacted\tdate"
 REPO = "github.com/example/app"
@@ -342,6 +343,58 @@ class BacktestTests(unittest.TestCase):
         self.ship(30000, 0.5, 1500, rules=[elsewhere])
         code, out = self.backtest()
         self.assertEqual((code, out), (2, {"error": "INVALID_REQUEST"}))
+
+    def rename_consumer_tests(self):
+        """The #42 outlier proposal, with #434's re-tagged footprint (commit d0b8797's run)."""
+        row = "github.com/liumingjian/reimburse-ai#434"
+        return {"id": "rename-consumer-tests", "kind": "tagging", "enabled": True, "proposed": True,
+                "text": "Test files are mechanical when the ticket only renames what they reference.",
+                "match": "*.test.*", "cites": [row],
+                "rows": {row: {"semantic_bytes": 116982, "mechanical_files": 55}}}
+
+    def test_a_helpful_proposal_and_a_refit_in_one_run_are_both_adopted(self):
+        # The #42 run: placeholder constants, 18 reimburse-ai rows, one proposed tagging rule.
+        # Before is what ships (placeholders, no rule); the rule beats the refit without it.
+        self.table.write_bytes((FIXTURES / "calibration-reimburse-ai.tsv").read_bytes())
+        self.ship(30000, 0.5, 1500, rules=[self.rename_consumer_tests()])
+        code, out = self.backtest("--adopt")
+        self.assertEqual(code, 0)
+        self.assertEqual((out["before"]["rules"], out["before"]["tier_accuracy"], out["before"]["median_error"]),
+                         ([], 0.5, 0.249))
+        self.assertEqual(out["after"]["coefficients"], {"base": 60913, "k_semantic": 0.3859, "k_mechanical": 748})
+        self.assertEqual((out["after"]["rules"], out["after"]["tier_accuracy"], out["after"]["median_error"]),
+                         (["rename-consumer-tests"], 0.6667, 0.2178))
+        [verdict] = out["rules"]
+        self.assertEqual((verdict["id"], verdict["proposed"], verdict["verdict"]), ("rename-consumer-tests", True, "keep"))
+        self.assertEqual((verdict["without"]["tier_accuracy"], verdict["without"]["median_error"]), (0.6111, 0.219))
+        self.assertEqual((out["verdict"], out["reasons"], out["written"]), ("adopt", [], True))
+        shipped = read_constants(self.constants)
+        adopted = {k: v for k, v in self.rename_consumer_tests().items() if k != "proposed"}
+        self.assertEqual(shipped["RULES"], [adopted])
+        code, out = self.backtest()
+        self.assertEqual((out["before"]["rules"], out["verdict"], out["reasons"]),
+                         (["rename-consumer-tests"], "refuse", ["unchanged"]))
+
+    def test_a_proposal_that_does_not_beat_the_refit_without_it_is_deleted_and_the_refit_still_adopted(self):
+        # Data is exact without the rule, so the rule can only make the refit worse.
+        harmful = dict(self.migrations(True), proposed=True)
+        self.ship(30000, 0.5, 1500, rules=[harmful])
+        self.rows(*[exact(i, s) for i, s in enumerate(SIZES, 1)])
+        code, out = self.backtest("--adopt")
+        self.assertEqual(code, 0)
+        self.assertEqual(out["before"]["rules"], [])
+        self.assertEqual([(r["id"], r["verdict"]) for r in out["rules"]], [("migrations", "delete")])
+        self.assertEqual(out["after"]["coefficients"], {"base": 20000, "k_semantic": 0.3, "k_mechanical": 1500})
+        self.assertEqual((out["after"]["rules"], out["verdict"], out["written"]), ([], "adopt", True))
+        self.assertEqual(read_constants(self.constants)["RULES"], [])
+
+    def test_a_proposal_that_changes_nothing_is_deleted(self):
+        idle = dict(self.migrations(True), proposed=True, rows={f"{REPO}#2": {"units": 0}})
+        self.ship(20000, 0.3, 1500, rules=[idle])
+        self.rows(*[exact(i, s) for i, s in enumerate(SIZES, 1)])
+        code, out = self.backtest()
+        self.assertEqual([(r["id"], r["verdict"]) for r in out["rules"]], [("migrations", "delete")])
+        self.assertEqual((out["verdict"], out["reasons"]), ("refuse", ["unchanged"]))
 
     def test_a_malformed_table_is_refused(self):
         self.table.write_text("not\ta\theader\n", encoding="utf-8")

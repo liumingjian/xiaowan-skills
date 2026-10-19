@@ -14,7 +14,9 @@ def print_json(value):
     sys.stdout.buffer.flush()
 
 
-def refuse(message):
+def refuse(_message):
+    """argparse's error hook. Its message quotes the user's arguments, so it is deliberately
+    dropped: a usage error is the bare {"error": "INVALID_REQUEST"}, exit 2, like any refusal."""
     raise Refusal()
 
 

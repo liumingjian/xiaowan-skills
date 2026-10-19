@@ -36,7 +36,7 @@ Most skills here are public beta releases. They stay in `skills/in-progress/` un
 
 `delegate-to-codex` requires the `rexec` skill and the Codex CLI on the paired Mac mini. It submits durable background work and collects validated response, patch, and status text artifacts. Raw Codex logs remain private on the Mac. Implement mode creates a disposable Git baseline in the synced workspace; applying the returned patch is a separate reviewed step.
 
-`size-tickets` needs `python3` and `git` and runs anywhere the repository is checked out. Its coefficients are calibrated against 18 implemented reimburse-ai tickets; each `learn` run's backtest refits them over `calibration.tsv` and ships the change through a reviewed PR.
+`size-tickets` needs `python3` and `git` and runs anywhere the repository is checked out. Its coefficients are calibrated from the implemented tickets in its `calibration.tsv`; each `learn` run adds rows, refits behind a regression guard, and ships the change through a reviewed PR.
 
 `intranet-ssh` uses macOS OpenSSH, Ruby, `sshpass`, and an existing private company connection configuration. Installing the skill does not provision credentials. It supports root SSH access to `192.168.0.0/16` without changing system routes or proxy settings.
 
