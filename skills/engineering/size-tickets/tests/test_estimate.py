@@ -91,14 +91,14 @@ class EstimateTests(unittest.TestCase):
         self.assertEqual(ticket["estimate"], 13000)  # 10000 + 2*1000 + 500*2
         self.assertEqual(ticket["tier"], "undersized")
 
-    def test_shipped_coefficients_are_reported_as_uncalibrated(self):
+    def test_shipped_coefficients_are_reported_as_calibrated(self):
         self.write("a.py", 100)
         code, out = self.estimate({
             "repo": str(self.repo),
             "tickets": [{"id": "T1", "title": "t", "footprint": [{"path": "a.py", "kind": "semantic"}]}],
         })
         self.assertEqual(code, 0)
-        self.assertIs(out["calibrated"], False)
+        self.assertIs(out["calibrated"], True)
         self.assertEqual(out["coefficients_source"], "shipped")
         self.assertEqual(set(out["coefficients"]), {"base", "k_semantic", "k_mechanical"})
 

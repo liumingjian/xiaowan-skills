@@ -1,12 +1,12 @@
 # Shipped knowledge. Only the learn branch changes these, through a reviewed PR.
 
-# Placeholders while CALIBRATED is False. `backtest --adopt` (learn branch) rewrites
-# CALIBRATED, COEFFICIENTS, REPO_OFFSETS and RULES with values fitted over calibration.tsv.
-CALIBRATED = False
+# Fitted over calibration.tsv. `backtest --adopt` (learn branch) rewrites CALIBRATED,
+# COEFFICIENTS, REPO_OFFSETS and RULES; CALIBRATED is False only for placeholder values.
+CALIBRATED = True
 COEFFICIENTS = {
-    "base": 30000,          # tokens every implementer spends before touching the ticket
-    "k_semantic": 0.5,      # tokens per byte of semantically involved file
-    "k_mechanical": 1500,   # tokens per mechanically edited file
+    "base": 59604,  # tokens every implementer spends before touching the ticket
+    "k_semantic": 0.3993,  # tokens per byte of semantically involved file
+    "k_mechanical": 96,  # tokens per mechanically edited file
 }
 
 # Offsets in tokens keyed by normalised git remote (host/owner/name). A repo gets one only
