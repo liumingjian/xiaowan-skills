@@ -18,4 +18,16 @@ Keep `README.md` and each bucket `README.md` in sync with the catalog. Use `scri
 npx skills@latest add liumingjian/xiaowan-skills
 ```
 
-Read `.agents/invocation.md` before changing skill invocation behavior and `.agents/install-block.md` before changing installation wording.
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked in GitHub Issues for `liumingjian/xiaowan-skills` via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one root `GLOSSARY.md` plus `docs/adr/`. See `docs/agents/domain.md`.
