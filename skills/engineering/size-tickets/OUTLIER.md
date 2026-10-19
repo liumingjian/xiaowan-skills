@@ -32,4 +32,4 @@ Your final message is exactly one JSON object, or `null`:
  "evidence": "3 migrations read 4 times each with test output: 52k of the 160k miss (turns 41-57)."}
 ```
 
-`id` is short kebab-case. `match` is an `fnmatch` glob over repo-relative paths, where `*` also crosses `/`. `tokens` appears only on a term rule. `cites` is the row you were given. `evidence` names the files or commands and their token figures.
+The fields follow the rule schema in the docstring of `runtime/size_tickets_runtime/rules.py`, beside this file; leave out `enabled`, `proposed` and `rows`, which the caller fills in. `cites` is the row you were given. `evidence` is yours alone: the files or commands and their token figures.
