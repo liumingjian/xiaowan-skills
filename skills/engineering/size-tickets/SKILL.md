@@ -60,4 +60,26 @@ Stateless: every run re-estimates every ticket from scratch. Read no repo config
 
 ## Learn
 
-Not yet available. Tell the user that `learn` ships in a later version and stop.
+Run after a spec is implemented, from the repo that holds it. Compares the current skill version's estimate of each published ticket with the context peak its implementer actually reached, then appends the results to `SKILL_DIR/calibration.tsv`. That file is the only thing this branch writes outside the temp directory.
+
+1. **Estimate the published tickets.** Run Estimate steps 1–4 on `<spec>` as a published spec: its child tickets' bodies verbatim, since that is what the implementers received. Keep the temp directory and the estimate output. Human tickets are skipped there and stay out of everything below.
+2. **Find the logs.** Claude Code keeps one directory per working directory under `~/.claude/projects`, named after the path with `/` and `.` replaced by `-`, and each worktree gets its own. Take every directory whose name starts with the repo root's encoded path (e.g. `/home/me/app` → `-home-me-app`, which also matches `-home-me-app--claude-worktrees-x`). Only read these logs; never write under `~/.claude/projects`.
+3. **Measure.** Run `SKILL_DIR/bin/size-tickets measure --logs <dir> [--logs <dir> ...] <ticket> ...` with every estimated ticket number. It searches each directory recursively, subagent logs included, and prints one JSON line:
+   - `tickets[]`: `ticket`, `peak` (the largest input context across the session's turns), `compacted`, `session` (the log file). A session belongs to a ticket when the first requested ticket named in its opening prompt is that ticket and the prompt's first sentence states an implementer role (`implement`, `implementer`, `实现`). This covers `/implement-spec` implementers and hand-opened sessions alike.
+   - `skipped[]`: `session`, `tickets`, `reason`, `peak`. Reasons: `multi_ticket` (the first sentence names several requested tickets), `not_implementer` (a reviewer, merger or fixer naming the ticket), `no_usage` (no turn carried usage), `duplicate_implementer` (a second implementer for a ticket; the larger peak is kept).
+   - `unmatched[]`: requested tickets with no implementer session.
+4. **Report.** One table, in ticket order:
+
+   | Ticket | Title | Estimate | Tier | Actual | Error | Compacted |
+   |---|---|---|---|---|---|---|
+
+   Estimate and Actual in k tokens. Error is `(estimate − actual) / actual` as a signed percent. Mark compacted tickets: their peak is a lower bound, because compaction cut the context. Under the table, list every `skipped` session with its reason and ticket, then the `unmatched` tickets.
+5. **Record.** Write `<tmp>/rows.json` as `{"rows": [...]}` with one object per matched ticket:
+
+   ```json
+   {"repo": "github.com/owner/name", "spec": 36, "ticket": 39, "estimate": 98000, "actual": 105965,
+    "semantic_bytes": 136000, "mechanical_files": 0, "compacted": false, "date": "2026-10-19"}
+   ```
+
+   `repo` is `git remote get-url origin` reduced to `host/owner/name` (no scheme, user, port or `.git`). `estimate`, `semantic_bytes` and `mechanical_files` come from step 1, `actual` and `compacted` from step 3, and `date` is today's UTC date. Run `SKILL_DIR/bin/size-tickets record <tmp>/rows.json`. It prints `{"calibration", "appended", "replaced"}`; a rerun replaces a ticket's existing row instead of adding a second one. Exit 2 with `{"error":"INVALID_REQUEST"}` means a row is malformed and nothing was written: fix it and rerun.
+6. Delete the temp directory. Tell the user how many rows were appended or replaced in `calibration.tsv` and that the change is uncommitted in the skill's checkout. Refitting the coefficients and extracting rules from outliers ship in a later version, so stop here.
