@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from .common import Refusal
+from .common import require
 from .constants import BUDGET, CALIBRATED, COEFFICIENTS, REPO_OFFSETS, RULES
 from .rules import checked, terms
 
@@ -17,11 +17,6 @@ def tier(estimate, budget=BUDGET):
     if estimate < 2 * budget:
         return "oversized"
     return "must_split"
-
-
-def require(condition):
-    if not condition:
-        raise Refusal()
 
 
 def strings(value):
@@ -65,25 +60,29 @@ def checked_ticket(ticket):
     return footprint
 
 
+def unique(items):
+    """Each path once, in first-seen order; for a duplicate, a semantic item wins over a mechanical one."""
+    merged = {}
+    for item in items:
+        if merged.get(item["path"], {}).get("kind") != "semantic":
+            merged[item["path"]] = item
+    return list(merged.values())
+
+
 def files(repo, footprint):
-    """One entry per path, sized like `wc -c`; semantic wins over mechanical for a duplicate.
+    """One entry per path, sized like `wc -c`.
 
     A path that does not exist yet is a file the ticket creates: zero bytes, flagged.
     """
-    merged, groups = {}, {}
-    for item in footprint:
-        if merged.get(item["path"]) != "semantic":
-            merged[item["path"]] = item["kind"]
-        if "group" in item:
-            groups.setdefault(item["path"], item["group"])
     entries = []
-    for path, kind in merged.items():
+    for item in unique(footprint):
+        path = item["path"]
         target = Path(os.path.realpath(repo / path))
         require(not Path(path).is_absolute() and target.is_relative_to(repo))
         exists = target.is_file()
-        entry = {"path": path, "kind": kind, "bytes": target.stat().st_size if exists else 0, "exists": exists}
-        if path in groups:
-            entry["group"] = groups[path]
+        entry = {"path": path, "kind": item["kind"], "bytes": target.stat().st_size if exists else 0, "exists": exists}
+        if "group" in item:
+            entry["group"] = item["group"]
         entries.append(entry)
     return entries
 
@@ -103,6 +102,14 @@ def group_key(entry):
     return entry.get("group") or (os.path.dirname(entry["path"]) or ".")
 
 
+def grouped(entries):
+    """{group key: its entries}, in first-seen order."""
+    by_key = {}
+    for entry in entries:
+        by_key.setdefault(group_key(entry), []).append(entry)
+    return by_key
+
+
 def cost(entry, coefficients):
     if entry["kind"] == "semantic":
         return coefficients["k_semantic"] * entry["bytes"]
@@ -111,11 +118,8 @@ def cost(entry, coefficients):
 
 def breakdown(entries, coefficients, top=3):
     """Where the footprint comes from: the most expensive groups, base excluded."""
-    by_key = {}
-    for entry in entries:
-        by_key.setdefault(group_key(entry), []).append(entry)
     rows = []
-    for key, members in by_key.items():
+    for key, members in grouped(entries).items():
         largest = min(members, key=lambda entry: (-cost(entry, coefficients), entry["path"]))
         rows.append({
             "group": key,
@@ -136,9 +140,7 @@ def split(ticket_id, entries, coefficients, extras):
     """
     if score(entries, coefficients, extras)["estimate"] <= BUDGET:
         return None
-    by_key = {}
-    for entry in entries:
-        by_key.setdefault(group_key(entry), []).append(entry)
+    by_key = grouped(entries)
     parts, current = [], []
 
     def fits(candidate):
@@ -177,15 +179,6 @@ def split(ticket_id, entries, coefficients, extras):
     return {"by": "group" if any("group" in entry for entry in entries) else "directory", "parts": result}
 
 
-def union(first, second):
-    """Both footprints with each path once; semantic wins over mechanical."""
-    merged = {}
-    for entry in first + second:
-        if merged.get(entry["path"], {}).get("kind") != "semantic":
-            merged[entry["path"]] = entry
-    return list(merged.values())
-
-
 def merges(tickets, coefficients, extras):
     """Pairs worth merging: both undersized, directly adjacent on a blocking chain
     or sharing footprint files, and the recomputed union still within the budget.
@@ -202,7 +195,7 @@ def merges(tickets, coefficients, extras):
                 reasons.append("shared_files")
             if not reasons:
                 continue
-            entries = union(first["files"], second["files"])
+            entries = unique(first["files"] + second["files"])
             combined = score(entries, coefficients, extras)
             if combined["estimate"] > BUDGET:
                 continue
