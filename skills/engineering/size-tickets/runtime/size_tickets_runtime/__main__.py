@@ -2,6 +2,7 @@ import argparse
 import json
 import sys
 
+from .backtest import backtest
 from .common import Refusal
 from .estimate import estimate
 from .measure import measure
@@ -20,7 +21,6 @@ def refuse(message):
 def arguments(argv):
     parser = argparse.ArgumentParser(prog="size-tickets")
     commands = parser.add_subparsers(dest="command", required=True)
-    # `backtest` (learn branch) joins here as a sibling subcommand.
     run = commands.add_parser("estimate", help="estimate each ticket's implementer context peak")
     run.add_argument("input", help="request JSON file, or - for stdin")
     logs = commands.add_parser("measure", help="read each ticket's actual context peak from session logs")
@@ -29,7 +29,11 @@ def arguments(argv):
     rows = commands.add_parser("record", help="append measured tickets to calibration.tsv")
     rows.add_argument("--calibration", help="table to append to (default: the skill's calibration.tsv)")
     rows.add_argument("input", help="rows JSON file, or - for stdin")
-    for each in (parser, run, logs, rows):
+    fit = commands.add_parser("backtest", help="refit the coefficients over calibration.tsv behind a regression guard")
+    fit.add_argument("--calibration", help="calibration table (default: the skill's calibration.tsv)")
+    fit.add_argument("--constants", help="constants file scored as 'before' and written on --adopt (default: the skill's)")
+    fit.add_argument("--adopt", action="store_true", help="write the refitted coefficients when the verdict is adopt")
+    for each in (parser, run, logs, rows, fit):
         # argparse would echo user text and exit 2 with prose; keep the JSON error contract.
         each.error = refuse
     return parser.parse_args(argv)
@@ -53,6 +57,8 @@ def main(argv):
         print_json(measure(args.logs, args.tickets))
     elif args.command == "record":
         print_json(record(read_request(args.input), args.calibration))
+    elif args.command == "backtest":
+        print_json(backtest(args.calibration, args.constants, args.adopt))
     return 0
 
 
