@@ -20,10 +20,14 @@ Done when every acceptance criterion traces to at least one file and every chang
 
 When unsure, tag semantic.
 
+## Group each file
+
+Give every file a `group`: a short name for the behaviour or acceptance criterion it serves, such as `parse totals` or `export csv`. Put tests and readers in the group of the code they exercise. If the ticket is over budget, it is split between groups, so make each group something an implementer could deliver on its own. A file serving several behaviours goes in the group it matters most to.
+
 ## Return
 
 Your final message is exactly one JSON object, paths relative to the repo root:
 
 ```json
-{"id": "<ticket id>", "footprint": [{"path": "src/a.py", "kind": "semantic"}, {"path": "src/b.py", "kind": "mechanical"}]}
+{"id": "<ticket id>", "footprint": [{"path": "src/a.py", "kind": "semantic", "group": "parse totals"}, {"path": "src/b.py", "kind": "mechanical", "group": "rename field"}]}
 ```
