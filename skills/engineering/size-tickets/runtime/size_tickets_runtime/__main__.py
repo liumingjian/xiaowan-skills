@@ -4,6 +4,7 @@ import sys
 
 from .common import Refusal
 from .estimate import estimate
+from .measure import measure
 
 
 def print_json(value):
@@ -18,10 +19,13 @@ def refuse(message):
 def arguments(argv):
     parser = argparse.ArgumentParser(prog="size-tickets")
     commands = parser.add_subparsers(dest="command", required=True)
-    # `measure` and `backtest` (learn branch) join here as sibling subcommands.
+    # `backtest` (learn branch) joins here as a sibling subcommand.
     run = commands.add_parser("estimate", help="estimate each ticket's implementer context peak")
     run.add_argument("input", help="request JSON file, or - for stdin")
-    for each in (parser, run):
+    logs = commands.add_parser("measure", help="read each ticket's actual context peak from session logs")
+    logs.add_argument("--logs", action="append", required=True, help="session-log directory, searched recursively; repeatable")
+    logs.add_argument("tickets", nargs="+", help="ticket numbers, with or without #")
+    for each in (parser, run, logs):
         # argparse would echo user text and exit 2 with prose; keep the JSON error contract.
         each.error = refuse
     return parser.parse_args(argv)
@@ -41,6 +45,8 @@ def main(argv):
     args = arguments(argv)
     if args.command == "estimate":
         print_json(estimate(read_request(args.input)))
+    elif args.command == "measure":
+        print_json(measure(args.logs, args.tickets))
     return 0
 
 
