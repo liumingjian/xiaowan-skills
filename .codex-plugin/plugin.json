@@ -1,0 +1,26 @@
+{
+  "name": "xiaowan-skills",
+  "version": "0.1.0",
+  "description": "Xiaowan's agent skills for practical engineering work",
+  "author": {
+    "name": "liumingjian",
+    "url": "https://github.com/liumingjian"
+  },
+  "homepage": "https://github.com/liumingjian/xiaowan-skills",
+  "repository": "https://github.com/liumingjian/xiaowan-skills",
+  "license": "MIT",
+  "skills": [
+    "./skills/engineering/rexec",
+    "./skills/engineering/size-tickets",
+    "./skills/in-progress/accept-milestone",
+    "./skills/in-progress/delegate-to-cc",
+    "./skills/in-progress/delegate-to-codex",
+    "./skills/in-progress/intranet-ssh",
+    "./skills/in-progress/readme-designer"
+  ],
+  "interface": {
+    "displayName": "Xiaowan Skills",
+    "shortDescription": "Agent skills for practical engineering work",
+    "developerName": "liumingjian"
+  }
+}

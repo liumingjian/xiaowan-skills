@@ -4,7 +4,16 @@ Small, composable agent skills for practical engineering work. Each skill is an 
 
 ## Installation
 
-The canonical installer is the Skills CLI. From the repository root of the project where you want the skills:
+For Codex, add the marketplace and install the plugin:
+
+```bash
+codex plugin marketplace add liumingjian/xiaowan-skills
+codex plugin add xiaowan-skills@xiaowan
+```
+
+Start a new Codex session after installation. Use `/skills` to find the installed skills. To invoke a skill, type `$` and select it, or use its full name, such as `$xiaowan-skills:readme-designer`.
+
+For Claude Code or another compatible agent, use the Skills CLI from your project root:
 
 ```bash
 npx skills@latest add liumingjian/xiaowan-skills
@@ -16,7 +25,7 @@ Install one skill at a time with:
 npx skills@latest add liumingjian/xiaowan-skills --skill delegate-to-cc
 ```
 
-The installer discovers `SKILL.md` files under `skills/<bucket>/<skill>/`. Use `-g` for a global install or `--list` to inspect the catalog before installing. The repository itself is not an npm runtime package; `npx skills` is the distribution and installation path.
+The Skills CLI discovers `SKILL.md` files under `skills/<bucket>/<skill>/`. Use `-g` for a global install or `--list` to inspect the catalog before installing.
 
 ## Skills
 
@@ -61,3 +70,14 @@ Keep a skill self-contained, give it a discriminating frontmatter description, a
 npm run list-skills
 python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/in-progress/<skill-name>
 ```
+
+To test the Codex plugin from a local checkout, use a temporary Codex home:
+
+```bash
+xiaowan_codex_home="$(mktemp -d)"
+CODEX_HOME="$xiaowan_codex_home" codex plugin marketplace add "$PWD"
+CODEX_HOME="$xiaowan_codex_home" codex plugin list --available --json
+CODEX_HOME="$xiaowan_codex_home" codex plugin add xiaowan-skills@xiaowan
+```
+
+When you add, move, or retire a skill, update the explicit `skills` list in `.codex-plugin/plugin.json`. Include every active skill and preserve its bucket path. Keep the plugin version in sync with `package.json`.
