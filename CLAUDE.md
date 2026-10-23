@@ -12,11 +12,14 @@ The installable contract is a directory containing `SKILL.md`. The Skills CLI di
 
 Every skill also carries `agents/openai.yaml` for Codex UI metadata. For a user-invoked skill, set `policy.allow_implicit_invocation: false`; keep the policy in sync with the intended invocation boundary.
 
-Keep `README.md` and each bucket `README.md` in sync with the catalog. Use `scripts/list-skills.sh` to inspect every skill and `scripts/link-skills.sh` to link the repository into local harness directories. The supported user installation path is:
+Keep `README.md` and each bucket `README.md` in sync with the catalog. Use `scripts/list-skills.sh` to inspect every skill and `scripts/link-skills.sh` to link the repository into local harness directories. Install the Codex plugin with:
 
 ```bash
-npx skills@latest add liumingjian/xiaowan-skills
+codex plugin marketplace add liumingjian/xiaowan-skills
+codex plugin add xiaowan-skills@xiaowan
 ```
+
+The alternative Skills CLI installer is `npx skills@latest add liumingjian/xiaowan-skills`. When you add, move, or retire a skill, update the explicit `skills` list in `.codex-plugin/plugin.json`. Include every active skill with its bucket path. Keep the plugin version in sync with `package.json`.
 
 ## Agent skills
 
