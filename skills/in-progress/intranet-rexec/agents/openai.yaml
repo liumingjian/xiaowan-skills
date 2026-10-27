@@ -1,0 +1,6 @@
+interface:
+  display_name: "Intranet via rexec"
+  short_description: "Run intranet commands and transfers from vps-cc through the paired Mac"
+  default_prompt: "Use $intranet-rexec to complete the requested operation on the specified company server through rexec."
+policy:
+  allow_implicit_invocation: false
