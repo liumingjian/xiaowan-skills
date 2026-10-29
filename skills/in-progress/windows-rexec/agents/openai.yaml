@@ -1,0 +1,6 @@
+interface:
+  display_name: "Windows via rexec"
+  short_description: "Verify and adapt the project on the paired Mac's Windows VM"
+  default_prompt: "Use $windows-rexec to run the requested build, tests, or browser checks on the Windows VM through rexec."
+policy:
+  allow_implicit_invocation: false

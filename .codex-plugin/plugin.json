@@ -1,6 +1,6 @@
 {
   "name": "xiaowan-skills",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Xiaowan's agent skills for practical engineering work",
   "author": {
     "name": "liumingjian",
@@ -17,7 +17,8 @@
     "./skills/in-progress/delegate-to-codex",
     "./skills/in-progress/intranet-rexec",
     "./skills/in-progress/intranet-ssh",
-    "./skills/in-progress/readme-designer"
+    "./skills/in-progress/readme-designer",
+    "./skills/in-progress/windows-rexec"
   ],
   "interface": {
     "displayName": "Xiaowan Skills",

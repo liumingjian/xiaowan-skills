@@ -1,0 +1,219 @@
+#!/bin/bash
+# Run one job on the Windows VM from the paired Mac: copy the current directory
+# in, run a PowerShell script there, bring result.tgz back, delete the job.
+# Compatible with macOS /bin/bash 3.2.
+set -euo pipefail
+
+VM_NAME="${WINVM_NAME:-Windows 11 ARM64}"
+UTMCTL="${WINVM_UTMCTL:-/Applications/UTM.app/Contents/MacOS/utmctl}"
+HERE="$(cd "$(dirname "$0")" && pwd -P)"
+KEY="$HOME/.ssh/windows-vm_ed25519"
+SETUP='C:\Users\Public\winvm-'
+MAC_CACHE="$HOME/.cache/winvm/mac"
+BOOT_WAIT=120
+RESULT_LIMIT=$((64 * 1024 * 1024))
+
+usage() {
+  cat >&2 <<'TEXT'
+Usage: winvm exec 'POWERSHELL'        run in the background on the Windows VM
+       winvm exec - < run.ps1
+       winvm desktop [--timeout SECONDS] 'POWERSHELL'
+                                      run on the logged-in Windows desktop
+       winvm init                     set up the Mac side, then connect
+The current directory is copied into the job's working directory. Files the
+script writes to $env:WINVM_OUT return as result.tgz in $REXEC_ARTIFACTS
+(or the current directory outside rexec).
+TEXT
+  exit 64
+}
+
+die() { code="$1"; shift; printf 'winvm: %s\n' "$*" >&2; exit "$code"; }
+
+IP=''
+rsh() { ssh -o HostName="$IP" -o ConnectTimeout=10 windows-vm "$1"; }
+rcp() { scp -q -o HostName="$IP" -o ConnectTimeout=10 "$@"; }
+
+# Ask the guest agent; when it does not answer, look up the VM's cached MAC in
+# the Mac's DHCP leases (lease octets drop leading zeros).
+vm_ip() {
+  ip="$("$UTMCTL" ip-address "$VM_NAME" 2>/dev/null \
+    | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | grep -v '^169\.254\.' | head -n 1 || true)"
+  if [ -z "$ip" ] && [ -s "$MAC_CACHE" ]; then
+    ip="$(awk -v mac="1,$(cat "$MAC_CACHE")" '
+      /^\{/ { a = ""; h = "" } /ip_address=/ { sub(/.*=/, ""); a = $0 }
+      /hw_address=/ { sub(/.*=/, ""); h = $0 } /^\}/ && h == mac { print a; exit }' /var/db/dhcpd_leases 2>/dev/null || true)"
+  fi
+  printf '%s' "$ip"
+}
+
+# Record the VM's MAC for vm_ip while SSH works.
+remember_mac() {
+  mac="$(rsh "(Get-NetAdapter -Physical | Where-Object Status -eq Up | Select-Object -First 1).MacAddress" 2>/dev/null \
+    | tr -d '\r' | tr 'A-F-' 'a-f:' | sed -E 's/(^|:)0([0-9a-f])/\1\2/g')"
+  [ -n "$mac" ] && mkdir -p "$(dirname "$MAC_CACHE")" && printf '%s\n' "$mac" > "$MAC_CACHE"
+  return 0
+}
+
+# utmctl exits 0 even when the guest agent fails, so judge by its stderr.
+utm_file() {
+  err="$("$UTMCTL" file "$@" 2>&1 >/dev/null)"
+  case "$err" in *Error*|*'Timed out'*) printf 'winvm: guest agent: %s\n' "$err" >&2; return 1 ;; esac
+}
+
+# Start the VM when it is not running, then wait until SSH accepts the key.
+vm_ready() {
+  [ -x "$UTMCTL" ] || die 69 "utmctl not found at $UTMCTL; is UTM installed?"
+  grep -qi '^Host windows-vm$' "$HOME/.ssh/config" 2>/dev/null \
+    || die 69 'no "Host windows-vm" in ~/.ssh/config; run winvm init first'
+  state="$("$UTMCTL" status "$VM_NAME" 2>&1)" || die 69 "UTM has no VM named \"$VM_NAME\": $state"
+  if [ "$state" != started ]; then
+    printf 'winvm: VM is %s; starting it\n' "$state" >&2
+    "$UTMCTL" start "$VM_NAME" >/dev/null || die 69 "utmctl could not start \"$VM_NAME\""
+  fi
+  deadline=$(( $(date +%s) + BOOT_WAIT ))
+  last=''
+  while :; do
+    IP="$(vm_ip)"
+    if [ -n "$IP" ]; then
+      if last="$(rsh 'exit 0' 2>&1 >/dev/null)"; then remember_mac; return 0; fi
+      case "$last" in
+        *'IDENTIFICATION HAS CHANGED'*|*'Host key verification failed'*)
+          die 77 'the Windows VM host key changed; confirm the VM, then remove the old key with: ssh-keygen -R windows-vm' ;;
+        *'Permission denied'*)
+          die 77 'the Windows VM rejected the SSH key; rerun setup.ps1 in Windows' ;;
+      esac
+    fi
+    [ "$(date +%s)" -lt "$deadline" ] || die 69 "SSH to the Windows VM did not come up within ${BOOT_WAIT}s${last:+: $last}"
+    sleep 3
+  done
+}
+
+JOB=''
+JOB_DIR=''
+LOCAL=''
+cleanup() {
+  [ -n "$LOCAL" ] && rm -rf "$LOCAL"
+  [ -n "$JOB" ] && rsh "Remove-Item -LiteralPath '$JOB_DIR' -Recurse -Force -ErrorAction SilentlyContinue" >/dev/null 2>&1 || true
+}
+
+# Copy the snapshot, the script, and the runner into a fresh job directory.
+# Leftover job directories are stale: jobs run one at a time.
+stage() {
+  script="$1"
+  JOB="$(date +%Y%m%d%H%M%S)-$$"
+  JOB_DIR="C:\\winvm\\jobs\\$JOB"
+  LOCAL="$(mktemp -d /tmp/winvm.XXXXXX)"
+  trap cleanup EXIT
+  printf '%s\n' "$script" > "$LOCAL/run.ps1"
+  COPYFILE_DISABLE=1 tar -czf "$LOCAL/snapshot.tgz" -C "$PWD" .
+  rsh "Remove-Item 'C:\\winvm\\jobs\\*' -Recurse -Force -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Force '$JOB_DIR\\work', '$JOB_DIR\\out' | Out-Null" \
+    || die 69 'could not create the job directory on the Windows VM'
+  rcp "$HERE/runner.ps1" "windows-vm:C:/winvm/runner.ps1"
+  rcp "$LOCAL/run.ps1" "$LOCAL/snapshot.tgz" "windows-vm:C:/winvm/jobs/$JOB/"
+  rsh "tar.exe -xzf '$JOB_DIR\\snapshot.tgz' -C '$JOB_DIR\\work'; if (\$LASTEXITCODE) { exit 1 }; Remove-Item '$JOB_DIR\\snapshot.tgz'" \
+    || die 69 'could not unpack the snapshot on the Windows VM'
+}
+
+collect() {
+  dest="${REXEC_ARTIFACTS:-$PWD}"
+  rcp "windows-vm:C:/winvm/jobs/$JOB/result.tgz" "$LOCAL/result.tgz" 2>/dev/null \
+    || { printf 'winvm: the job left no result.tgz\n' >&2; return 0; }
+  size="$(wc -c < "$LOCAL/result.tgz" | tr -d ' ')"
+  if [ "$size" -gt "$RESULT_LIMIT" ]; then
+    # shellcheck disable=SC2016
+    printf 'winvm: result.tgz is %s bytes, over the 64 MiB limit; not collected. Write less to $env:WINVM_OUT.\n' "$size" >&2
+    return 0
+  fi
+  mv "$LOCAL/result.tgz" "$dest/result.tgz"
+}
+
+read_script() {
+  [ "$#" -eq 1 ] || usage
+  if [ "$1" = - ]; then cat; else printf '%s' "$1"; fi
+}
+
+cmd_exec() {
+  script="$(read_script "$@")"
+  [ -n "$script" ] || usage
+  vm_ready
+  stage "$script"
+  set +e
+  rsh "& C:\\winvm\\runner.ps1 -Job '$JOB'; exit \$LASTEXITCODE"
+  code=$?
+  set -e
+  collect
+  exit "$code"
+}
+
+cmd_desktop() {
+  timeout=1500
+  if [ "${1:-}" = --timeout ]; then
+    [ "$#" -ge 2 ] && [ "$2" -gt 0 ] 2>/dev/null || usage
+    timeout="$2"; shift 2
+  fi
+  script="$(read_script "$@")"
+  [ -n "$script" ] || usage
+  vm_ready
+  set +e
+  why="$(rsh "& C:\\winvm\\runner.ps1 -Mode check; exit \$LASTEXITCODE" 2>&1)"
+  ok=$?
+  set -e
+  [ "$ok" -eq 0 ] || die 69 "desktop run unavailable: $why"
+  stage "$script"
+  rsh "Set-Content -LiteralPath C:\\winvm\\current.txt -Value '$JOB'; schtasks.exe /end /tn winvm-interactive *> \$null; schtasks.exe /run /tn winvm-interactive | Out-Null; if (\$LASTEXITCODE) { exit 1 }" \
+    || die 69 'could not start the winvm-interactive scheduled task'
+  set +e
+  rsh "\$d = (Get-Date).AddSeconds($timeout); while (-not (Test-Path '$JOB_DIR\\exit_code')) { if ((Get-Date) -gt \$d) { schtasks.exe /end /tn winvm-interactive | Out-Null; 'winvm: desktop run passed ${timeout}s; task ended'; exit 124 }; Start-Sleep 2 }; Get-Content -Raw -ErrorAction SilentlyContinue '$JOB_DIR\\out\\console.log'; exit [int](Get-Content '$JOB_DIR\\exit_code')"
+  code=$?
+  set -e
+  collect
+  exit "$code"
+}
+
+# Idempotent. Once the SSH alias exists, check it. Before that, push the
+# current setup files into Windows; after setup.ps1 has run there, add the
+# alias and check it.
+cmd_init() {
+  [ "$#" -eq 0 ] || usage
+  [ -x "$UTMCTL" ] || die 69 "utmctl not found at $UTMCTL; is UTM installed?"
+  [ "$("$UTMCTL" status "$VM_NAME" 2>&1)" = started ] || die 69 "start \"$VM_NAME\" in UTM and log in first"
+  [ -f "$KEY" ] || ssh-keygen -q -t ed25519 -N '' -C winvm -f "$KEY"
+  if ! grep -qi '^Host windows-vm$' "$HOME/.ssh/config" 2>/dev/null; then
+    utm_file push "$VM_NAME" "${SETUP}setup.ps1" < "$HERE/setup.ps1" || die 69 'could not push setup.ps1; retry when the guest agent answers'
+    utm_file push "$VM_NAME" "${SETUP}mac.pub" < "$KEY.pub" || die 69 'could not push the Mac key; retry when the guest agent answers'
+    user="$("$UTMCTL" file pull "$VM_NAME" "${SETUP}user.txt" 2>/dev/null | tr -d '\r\n' || true)"
+    case "$user" in
+      ''|*' '*|*Error*)
+        cat <<TEXT
+Pushed setup.ps1 into the Windows VM. In Windows, open PowerShell as
+administrator, run this line, then run winvm init again:
+
+  powershell -ExecutionPolicy Bypass -File ${SETUP}setup.ps1
+TEXT
+        return 0 ;;
+    esac
+    mkdir -p "$HOME/.ssh"
+    cat >> "$HOME/.ssh/config" <<EOF
+
+Host windows-vm
+  User $user
+  IdentityFile $KEY
+  IdentitiesOnly yes
+  HostKeyAlias windows-vm
+  StrictHostKeyChecking accept-new
+  BatchMode yes
+EOF
+    printf 'winvm: added Host windows-vm (user %s) to ~/.ssh/config\n' "$user" >&2
+  fi
+  vm_ready
+  rsh "'{0} on {1}: PowerShell {2}' -f \$env:USERNAME, (hostname), \$PSVersionTable.PSVersion"
+}
+
+[ "$#" -ge 1 ] || usage
+sub="$1"; shift
+case "$sub" in
+  exec) cmd_exec "$@" ;;
+  desktop) cmd_desktop "$@" ;;
+  init) cmd_init "$@" ;;
+  *) usage ;;
+esac

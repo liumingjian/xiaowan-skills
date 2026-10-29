@@ -37,6 +37,7 @@ Most skills here are public beta releases. They stay in `skills/in-progress/` un
 - **[intranet-rexec](./skills/in-progress/intranet-rexec/SKILL.md)** - Run commands and transfer files on company intranet servers from `vps-cc` through rexec and the paired Mac mini.
 - **[intranet-ssh](./skills/in-progress/intranet-ssh/SKILL.md)** - Log in, run commands, and transfer files on company intranet servers through the saved SOCKS5 proxy.
 - **[readme-designer](./skills/in-progress/readme-designer/SKILL.md)** - Review or rewrite a repository README around real facts, navigation, and a verifiable first run.
+- **[windows-rexec](./skills/in-progress/windows-rexec/SKILL.md)** - Verify and adapt the current project on the Windows VM in UTM on the paired Mac mini, through rexec.
 - **[rexec](./skills/engineering/rexec/SKILL.md)** - Run durable builds, tests, and other heavy work from `vps-cc` on the paired Mac mini.
 - **[size-tickets](./skills/engineering/size-tickets/SKILL.md)** - Estimate each ticket's implementer context peak and tier before a spec's slicing is final.
 
@@ -51,6 +52,8 @@ Most skills here are public beta releases. They stay in `skills/in-progress/` un
 `intranet-ssh` uses macOS OpenSSH, Ruby, `sshpass`, and an existing private company connection configuration. Installing the skill does not provision credentials. It supports root SSH access to `192.168.0.0/16` without changing system routes or proxy settings.
 
 `intranet-rexec` requires the `rexec` skill and intranet-ssh installed under `~/.agents/skills` on the paired Mac mini, which holds the company configuration. It runs one-shot commands and single-file transfers without an interactive login, and rexec output filtering shows intranet addresses as `[private]`.
+
+`windows-rexec` requires the `rexec` skill, UTM with a `Windows 11 ARM64` guest on the paired Mac mini, and this repository linked under `~/.agents/skills` there. `winvm init` sets up the Mac key and pushes a one-time `setup.ps1` that installs OpenSSH Server, PowerShell 7, and the base toolchain in Windows. Jobs copy the project into the VM and return `result.tgz`; nothing persists in the VM between jobs.
 
 ## Repository layout
 
