@@ -20,3 +20,4 @@ npx skills@latest add liumingjian/xiaowan-skills --skill <name>
 - **[intranet-rexec](./intranet-rexec/SKILL.md)** - Run commands and transfer files on company intranet servers from `vps-cc` through rexec and the paired Mac mini. User-invoked.
 - **[intranet-ssh](./intranet-ssh/SKILL.md)** - Log in, run commands, and transfer files on company intranet servers through the saved SOCKS5 proxy. User-invoked.
 - **[readme-designer](./readme-designer/SKILL.md)** - Review or rewrite a repository README around real facts, navigation, and a verifiable first run. Model-invoked.
+- **[windows-rexec](./windows-rexec/SKILL.md)** - Verify and adapt the current project on the Windows VM in UTM on the paired Mac mini, through rexec. User-invoked.
