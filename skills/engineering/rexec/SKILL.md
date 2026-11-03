@@ -41,6 +41,12 @@ description: Run builds, dependency installation, test suites, services for end-
 4. Read the terminal receipt and exit status. Successful completion returns 0; command failures pass through their exit codes. Timeout returns 124, cancellation 125, and an expired wait returns pending with 75. Exit 126 with outcome `failed` means the command never started; fix the reported reason and resubmit. Outcome `unknown` (exit 70) means the command may have partly run: check its side effects before resubmitting, never assume it failed. See [REFERENCE.md](REFERENCE.md#recovery-and-results) for recovery and acknowledgment behavior.
 5. Fetch requested artifacts with `rexec artifacts JOB --into DIR`. Commands publish them as bounded regular files beneath `$REXEC_ARTIFACTS`: UTF-8 text, or a build output packaged as `.zip`, `.vsix`, `.whl`, `.jar`, `.tgz`, or `.tar.gz`; zip any other binary first. Use `$TMPDIR` for private scratch files. Verify the collected result before claiming the work passed. See [REFERENCE.md](REFERENCE.md#output-and-artifacts) for export limits.
 
+   A job's file edits stay in its Mac snapshot. When a command must change project files (a formatter, a `--fix` lint, codegen, a lockfile update), wrap it so the edits return as a patch, keeping the tool's exit status, then fetch it and run `git apply` on the VPS before reporting the change:
+
+   ```bash
+   rexec --label format 'git init -q && git add -A && { npx prettier --write src; s=$?; git add -N . && git diff --binary > "$REXEC_ARTIFACTS/changes.patch"; exit $s; }'
+   ```
+
 ## Management
 
 When the user requests queue, status, trace, cancellation, or cleanup, run the corresponding command directly:
