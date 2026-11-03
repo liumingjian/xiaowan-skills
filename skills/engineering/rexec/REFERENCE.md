@@ -6,6 +6,24 @@ Read this file for initial setup, service management, interrupted work, output f
 
 The only pair is `vps-cc` and one Mac mini. The Mac uses the existing SSH alias with its proxy, host-key policy, and 120-second connection timeout. That alias uses Cloudflare Access/Tunnel and local SOCKS; public SSH is closed. The runtime does not discover machines, select a host, or fail over.
 
+The worker opens a fresh `ssh vps-cc` for every poll and heartbeat, unattended. On the Mac, that alias must authenticate to the `vps-cc SSH` Access application with a Service Token through a `Service Auth` policy, not with a human identity: when an identity session expires, `cloudflared` stops at a browser approval page and the worker goes `OFFLINE` until someone clicks Approve. Keep the identity policy beside it for other devices. The token is non-expiring and scoped to that one application; revoke it in Zero Trust if it leaks. Store it in a file rather than the Keychain, because a Keychain read from launchd can raise an approval dialog. The ssh config stays user-owned; rexec neither ships nor installs this wrapper. Example:
+
+```sshconfig
+Host vps-cc
+  # The original cloudflared command, prefixed by the wrapper.
+  ProxyCommand ~/.cloudflared/vps-cc-proxy cloudflared access ssh --hostname %h
+```
+
+```sh
+#!/bin/sh
+# ~/.cloudflared/vps-cc-proxy (mode 700). ~/.cloudflared/vps-cc.token (mode 600) holds two lines: client ID, client secret.
+{ read -r TUNNEL_SERVICE_TOKEN_ID; read -r TUNNEL_SERVICE_TOKEN_SECRET; } < "$HOME/.cloudflared/vps-cc.token"
+export TUNNEL_SERVICE_TOKEN_ID TUNNEL_SERVICE_TOKEN_SECRET
+exec "$@"
+```
+
+A revoked or wrong token shows as `OFFLINE` in `rexec status`, with the cause in the Mac's `transport.stderr`.
+
 A private dedicated worker credential binds the pair. Setup never prints it. Routing and receipts use opaque identifiers, not ComputerName, hostname, hardware UUID, source IP, or SSH fingerprints. Legacy machine flags and `REXEC_HOST`/`REXEC_MAC` overrides are rejected.
 
 ## Setup and service
